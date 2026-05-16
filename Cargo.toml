@@ -1,0 +1,39 @@
+[package]
+name = "diskwatch"
+version = "0.1.0"
+edition = "2021"
+description = "Single-host, read-only disk diagnostics TUI. Eight tabs across devices, volumes, filesystems, IO, SMART, hot files, and insights. Sibling to netwatch and syswatch."
+license = "MIT"
+repository = "https://github.com/matthart1983/diskwatch"
+homepage = "https://github.com/matthart1983/diskwatch"
+readme = "README.md"
+keywords = ["disk", "storage", "tui", "diagnostics", "observability"]
+categories = ["command-line-utilities"]
+exclude = [
+    # Demo assets aren't needed by anyone consuming the crate.
+    "demo.gif",
+    "demo.tape",
+]
+
+[[bin]]
+name = "diskwatch"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.32"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# FSEvents-backed file watcher on macOS (kFSEventStreamCreateFlagFileEvents
+# is enabled by default in notify 6+), inotify on Linux. We use the raw
+# event stream, not the debounced API.
+notify = "7"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
