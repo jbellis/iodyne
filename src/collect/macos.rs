@@ -12,15 +12,15 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct MacDevice {
-    pub bsd_name: String,         // "disk0"
+    pub bsd_name: String, // "disk0"
     pub controller_kind: ControllerKind,
     pub model: String,
     pub firmware: Option<String>,
     pub serial: Option<String>,
     pub size_bytes: u64,
     pub removable: bool,
-    pub smart_ok: Option<bool>,   // None = controller doesn't report SMART
-    pub protocol: String,         // "PCIe / NVMe", "USB", "SATA"
+    pub smart_ok: Option<bool>, // None = controller doesn't report SMART
+    pub protocol: String,       // "PCIe / NVMe", "USB", "SATA"
     /// Reserved — surfaced once the Devices DETAIL panel grows a trim row.
     #[allow(dead_code)]
     pub trim: Option<bool>,
@@ -33,8 +33,8 @@ pub struct MacDevice {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // Filled in by parse_device for future per-volume attribution.
 pub struct MacVolume {
-    pub bsd_name: String,         // "disk0s2", "disk3s5"
-    pub kind: String,             // "Apple_APFS", "Apple_APFS_ISC", etc.
+    pub bsd_name: String, // "disk0s2", "disk3s5"
+    pub kind: String,     // "Apple_APFS", "Apple_APFS_ISC", etc.
     pub size_bytes: u64,
 }
 
@@ -50,11 +50,7 @@ pub enum ControllerKind {
 pub fn collect() -> Vec<MacDevice> {
     let mut out = Vec::new();
     out.extend(query(ControllerKind::Nvme, "SPNVMeDataType", "PCIe / NVMe"));
-    out.extend(query(
-        ControllerKind::Sata,
-        "SPSerialATADataType",
-        "SATA",
-    ));
+    out.extend(query(ControllerKind::Sata, "SPSerialATADataType", "SATA"));
     out.extend(query(ControllerKind::Usb, "SPUSBDataType", "USB"));
     out
 }
@@ -107,11 +103,7 @@ fn walk(node: &serde_json::Value, kind: ControllerKind, protocol: &str, out: &mu
     }
 }
 
-fn parse_device(
-    v: &serde_json::Value,
-    kind: ControllerKind,
-    protocol: &str,
-) -> Option<MacDevice> {
+fn parse_device(v: &serde_json::Value, kind: ControllerKind, protocol: &str) -> Option<MacDevice> {
     let bsd_name = v.get("bsd_name")?.as_str()?.to_string();
     let model = v
         .get("device_model")
@@ -130,10 +122,7 @@ fn parse_device(
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let size_bytes = v
-        .get("size_in_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+    let size_bytes = v.get("size_in_bytes").and_then(|x| x.as_u64()).unwrap_or(0);
     let removable = matches!(
         v.get("removable_media").and_then(|x| x.as_str()),
         Some("yes") | Some("Yes") | Some("YES")
@@ -144,9 +133,10 @@ fn parse_device(
             "Verified" | "verified" | "OK" | "Ok" | "Passed" | "passed"
         )
     });
-    let trim = v.get("spnvme_trim_support").and_then(|x| x.as_str()).map(|s| {
-        matches!(s, "Yes" | "yes" | "YES")
-    });
+    let trim = v
+        .get("spnvme_trim_support")
+        .and_then(|x| x.as_str())
+        .map(|s| matches!(s, "Yes" | "yes" | "YES"));
 
     let volumes = v
         .get("volumes")
@@ -160,7 +150,10 @@ fn parse_device(
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let size = vol.get("size_in_bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let size = vol
+                        .get("size_in_bytes")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
                     Some(MacVolume {
                         bsd_name: bsd.to_string(),
                         kind,
@@ -223,8 +216,7 @@ pub fn container_to_physical_map() -> std::collections::HashMap<String, String> 
             }
             continue;
         }
-        if let (Some(synth), Some(idx)) = (current_synth.as_ref(), line.find("Physical Store "))
-        {
+        if let (Some(synth), Some(idx)) = (current_synth.as_ref(), line.find("Physical Store ")) {
             let after = &line[idx + "Physical Store ".len()..];
             let phys_partition: String = after
                 .chars()

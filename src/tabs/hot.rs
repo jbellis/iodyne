@@ -54,23 +54,17 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(p::RED).add_modifier(Modifier::BOLD),
         ));
     } else if roots.is_empty() {
-        spans.push(Span::styled(
-            "(no roots)",
-            Style::default().fg(p::DIM),
-        ));
+        spans.push(Span::styled("(no roots)", Style::default().fg(p::DIM)));
     } else {
-        let joined: Vec<String> = roots
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        spans.push(Span::styled(
-            joined.join("  "),
-            Style::default().fg(p::FG),
-        ));
+        let joined: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        spans.push(Span::styled(joined.join("  "), Style::default().fg(p::FG)));
     }
     spans.push(Span::raw("   "));
     spans.push(Span::styled(
-        format!("{} active paths  {} events since start", active, total_events),
+        format!(
+            "{} active paths  {} events since start",
+            active, total_events
+        ),
         Style::default().fg(p::DIM),
     ));
     f.render_widget(
@@ -114,9 +108,8 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
             height: 1,
         },
     );
-    let rule: String = std::iter::repeat('\u{2500}')
-        .take(inner.width.saturating_sub(2) as usize)
-        .collect();
+    let rule: String =
+        std::iter::repeat_n('\u{2500}', inner.width.saturating_sub(2) as usize).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rule,
@@ -143,11 +136,8 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
         };
         drop(s);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                msg,
-                Style::default().fg(p::DIM),
-            )))
-            .style(Style::default().bg(p::BG)),
+            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(p::DIM))))
+                .style(Style::default().bg(p::BG)),
             Rect {
                 x: inner.x + 1,
                 y: inner.y + 2,
@@ -175,15 +165,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_row(
-    f: &mut Frame,
-    x: u16,
-    y: u16,
-    w: u16,
-    fa: &FileActivity,
-    now: Instant,
-    leader: bool,
-) {
+fn draw_row(f: &mut Frame, x: u16, y: u16, w: u16, fa: &FileActivity, now: Instant, leader: bool) {
     let rate_str = if fa.events_per_sec >= 1.0 {
         format!("{:.1}", fa.events_per_sec)
     } else if fa.events_per_sec > 0.01 {
@@ -214,7 +196,12 @@ fn draw_row(
     let row_bg = if leader { p::SEL_BG } else { p::BG };
     f.render_widget(
         Paragraph::new("").style(Style::default().bg(row_bg)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
     let line = Line::from(vec![
         Span::raw(" "),
@@ -245,7 +232,12 @@ fn draw_row(
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(row_bg)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }
 

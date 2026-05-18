@@ -44,7 +44,7 @@ pub fn pad_right(s: &str, n: usize) -> String {
         s.chars().take(n).collect()
     } else {
         let mut out = s.to_string();
-        out.extend(std::iter::repeat(' ').take(n - len));
+        out.extend(std::iter::repeat_n(' ', n - len));
         out
     }
 }
@@ -55,7 +55,7 @@ pub fn pad_left(s: &str, n: usize) -> String {
         s.chars().take(n).collect()
     } else {
         let mut out = String::new();
-        out.extend(std::iter::repeat(' ').take(n - len));
+        out.extend(std::iter::repeat_n(' ', n - len));
         out.push_str(s);
         out
     }

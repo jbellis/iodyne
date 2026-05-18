@@ -128,28 +128,29 @@ impl IoCollector {
             let read_ops_delta = t.ops_read.saturating_sub(prev.ops_read);
             let write_ops_delta = t.ops_written.saturating_sub(prev.ops_written);
             let read_time_delta = t.total_time_read_ns.saturating_sub(prev.total_time_read_ns);
-            let write_time_delta = t.total_time_write_ns.saturating_sub(prev.total_time_write_ns);
+            let write_time_delta = t
+                .total_time_write_ns
+                .saturating_sub(prev.total_time_write_ns);
 
             let read_bps = read_bytes_delta / elapsed;
             let write_bps = write_bytes_delta / elapsed;
             let bps = read_bps + write_bps;
 
-            let (latency_avg, sample_r_us, sample_w_us) =
-                if read_ops_delta + write_ops_delta == 0 {
-                    (None, None, None)
+            let (latency_avg, sample_r_us, sample_w_us) = if read_ops_delta + write_ops_delta == 0 {
+                (None, None, None)
+            } else {
+                let r_us = if read_ops_delta > 0 {
+                    Some((read_time_delta as f64 / read_ops_delta as f64) / 1_000.0)
                 } else {
-                    let r_us = if read_ops_delta > 0 {
-                        Some((read_time_delta as f64 / read_ops_delta as f64) / 1_000.0)
-                    } else {
-                        None
-                    };
-                    let w_us = if write_ops_delta > 0 {
-                        Some((write_time_delta as f64 / write_ops_delta as f64) / 1_000.0)
-                    } else {
-                        None
-                    };
-                    (Some((r_us.unwrap_or(0.0), w_us.unwrap_or(0.0))), r_us, w_us)
+                    None
                 };
+                let w_us = if write_ops_delta > 0 {
+                    Some((write_time_delta as f64 / write_ops_delta as f64) / 1_000.0)
+                } else {
+                    None
+                };
+                (Some((r_us.unwrap_or(0.0), w_us.unwrap_or(0.0))), r_us, w_us)
+            };
 
             let h = self.history.entry(device.clone()).or_default();
             push_ring(&mut h.combined, bps, RING_LEN);
@@ -162,21 +163,20 @@ impl IoCollector {
 
             // Recompute percentiles from the windows. Sorts a copy each
             // time — cheap at this scale (≤300 samples).
-            let latency_pct =
-                if !h.read_us.is_empty() || !h.write_us.is_empty() {
-                    let (p50_r, p99_r, p999_r) = percentiles(&h.read_us);
-                    let (p50_w, p99_w, p999_w) = percentiles(&h.write_us);
-                    Some(LatencyPct {
-                        p50_r,
-                        p99_r,
-                        p999_r,
-                        p50_w,
-                        p99_w,
-                        p999_w,
-                    })
-                } else {
-                    None
-                };
+            let latency_pct = if !h.read_us.is_empty() || !h.write_us.is_empty() {
+                let (p50_r, p99_r, p999_r) = percentiles(&h.read_us);
+                let (p50_w, p99_w, p999_w) = percentiles(&h.write_us);
+                Some(LatencyPct {
+                    p50_r,
+                    p99_r,
+                    p999_r,
+                    p50_w,
+                    p99_w,
+                    p999_w,
+                })
+            } else {
+                None
+            };
 
             new_latest.push(IoTick {
                 device: device.clone(),
@@ -247,12 +247,24 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
         if is_partition_name(name) {
             continue;
         }
-        let Ok(reads) = fields[3].parse::<u64>() else { continue };
-        let Ok(sectors_read) = fields[5].parse::<u64>() else { continue };
-        let Ok(ms_reading) = fields[6].parse::<u64>() else { continue };
-        let Ok(writes) = fields[7].parse::<u64>() else { continue };
-        let Ok(sectors_written) = fields[9].parse::<u64>() else { continue };
-        let Ok(ms_writing) = fields[10].parse::<u64>() else { continue };
+        let Ok(reads) = fields[3].parse::<u64>() else {
+            continue;
+        };
+        let Ok(sectors_read) = fields[5].parse::<u64>() else {
+            continue;
+        };
+        let Ok(ms_reading) = fields[6].parse::<u64>() else {
+            continue;
+        };
+        let Ok(writes) = fields[7].parse::<u64>() else {
+            continue;
+        };
+        let Ok(sectors_written) = fields[9].parse::<u64>() else {
+            continue;
+        };
+        let Ok(ms_writing) = fields[10].parse::<u64>() else {
+            continue;
+        };
         out.insert(
             name.to_string(),
             DeviceTotals {
@@ -279,7 +291,10 @@ fn is_partition_name(name: &str) -> bool {
     if name.starts_with("dm-") {
         return false;
     }
-    name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    name.chars()
+        .last()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
 }
 
 fn push_ring(q: &mut VecDeque<f64>, v: f64, cap: usize) {
@@ -308,10 +323,7 @@ fn percentiles(samples: &VecDeque<f64>) -> (f64, f64, f64) {
 /// Sums device rates for the Overview "AGG IO" panel.
 pub fn aggregate(latest: &[IoTick]) -> (f64, f64) {
     let combined: f64 = latest.iter().map(|t| t.bps).sum();
-    let write: f64 = latest
-        .iter()
-        .filter_map(|t| t.split.map(|(_, w)| w))
-        .sum();
+    let write: f64 = latest.iter().filter_map(|t| t.split.map(|(_, w)| w)).sum();
     (combined, write)
 }
 

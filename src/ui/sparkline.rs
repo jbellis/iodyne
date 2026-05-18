@@ -15,7 +15,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
-const BLOCKS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+const BLOCKS: [char; 8] = [
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+];
 
 pub struct BaselineSparkline<'a> {
     samples: &'a [f64],
@@ -69,11 +71,7 @@ impl<'a> Widget for BaselineSparkline<'a> {
 
         let max = match self.max {
             Some(m) if m > 0.0 => m,
-            _ => visible
-                .iter()
-                .cloned()
-                .fold(0.0_f64, f64::max)
-                .max(1.0),
+            _ => visible.iter().cloned().fold(0.0_f64, f64::max).max(1.0),
         };
 
         for x in 0..w {

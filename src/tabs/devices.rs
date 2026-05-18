@@ -18,8 +18,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // filter chips + summary
-            Constraint::Min(8),    // device table
+            Constraint::Length(2),  // filter chips + summary
+            Constraint::Min(8),     // device table
             Constraint::Length(12), // detail panel + latency hist
         ])
         .split(area);
@@ -36,7 +36,9 @@ fn draw_filter_row(f: &mut Frame, area: Rect, count: usize) {
         Span::raw("  "),
         Span::styled(
             "size",
-            Style::default().fg(p::BR_WHITE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled("io", Style::default().fg(p::FG)),
@@ -91,7 +93,8 @@ fn draw_device_table(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Header
-    let header = "   DEVICE     MODEL                            BUS                 SIZE     USED   KIND";
+    let header =
+        "   DEVICE     MODEL                            BUS                 SIZE     USED   KIND";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header.to_string(),
@@ -107,9 +110,7 @@ fn draw_device_table(f: &mut Frame, area: Rect, app: &App) {
     );
 
     // Rule under header
-    let rule: String = std::iter::repeat('\u{2500}')
-        .take(inner.width as usize - 2)
-        .collect();
+    let rule: String = std::iter::repeat_n('\u{2500}', inner.width as usize - 2).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rule,
@@ -131,7 +132,14 @@ fn draw_device_table(f: &mut Frame, area: Rect, app: &App) {
             break;
         }
         let selected = i == app.selected_device;
-        draw_device_row(f, inner.x + 1, y, inner.width.saturating_sub(2), d, selected);
+        draw_device_row(
+            f,
+            inner.x + 1,
+            y,
+            inner.width.saturating_sub(2),
+            d,
+            selected,
+        );
         y += 2;
         let _ = rows_avail;
     }
@@ -159,18 +167,9 @@ fn draw_device_row(f: &mut Frame, x: u16, y: u16, w: u16, d: &DeviceTick, select
         Span::raw(" "),
         Span::styled("\u{25cf}", Style::default().fg(dot_color)),
         Span::raw(" "),
-        Span::styled(
-            pad_right(&d.name, 11),
-            Style::default().fg(name_color),
-        ),
-        Span::styled(
-            pad_right(&d.model, 32),
-            Style::default().fg(p::FG),
-        ),
-        Span::styled(
-            pad_right(&d.bus, 20),
-            Style::default().fg(p::DIM),
-        ),
+        Span::styled(pad_right(&d.name, 11), Style::default().fg(name_color)),
+        Span::styled(pad_right(&d.model, 32), Style::default().fg(p::FG)),
+        Span::styled(pad_right(&d.bus, 20), Style::default().fg(p::DIM)),
         Span::styled(
             pad_left(&fmt_size(d.size_bytes), 8),
             Style::default().fg(p::DIM),
@@ -187,9 +186,18 @@ fn draw_device_row(f: &mut Frame, x: u16, y: u16, w: u16, d: &DeviceTick, select
         ),
     ]);
 
-    let area = Rect { x, y, width: w, height: 1 };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: 1,
+    };
     f.render_widget(
-        Paragraph::new(primary).style(Style::default().bg(if selected { p::SEL_BG } else { p::BG })),
+        Paragraph::new(primary).style(Style::default().bg(if selected {
+            p::SEL_BG
+        } else {
+            p::BG
+        })),
         area,
     );
 
@@ -216,10 +224,18 @@ fn draw_device_row(f: &mut Frame, x: u16, y: u16, w: u16, d: &DeviceTick, select
         Span::styled(pad_right(serial, 22), Style::default().fg(p::DIM)),
         Span::styled(state.0, Style::default().fg(state.1)),
     ]);
-    let sub_area = Rect { x, y: y + 1, width: w, height: 1 };
+    let sub_area = Rect {
+        x,
+        y: y + 1,
+        width: w,
+        height: 1,
+    };
     f.render_widget(
-        Paragraph::new(sub_line)
-            .style(Style::default().bg(if selected { p::SEL_BG } else { p::BG })),
+        Paragraph::new(sub_line).style(Style::default().bg(if selected {
+            p::SEL_BG
+        } else {
+            p::BG
+        })),
         sub_area,
     );
 }
@@ -347,4 +363,3 @@ fn kind_color(k: DeviceKind) -> ratatui::style::Color {
         DeviceKind::Unknown => p::DIM,
     }
 }
-

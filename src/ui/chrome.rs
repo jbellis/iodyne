@@ -12,10 +12,7 @@ use crate::ui::palette as p;
 
 pub fn draw_header(f: &mut Frame, area: Rect, host: &HostInfo, live: LiveState) {
     let mut left: Vec<Span> = Vec::new();
-    left.push(Span::styled(
-        " \u{25cf}",
-        Style::default().fg(p::GREEN),
-    ));
+    left.push(Span::styled(" \u{25cf}", Style::default().fg(p::GREEN)));
     left.push(Span::styled(
         " DiskWatch",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
@@ -192,7 +189,11 @@ pub fn draw_footer(f: &mut Frame, area: Rect, extra: &[(char, &str)]) {
             spans.push(Span::styled(" \u{2502} ", Style::default().fg(p::FAINT)));
         }
         for (k, label) in g.iter() {
-            let key_str = if *k == '1' { "1-9".to_string() } else { k.to_string() };
+            let key_str = if *k == '1' {
+                "1-9".to_string()
+            } else {
+                k.to_string()
+            };
             spans.push(Span::styled(
                 key_str,
                 Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
@@ -229,9 +230,7 @@ pub fn draw_footer(f: &mut Frame, area: Rect, extra: &[(char, &str)]) {
         width: area.width,
         height: 1,
     };
-    let divider: String = std::iter::repeat('\u{2500}')
-        .take(area.width as usize)
-        .collect();
+    let divider: String = std::iter::repeat_n('\u{2500}', area.width as usize).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             divider,

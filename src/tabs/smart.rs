@@ -126,10 +126,7 @@ fn draw_missing_smartctl_banner(f: &mut Frame, area: Rect, d: &DeviceTick) {
                 "verified",
                 Style::default().fg(p::GREEN).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "  (via diskutil)",
-                Style::default().fg(p::DIM),
-            ),
+            Span::styled("  (via diskutil)", Style::default().fg(p::DIM)),
         ]),
         Some(false) => Line::from(vec![
             Span::styled("  SMART status: ", Style::default().fg(p::DIM)),
@@ -253,9 +250,8 @@ fn draw_ata_table(f: &mut Frame, area: Rect, tick: &SmartTick) {
         header.to_string(),
         Style::default().fg(p::DIM),
     ))];
-    let rule: String = std::iter::repeat('\u{2500}')
-        .take(area.width.saturating_sub(2) as usize)
-        .collect();
+    let rule: String =
+        std::iter::repeat_n('\u{2500}', area.width.saturating_sub(2) as usize).collect();
     lines.push(Line::from(Span::styled(
         rule,
         Style::default().fg(p::FAINT),
@@ -287,7 +283,9 @@ fn draw_ata_table(f: &mut Frame, area: Rect, tick: &SmartTick) {
             Span::raw("  "),
             Span::styled(
                 pad_left(
-                    &a.thresh.map(|t| t.to_string()).unwrap_or_else(|| "—".into()),
+                    &a.thresh
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "—".into()),
                     5,
                 ),
                 Style::default().fg(p::DIM),

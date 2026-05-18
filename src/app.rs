@@ -159,10 +159,7 @@ pub fn run(opts: Options) -> Result<()> {
     res
 }
 
-fn main_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let frame_budget = Duration::from_millis(50);
     loop {
         terminal.draw(|f| draw(f, app))?;
@@ -204,9 +201,7 @@ fn handle_key(app: &mut App, key: KeyCode) {
             TabId::Devices if app.selected_device + 1 < app.devices.len() => {
                 app.selected_device += 1
             }
-            TabId::Fs if app.selected_fs + 1 < app.filesystems.len() => {
-                app.selected_fs += 1
-            }
+            TabId::Fs if app.selected_fs + 1 < app.filesystems.len() => app.selected_fs += 1,
             _ => {}
         },
         _ => {}
@@ -217,10 +212,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // Paint the whole canvas with the terminal-bg before chrome draws, so
     // unfilled regions don't show through with the host terminal's default.
     let full = f.area();
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(p::BG)),
-        full,
-    );
+    f.render_widget(Paragraph::new("").style(Style::default().bg(p::BG)), full);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -244,6 +236,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     chrome::draw_footer(f, layout[3], &[]);
 }
 
+fn read_host(device_count: usize) -> HostInfo {
+    let hostname = System::host_name().unwrap_or_else(|| "localhost".to_string());
+    let name = System::name().unwrap_or_else(|| "unknown".to_string());
+    let version = System::os_version().unwrap_or_default();
+    let arch = std::env::consts::ARCH;
+    let os = if version.is_empty() {
+        format!("{} {}", name, arch)
+    } else {
+        format!("{} {} {}", name, version, arch)
+    };
+    HostInfo {
+        hostname,
+        os,
+        uptime_secs: System::uptime(),
+        device_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,7 +272,10 @@ mod tests {
             #[cfg(target_os = "macos")]
             {
                 assert!(d.size_bytes > 0, "macOS device should report size");
-                assert!(!d.model.is_empty() && d.model != "Unknown", "macOS device should have a model");
+                assert!(
+                    !d.model.is_empty() && d.model != "Unknown",
+                    "macOS device should have a model"
+                );
             }
         }
     }
@@ -293,23 +306,5 @@ mod tests {
         // We don't promise pretty output below the supported floor, only
         // that we don't panic.
         render_all_tabs(60, 20);
-    }
-}
-
-fn read_host(device_count: usize) -> HostInfo {
-    let hostname = System::host_name().unwrap_or_else(|| "localhost".to_string());
-    let name = System::name().unwrap_or_else(|| "unknown".to_string());
-    let version = System::os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH;
-    let os = if version.is_empty() {
-        format!("{} {}", name, arch)
-    } else {
-        format!("{} {} {}", name, version, arch)
-    };
-    HostInfo {
-        hostname,
-        os,
-        uptime_secs: System::uptime(),
-        device_count,
     }
 }

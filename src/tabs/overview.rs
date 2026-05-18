@@ -21,10 +21,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // KPI tiles
-            Constraint::Min(8),     // devices + IO chart
-            Constraint::Length(8),  // insights strip + hot files note
-            Constraint::Length(4),  // capacity bar
+            Constraint::Length(5), // KPI tiles
+            Constraint::Min(8),    // devices + IO chart
+            Constraint::Length(8), // insights strip + hot files note
+            Constraint::Length(4), // capacity bar
         ])
         .split(area);
 
@@ -167,14 +167,7 @@ fn draw_latency_tile(f: &mut Frame, area: Rect, app: &App) {
             );
         }
         None => {
-            render_tile(
-                f,
-                area,
-                "p99 LATENCY",
-                p::DIM,
-                "—",
-                "no IO observed yet",
-            );
+            render_tile(f, area, "p99 LATENCY", p::DIM, "—", "no IO observed yet");
         }
     }
 }
@@ -263,8 +256,7 @@ fn draw_devices_summary(f: &mut Frame, area: Rect, app: &App) {
     if inner.height < 2 {
         return;
     }
-    let header =
-        "   DEVICE     MODEL                         SIZE     USED   SMART";
+    let header = "   DEVICE     MODEL                         SIZE     USED   SMART";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header.to_string(),
@@ -388,7 +380,7 @@ fn aggregate_history(app: &App) -> Vec<f64> {
     // baseline sparkline widget handles the case where the area is
     // wider than the data.
     let mut buckets: Vec<f64> = Vec::new();
-    for (_, h) in &app.io.history {
+    for h in app.io.history.values() {
         for (i, v) in h.combined.iter().enumerate() {
             if i >= buckets.len() {
                 buckets.push(0.0);
@@ -416,9 +408,7 @@ fn draw_insights_summary(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(Span::styled(
             " INSIGHTS ",
-            Style::default()
-                .fg(p::YELLOW)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(p::BG));
     let inner = block.inner(area);
@@ -536,13 +526,13 @@ fn draw_capacity_bar(f: &mut Frame, area: Rect, app: &App) {
         } else {
             p::GREEN
         };
-        let block: String = std::iter::repeat('\u{2588}').take(seg_w).collect();
+        let block: String = std::iter::repeat_n('\u{2588}', seg_w).collect();
         spans.push(Span::styled(block, Style::default().fg(color).bg(p::BG)));
         consumed_cells += seg_w;
     }
     if consumed_cells < bar_w {
         let free_w = bar_w - consumed_cells;
-        let block: String = std::iter::repeat('\u{2591}').take(free_w).collect();
+        let block: String = std::iter::repeat_n('\u{2591}', free_w).collect();
         spans.push(Span::styled(block, Style::default().fg(p::FAINT).bg(p::BG)));
     }
     f.render_widget(

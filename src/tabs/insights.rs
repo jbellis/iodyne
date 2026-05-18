@@ -122,7 +122,9 @@ fn draw_card(f: &mut Frame, area: Rect, ins: &Insight) {
         Span::raw("  "),
         Span::styled(
             ins.title.clone(),
-            Style::default().fg(p::BR_WHITE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
     lines.push(header);

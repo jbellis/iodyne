@@ -67,7 +67,9 @@ pub(crate) fn parse_ioreg(text: &str) -> HashMap<String, IokitDeviceStats> {
             continue;
         }
         if line_is_node(line, "IOMedia") {
-            let Some(props) = read_property_block(&mut lines) else { continue };
+            let Some(props) = read_property_block(&mut lines) else {
+                continue;
+            };
             let bsd = props
                 .iter()
                 .find(|(k, _)| k == "BSD Name")

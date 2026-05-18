@@ -104,7 +104,7 @@ pub fn collect() -> Vec<DeviceTick> {
             })
             .collect();
         out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-        return out;
+        out
     }
 
     #[cfg(target_os = "linux")]
@@ -210,17 +210,18 @@ pub fn refresh_usage(devices: &mut [DeviceTick]) {
         let mut used_max = 0u64;
         for (mount_disk, mu) in &mounts {
             #[cfg(target_os = "macos")]
-            let phys = cmap.get(mount_disk).cloned().unwrap_or_else(|| mount_disk.clone());
+            let phys = cmap
+                .get(mount_disk)
+                .cloned()
+                .unwrap_or_else(|| mount_disk.clone());
             #[cfg(not(target_os = "macos"))]
             let phys = mount_disk.clone();
-            if phys == d.name {
-                if *mu > used_max {
-                    used_max = *mu;
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    used_sum = used_sum.saturating_add(*mu);
-                }
+            if phys == d.name && *mu > used_max {
+                used_max = *mu;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                used_sum = used_sum.saturating_add(*mu);
             }
         }
         #[cfg(target_os = "linux")]
@@ -289,10 +290,14 @@ fn macos_mount_table() -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in text.lines() {
         // Each line: "<device> on <mount> (fs, opts...)"
-        let Some(on_idx) = line.find(" on ") else { continue };
+        let Some(on_idx) = line.find(" on ") else {
+            continue;
+        };
         let device = line[..on_idx].trim().to_string();
         let after = &line[on_idx + 4..];
-        let Some(paren) = after.rfind(" (") else { continue };
+        let Some(paren) = after.rfind(" (") else {
+            continue;
+        };
         let mount = after[..paren].trim().to_string();
         map.insert(mount, device);
     }

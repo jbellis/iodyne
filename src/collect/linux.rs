@@ -53,7 +53,8 @@ pub fn collect() -> Vec<LinuxDevice> {
             || name.starts_with("ram")
             || name.starts_with("dm-")
             || name.starts_with("md")
-            || name.starts_with("zd") // ZFS zvols
+            || name.starts_with("zd")
+        // ZFS zvols
         {
             continue;
         }
@@ -87,7 +88,9 @@ fn parse_block(base: &Path, name: &str) -> LinuxDevice {
     // Compose a model string that includes the vendor when both are
     // present and the vendor isn't already a prefix of the model.
     let composed_model = if !vendor.is_empty()
-        && !model.to_ascii_lowercase().starts_with(&vendor.to_ascii_lowercase())
+        && !model
+            .to_ascii_lowercase()
+            .starts_with(&vendor.to_ascii_lowercase())
     {
         format!("{} {}", vendor, model)
     } else if model.is_empty() {

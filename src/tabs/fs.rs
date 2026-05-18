@@ -42,7 +42,9 @@ fn draw_filter_row(f: &mut Frame, area: Rect, fs: &[FsTick]) {
         Span::raw("  "),
         Span::styled(
             format!("mounted {}", mounted),
-            Style::default().fg(p::BR_WHITE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(format!("system {}", system), Style::default().fg(p::FG)),
@@ -97,9 +99,8 @@ fn draw_mounts_table(f: &mut Frame, area: Rect, app: &App) {
         },
     );
 
-    let rule: String = std::iter::repeat('\u{2500}')
-        .take(inner.width.saturating_sub(2) as usize)
-        .collect();
+    let rule: String =
+        std::iter::repeat_n('\u{2500}', inner.width.saturating_sub(2) as usize).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rule,
@@ -152,7 +153,12 @@ fn draw_fs_row(f: &mut Frame, x: u16, y: u16, w: u16, m: &FsTick, selected: bool
     // share the selection color.
     f.render_widget(
         Paragraph::new("").style(Style::default().bg(row_bg)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 
     let prefix = Line::from(vec![
@@ -174,7 +180,12 @@ fn draw_fs_row(f: &mut Frame, x: u16, y: u16, w: u16, m: &FsTick, selected: bool
     ]);
     f.render_widget(
         Paragraph::new(prefix).style(Style::default().bg(row_bg)),
-        Rect { x, y, width: w.min(70), height: 1 },
+        Rect {
+            x,
+            y,
+            width: w.min(70),
+            height: 1,
+        },
     );
 
     // Usage bar at x+70, 18 wide.
@@ -194,7 +205,12 @@ fn draw_fs_row(f: &mut Frame, x: u16, y: u16, w: u16, m: &FsTick, selected: bool
     if bar_x + bar_w <= x + w {
         f.render_widget(
             Paragraph::new(Line::from(bar_spans)),
-            Rect { x: bar_x, y, width: bar_w, height: 1 },
+            Rect {
+                x: bar_x,
+                y,
+                width: bar_w,
+                height: 1,
+            },
         );
     }
 
@@ -268,11 +284,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                 usage_color(used_pct),
             ),
             kv("free", &fmt_size(m.avail_bytes), p::FG),
-            kv(
-                "kind",
-                if m.is_system { "system" } else { "user" },
-                p::DIM,
-            ),
+            kv("kind", if m.is_system { "system" } else { "user" }, p::DIM),
             kv(
                 "removable",
                 if m.is_removable { "yes" } else { "no" },

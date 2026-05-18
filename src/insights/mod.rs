@@ -120,7 +120,7 @@ fn capacity_warning(fs: &[FsTick]) -> Option<Insight> {
         .filter(|m| {
             m.size_bytes > 0 && {
                 let p = used_pct(m);
-                p >= 80 && p < 90
+                (80..90).contains(&p)
             }
         })
         .collect();
@@ -234,9 +234,11 @@ fn io_dominant_device(io: &[IoTick]) -> Option<Insight> {
     if total < 1_000_000.0 {
         return None; // Don't fire on idle hosts.
     }
-    let dominant = io
-        .iter()
-        .max_by(|a, b| a.bps.partial_cmp(&b.bps).unwrap_or(std::cmp::Ordering::Equal))?;
+    let dominant = io.iter().max_by(|a, b| {
+        a.bps
+            .partial_cmp(&b.bps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
     let share = dominant.bps / total;
     if share < 0.80 {
         return None;

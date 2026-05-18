@@ -124,9 +124,11 @@ fn panel_areas(area: Rect, n: usize) -> Vec<Rect> {
         return Vec::new();
     }
     let cols = if n == 1 { 1 } else { 2 };
-    let rows = (n + cols - 1) / cols;
+    let rows = n.div_ceil(cols);
 
-    let row_constraints: Vec<Constraint> = (0..rows).map(|_| Constraint::Ratio(1, rows as u32)).collect();
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
     let row_areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
@@ -134,7 +136,7 @@ fn panel_areas(area: Rect, n: usize) -> Vec<Rect> {
 
     let mut out = Vec::with_capacity(n);
     for (r, row_area) in row_areas.iter().enumerate() {
-        let in_row = if r == rows - 1 && n % cols != 0 {
+        let in_row = if r == rows - 1 && !n.is_multiple_of(cols) {
             n % cols
         } else {
             cols
@@ -192,7 +194,9 @@ fn latency_line(tick: &IoTick) -> Line<'static> {
         Span::styled("p99 ", Style::default().fg(p::DIM)),
         Span::styled(
             lbl(pct.p99_r),
-            Style::default().fg(color(pct.p99_r)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color(pct.p99_r))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled("w ", Style::default().fg(p::DIM)),
@@ -202,7 +206,9 @@ fn latency_line(tick: &IoTick) -> Line<'static> {
         Span::styled("p99 ", Style::default().fg(p::DIM)),
         Span::styled(
             lbl(pct.p99_w),
-            Style::default().fg(color(pct.p99_w)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color(pct.p99_w))
+                .add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -273,8 +279,7 @@ fn draw_panel(f: &mut Frame, area: Rect, tick: &IoTick, history: Option<&DeviceH
         let panel_inner_h = inner.height.saturating_sub(3);
         let data: Vec<f64> = h.combined.iter().copied().collect();
         f.render_widget(
-            BaselineSparkline::new(&data)
-                .style(Style::default().fg(p::CYAN).bg(p::BG)),
+            BaselineSparkline::new(&data).style(Style::default().fg(p::CYAN).bg(p::BG)),
             Rect {
                 x: inner.x + 1,
                 y: inner.y + 2,
@@ -287,12 +292,10 @@ fn draw_panel(f: &mut Frame, area: Rect, tick: &IoTick, history: Option<&DeviceH
     // Footer note explains the percentile semantics so the user knows
     // what they're looking at.
     if inner.height >= 6 {
-        let lat = Line::from(vec![
-            Span::styled(
-                "  p50/p99 of per-tick averages — micro-spikes invisible without eBPF/IOReport",
-                Style::default().fg(p::DIM),
-            ),
-        ]);
+        let lat = Line::from(vec![Span::styled(
+            "  p50/p99 of per-tick averages — micro-spikes invisible without eBPF/IOReport",
+            Style::default().fg(p::DIM),
+        )]);
         f.render_widget(
             Paragraph::new(lat).style(Style::default().bg(p::BG)),
             Rect {

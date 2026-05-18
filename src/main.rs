@@ -29,9 +29,7 @@ fn main() -> Result<()> {
     if cli.diag {
         return run_diag();
     }
-    app::run(app::Options {
-        start_tab: cli.tab,
-    })
+    app::run(app::Options { start_tab: cli.tab })
 }
 
 fn run_diag() -> Result<()> {
@@ -64,7 +62,10 @@ fn run_diag() -> Result<()> {
         }
     }
 
-    println!("\n=== Filesystems ({}) ===", collect::filesystems::collect().len());
+    println!(
+        "\n=== Filesystems ({}) ===",
+        collect::filesystems::collect().len()
+    );
     for m in collect::filesystems::collect() {
         println!(
             "  {} -> {}  ({})  size={}  used={}",

@@ -84,11 +84,7 @@ fn draw_filter_row(
             if mdraid.len() == 1 { "" } else { "s" }
         )
     } else {
-        format!(
-            "{} apfs / {} mdraid",
-            containers.len(),
-            mdraid.len()
-        )
+        format!("{} apfs / {} mdraid", containers.len(), mdraid.len())
     };
     let line = Line::from(vec![
         Span::raw(" "),
@@ -96,7 +92,9 @@ fn draw_filter_row(
         Span::raw("  "),
         Span::styled(
             "all",
-            Style::default().fg(p::BR_WHITE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled("apfs", Style::default().fg(p::FG)),
@@ -147,9 +145,8 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
             height: 1,
         },
     );
-    let rule: String = std::iter::repeat('\u{2500}')
-        .take(inner.width.saturating_sub(2) as usize)
-        .collect();
+    let rule: String =
+        std::iter::repeat_n('\u{2500}', inner.width.saturating_sub(2) as usize).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rule,
@@ -222,10 +219,7 @@ fn draw_container_row(f: &mut Frame, x: u16, y: u16, w: u16, c: &ApfsContainer) 
             pad_right(&format!("\u{25be} {} (apfs)", c.bsd), 40),
             Style::default().fg(p::FG).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            pad_right("apfs ctr", 13),
-            Style::default().fg(p::CYAN),
-        ),
+        Span::styled(pad_right("apfs ctr", 13), Style::default().fg(p::CYAN)),
         Span::styled(
             pad_left(&fmt_size(c.size_bytes), 9),
             Style::default().fg(p::DIM),
@@ -236,10 +230,7 @@ fn draw_container_row(f: &mut Frame, x: u16, y: u16, w: u16, c: &ApfsContainer) 
             Style::default().fg(p::FG),
         ),
         Span::raw("  "),
-        Span::styled(
-            pad_right("mounted", 11),
-            Style::default().fg(p::GREEN),
-        ),
+        Span::styled(pad_right("mounted", 11), Style::default().fg(p::GREEN)),
         Span::styled(
             c.physical_store
                 .as_deref()
@@ -250,11 +241,22 @@ fn draw_container_row(f: &mut Frame, x: u16, y: u16, w: u16, c: &ApfsContainer) 
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::BG)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }
 
-fn draw_mdraid_row(f: &mut Frame, x: u16, y: u16, w: u16, arr: &crate::collect::volumes::MdRaidArray) {
+fn draw_mdraid_row(
+    f: &mut Frame,
+    x: u16,
+    y: u16,
+    w: u16,
+    arr: &crate::collect::volumes::MdRaidArray,
+) {
     let healthy = arr.members_present == arr.members_total && !arr.member_state.contains('_');
     let dot_color = if !healthy { p::YELLOW } else { p::GREEN };
     let state_label = if !healthy {
@@ -282,14 +284,14 @@ fn draw_mdraid_row(f: &mut Frame, x: u16, y: u16, w: u16, arr: &crate::collect::
         ),
         Span::raw("  "),
         Span::styled(
-            pad_left(
-                &format!("{}/{}", arr.members_present, arr.members_total),
-                5,
-            ),
+            pad_left(&format!("{}/{}", arr.members_present, arr.members_total), 5),
             Style::default().fg(p::FG),
         ),
         Span::raw("  "),
-        Span::styled(pad_right(&state_label, 11), Style::default().fg(state_color)),
+        Span::styled(
+            pad_right(&state_label, 11),
+            Style::default().fg(state_color),
+        ),
         Span::styled(
             format!("[{}]", arr.member_state),
             Style::default().fg(p::DIM),
@@ -297,7 +299,12 @@ fn draw_mdraid_row(f: &mut Frame, x: u16, y: u16, w: u16, arr: &crate::collect::
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::BG)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }
 
@@ -345,7 +352,12 @@ fn draw_member_row(
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::BG)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }
 
@@ -376,7 +388,12 @@ fn draw_progress_row(
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::BG)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }
 
@@ -387,15 +404,8 @@ fn draw_volume_row(f: &mut Frame, x: u16, y: u16, w: u16, v: &ApfsVolume, last: 
     } else {
         format!("{}  ({})", v.name, v.bsd)
     };
-    let mount = v
-        .mount_point
-        .as_deref()
-        .unwrap_or("(not mounted)");
-    let role_col = if v.role.is_empty() {
-        p::DIM
-    } else {
-        p::CYAN
-    };
+    let mount = v.mount_point.as_deref().unwrap_or("(not mounted)");
+    let role_col = if v.role.is_empty() { p::DIM } else { p::CYAN };
     let state = if v.mount_point.is_some() {
         ("mounted", p::GREEN)
     } else {
@@ -403,15 +413,22 @@ fn draw_volume_row(f: &mut Frame, x: u16, y: u16, w: u16, v: &ApfsVolume, last: 
     };
     let line = Line::from(vec![
         Span::raw(" "),
-        Span::styled("\u{25cf}", Style::default().fg(if v.mount_point.is_some() {
-            p::GREEN
-        } else {
-            p::DIM
-        })),
+        Span::styled(
+            "\u{25cf}",
+            Style::default().fg(if v.mount_point.is_some() {
+                p::GREEN
+            } else {
+                p::DIM
+            }),
+        ),
         Span::raw(" "),
         Span::styled(
             pad_right(&format!("{} {}", glyph, display_name), 40),
-            Style::default().fg(if v.mount_point.is_some() { p::FG } else { p::DIM }),
+            Style::default().fg(if v.mount_point.is_some() {
+                p::FG
+            } else {
+                p::DIM
+            }),
         ),
         Span::styled(
             pad_right(
@@ -437,6 +454,11 @@ fn draw_volume_row(f: &mut Frame, x: u16, y: u16, w: u16, v: &ApfsVolume, last: 
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::BG)),
-        Rect { x, y, width: w, height: 1 },
+        Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        },
     );
 }

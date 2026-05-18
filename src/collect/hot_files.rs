@@ -134,16 +134,17 @@ impl HotFileWatcher {
         drop(s);
 
         let state_w = state.clone();
-        let watcher_result = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-            let Ok(event) = result else { return };
-            let kind = ActivityKind::from_event(&event.kind);
-            // notify can emit multiple paths per event (e.g. rename). We
-            // record each path once.
-            let Ok(mut s) = state_w.lock() else { return };
-            for p in event.paths {
-                s.record(p, kind);
-            }
-        });
+        let watcher_result =
+            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                let Ok(event) = result else { return };
+                let kind = ActivityKind::from_event(&event.kind);
+                // notify can emit multiple paths per event (e.g. rename). We
+                // record each path once.
+                let Ok(mut s) = state_w.lock() else { return };
+                for p in event.paths {
+                    s.record(p, kind);
+                }
+            });
 
         let mut watcher = match watcher_result {
             Ok(w) => w,
@@ -217,11 +218,7 @@ impl HotFileWatcher {
 
     pub fn snapshot_meta(&self) -> (u64, Vec<PathBuf>, Option<String>) {
         let s = self.state.lock().unwrap();
-        (
-            s.total_events,
-            s.watch_roots.clone(),
-            s.error.clone(),
-        )
+        (s.total_events, s.watch_roots.clone(), s.error.clone())
     }
 }
 

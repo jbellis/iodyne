@@ -110,11 +110,20 @@ fn query_device(name: &str) -> Option<SmartTick> {
 
     // NVMe path.
     if let Some(log) = v.get("nvme_smart_health_information_log") {
-        tick.temperature_c = log.get("temperature").and_then(|x| x.as_i64()).map(|n| n as i16);
+        tick.temperature_c = log
+            .get("temperature")
+            .and_then(|x| x.as_i64())
+            .map(|n| n as i16);
         tick.power_on_hours = log.get("power_on_hours").and_then(|x| x.as_u64());
         tick.power_cycles = log.get("power_cycles").and_then(|x| x.as_u64());
-        tick.percentage_used = log.get("percentage_used").and_then(|x| x.as_u64()).map(|n| n as u8);
-        tick.available_spare = log.get("available_spare").and_then(|x| x.as_u64()).map(|n| n as u8);
+        tick.percentage_used = log
+            .get("percentage_used")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u8);
+        tick.available_spare = log
+            .get("available_spare")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u8);
         tick.data_units_read = log.get("data_units_read").and_then(|x| x.as_u64());
         tick.data_units_written = log.get("data_units_written").and_then(|x| x.as_u64());
     }
@@ -126,7 +135,9 @@ fn query_device(name: &str) -> Option<SmartTick> {
         .and_then(|x| x.as_array())
     {
         for a in attrs {
-            let Some(id) = a.get("id").and_then(|x| x.as_u64()) else { continue };
+            let Some(id) = a.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
             let name = a
                 .get("name")
                 .and_then(|x| x.as_str())

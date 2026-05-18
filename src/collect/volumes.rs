@@ -12,9 +12,9 @@ pub struct VolumeTick {
 
 #[derive(Debug, Clone, Default)]
 pub struct MdRaidArray {
-    pub name: String,             // "md0"
-    pub level: String,            // "raid10", "raid1", ...
-    pub state: String,            // "active", "inactive", ...
+    pub name: String,  // "md0"
+    pub level: String, // "raid10", "raid1", ...
+    pub state: String, // "active", "inactive", ...
     pub size_bytes: u64,
     /// "[4/4]" — total / present.
     pub members_total: u32,
@@ -64,7 +64,7 @@ pub struct ApfsVolume {
 pub fn collect() -> VolumeTick {
     #[cfg(target_os = "macos")]
     {
-        return macos_collect();
+        macos_collect()
     }
     #[cfg(target_os = "linux")]
     {
@@ -106,10 +106,7 @@ fn macos_collect() -> VolumeTick {
             if let Some(c) = cur_container.take() {
                 result.containers.push(c);
             }
-            let bsd: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace())
-                .collect();
+            let bsd: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
             cur_container = Some(ApfsContainer {
                 bsd,
                 ..Default::default()
@@ -124,10 +121,7 @@ fn macos_collect() -> VolumeTick {
                     c.volumes.push(v);
                 }
             }
-            let bsd: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace())
-                .collect();
+            let bsd: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
             cur_volume = Some(ApfsVolume {
                 bsd,
                 ..Default::default()
@@ -137,10 +131,7 @@ fn macos_collect() -> VolumeTick {
 
         // Physical store: "+-< Physical Store disk0s2 <uuid>"
         if let Some(rest) = trimmed.strip_prefix("+-< Physical Store ") {
-            let store: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace())
-                .collect();
+            let store: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
             if let Some(c) = cur_container.as_mut() {
                 c.physical_store = Some(store);
             }
@@ -272,9 +263,7 @@ pub(crate) fn parse_mdstat(text: &str) -> Vec<MdRaidArray> {
         let Some(arr) = cur.as_mut() else { continue };
 
         // Status line: "      7813767168 blocks super 1.2 256K chunks 2 near-copies [4/4] [UUUU]"
-        if line.trim_start().starts_with(|c: char| c.is_ascii_digit())
-            && line.contains("blocks")
-        {
+        if line.trim_start().starts_with(|c: char| c.is_ascii_digit()) && line.contains("blocks") {
             let mut tokens = line.split_whitespace();
             if let Some(blocks) = tokens.next().and_then(|s| s.parse::<u64>().ok()) {
                 arr.size_bytes = blocks.saturating_mul(1024);
@@ -291,7 +280,11 @@ pub(crate) fn parse_mdstat(text: &str) -> Vec<MdRaidArray> {
 
         // Progress line: "      [=====>...........]  resync = 15.0% (…) finish=89.3min speed=123776K/sec"
         let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && (trimmed.contains("resync") || trimmed.contains("recovery") || trimmed.contains("reshape") || trimmed.contains("check"))
+        if trimmed.starts_with('[')
+            && (trimmed.contains("resync")
+                || trimmed.contains("recovery")
+                || trimmed.contains("reshape")
+                || trimmed.contains("check"))
         {
             arr.progress = parse_progress(line);
             continue;
@@ -334,9 +327,7 @@ fn find_slot_pair(line: &str) -> Option<(u32, u32)> {
             let close = line[i..].find(']').map(|j| i + j)?;
             let inside = &line[i + 1..close];
             if let Some(slash) = inside.find('/') {
-                if let (Ok(a), Ok(b)) =
-                    (inside[..slash].parse(), inside[slash + 1..].parse())
-                {
+                if let (Ok(a), Ok(b)) = (inside[..slash].parse(), inside[slash + 1..].parse()) {
                     return Some((a, b));
                 }
             }
@@ -359,11 +350,7 @@ fn find_member_state(line: &str) -> Option<String> {
         if bytes[i] == b'[' {
             let close = line[i..].find(']').map(|j| i + j)?;
             let inside = &line[i + 1..close];
-            if !inside.is_empty()
-                && inside
-                    .chars()
-                    .all(|c| matches!(c, 'U' | '_' | 'B'))
-            {
+            if !inside.is_empty() && inside.chars().all(|c| matches!(c, 'U' | '_' | 'B')) {
                 return Some(inside.to_string());
             }
             i = close + 1;
