@@ -38,18 +38,38 @@ Where `lsblk` shows you *which disks exist*, DiskWatch shows you *what's happeni
 ## Install
 
 ```bash
+# Homebrew (macOS / Linux)
+brew install matthart1983/tap/diskwatch
+
+# Cargo
+cargo install diskwatch
+
+# Pre-built binaries — see Releases
+```
+
+<details>
+<summary><strong>All platforms & options</strong></summary>
+
+| Platform | Download |
+|----------|----------|
+| Linux (x86_64) | [`diskwatch-linux-x86_64.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+| Linux (aarch64) | [`diskwatch-linux-aarch64.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+| Linux (x86_64, static) | [`diskwatch-linux-x86_64-static.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+| Linux (aarch64, static) | [`diskwatch-linux-aarch64-static.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+| macOS (Intel) | [`diskwatch-macos-x86_64.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+| macOS (Apple Silicon) | [`diskwatch-macos-aarch64.tar.gz`](https://github.com/matthart1983/diskwatch/releases/latest) |
+
+**From source:**
+
+```bash
 git clone https://github.com/matthart1983/diskwatch.git && cd diskwatch
 cargo build --release
 ./target/release/diskwatch
 ```
 
-Or from crates.io:
+</details>
 
-```bash
-cargo install diskwatch
-```
-
-**Prerequisites:** Rust 1.75+. No system dependencies on Linux. macOS calls the standard `ioreg`, `diskutil`, and `system_profiler` binaries — all preinstalled. Optional: `smartmontools` (`brew install smartmontools` / `apt install smartmontools`) for full SMART attribute tables — without it, the SMART tab falls back to the basic verified/failing flag from `diskutil`.
+**Prerequisites:** Rust 1.75+ (only if building from source). No system dependencies on Linux. macOS calls the standard `ioreg`, `diskutil`, and `system_profiler` binaries — all preinstalled. Optional: `smartmontools` (`brew install smartmontools` / `apt install smartmontools`) for full SMART attribute tables — without it, the SMART tab falls back to the basic verified/failing flag from `diskutil`.
 
 ## Keys
 
