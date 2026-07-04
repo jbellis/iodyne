@@ -58,6 +58,7 @@ pub struct DeviceTick {
 }
 
 pub fn collect() -> Vec<DeviceTick> {
+    #[cfg(not(target_os = "linux"))]
     let mounts_used = sysinfo_mount_used();
 
     #[cfg(target_os = "macos")]
@@ -109,13 +110,7 @@ pub fn collect() -> Vec<DeviceTick> {
 
     #[cfg(target_os = "linux")]
     {
-        let mut used_by_device: HashMap<String, u64> = HashMap::new();
-        for (mount_disk, used) in &mounts_used {
-            let entry = used_by_device.entry(mount_disk.clone()).or_insert(0);
-            // Linux mounts each partition separately — sum used across
-            // partitions so the whole-disk total reflects actual usage.
-            *entry = entry.saturating_add(*used);
-        }
+        let used_by_device = linux_used_by_device();
         let mut out: Vec<DeviceTick> = linux::collect()
             .into_iter()
             .map(|l| {
@@ -197,42 +192,151 @@ pub fn collect() -> Vec<DeviceTick> {
 /// On macOS we re-use the cached container→physical map. If the topology
 /// changed (drive plugged in / out) the next full `collect()` picks it up.
 pub fn refresh_usage(devices: &mut [DeviceTick]) {
-    let mounts = sysinfo_mount_used();
-
-    #[cfg(target_os = "macos")]
-    let cmap = macos::container_to_physical_map();
-
-    for d in devices.iter_mut() {
-        // macOS APFS shares free across volumes → max-used per
-        // physical. Linux mounts partitions independently → sum.
-        #[cfg(target_os = "linux")]
-        let mut used_sum = 0u64;
-        let mut used_max = 0u64;
-        for (mount_disk, mu) in &mounts {
-            #[cfg(target_os = "macos")]
-            let phys = cmap
-                .get(mount_disk)
-                .cloned()
-                .unwrap_or_else(|| mount_disk.clone());
-            #[cfg(not(target_os = "macos"))]
-            let phys = mount_disk.clone();
-            if phys == d.name && *mu > used_max {
-                used_max = *mu;
-            }
-            #[cfg(target_os = "linux")]
-            {
-                used_sum = used_sum.saturating_add(*mu);
-            }
+    // Linux: shared attribution with collect() — a mount's usage lands
+    // only on the device(s) it actually lives on. (v0.1.1 summed every
+    // mount into every device here, so an 8-disk bcachefs box showed
+    // each disk at 266% — issue #4.)
+    #[cfg(target_os = "linux")]
+    {
+        let used = linux_used_by_device();
+        for d in devices.iter_mut() {
+            d.used_bytes = used.get(&d.name).copied().unwrap_or(0);
         }
-        #[cfg(target_os = "linux")]
-        {
-            d.used_bytes = used_sum;
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mounts = sysinfo_mount_used();
+
+        #[cfg(target_os = "macos")]
+        let cmap = macos::container_to_physical_map();
+
+        for d in devices.iter_mut() {
+            // macOS APFS shares free across volumes → max-used per physical.
+            let mut used_max = 0u64;
+            for (mount_disk, mu) in &mounts {
+                #[cfg(target_os = "macos")]
+                let phys = cmap
+                    .get(mount_disk)
+                    .cloned()
+                    .unwrap_or_else(|| mount_disk.clone());
+                #[cfg(not(target_os = "macos"))]
+                let phys = mount_disk.clone();
+                if phys == d.name && *mu > used_max {
+                    used_max = *mu;
+                }
+            }
             d.used_bytes = used_max;
         }
     }
+}
+
+/// Linux: map whole-disk device names to used bytes, attributing each
+/// mounted filesystem to the device(s) backing it.
+#[cfg(target_os = "linux")]
+fn linux_used_by_device() -> HashMap<String, u64> {
+    let disks = Disks::new_with_refreshed_list();
+    // Dedupe by raw mount source first: the same source mounted at
+    // several points (bind mounts, btrfs subvolumes, `/` + `/nix/store`)
+    // is one filesystem and must count once.
+    let mut by_source: HashMap<String, u64> = HashMap::new();
+    for d in disks.list() {
+        let used = d.total_space().saturating_sub(d.available_space());
+        if used == 0 {
+            continue;
+        }
+        let source = d.name().to_string_lossy().to_string();
+        let entry = by_source.entry(source).or_insert(0);
+        if used > *entry {
+            *entry = used;
+        }
+    }
+    attribute_sources(&by_source, &sysfs_slaves)
+}
+
+/// Attribute per-mount-source used bytes to whole-disk device names.
+///
+/// Handles the source shapes that broke v0.1.1 (issue #4):
+/// - `/dev/sda1` — plain partition → parent disk.
+/// - `/dev/sda:/dev/sdb:...` — bcachefs multi-device → split across members.
+/// - `/dev/md0`, `/dev/mapper/vg-lv` — stacked devices → resolved to their
+///   member disks via `slaves`.
+/// - `overlay`, `tmpfs`, ZFS datasets — no `/dev/` source → attributed to
+///   nothing rather than to everything.
+///
+/// statfs totals are filesystem-wide, so a filesystem spanning N disks is
+/// split evenly — per-member truth isn't knowable from statfs alone.
+///
+/// `slaves` resolves a stacked block device path to its member disk names
+/// (`/dev/md0` → `["sda", "sdb"]`), returning `None` for plain devices.
+// Only called from Linux collection, but compiled everywhere so the
+// pure-logic tests run on any development machine.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn attribute_sources(
+    by_source: &HashMap<String, u64>,
+    slaves: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = HashMap::new();
+    for (source, used) in by_source {
+        let mut members: Vec<String> = source
+            .split(':')
+            .filter(|piece| piece.starts_with("/dev/"))
+            .flat_map(|piece| match slaves(piece) {
+                Some(m) if !m.is_empty() => m,
+                _ => vec![short_name(piece)],
+            })
+            .collect();
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            continue;
+        }
+        let share = used / members.len() as u64;
+        for m in members {
+            let entry = out.entry(m).or_insert(0);
+            *entry = entry.saturating_add(share);
+        }
+    }
+    out
+}
+
+/// Resolve a stacked block device (`/dev/md0`, `/dev/mapper/vg-lv`) to its
+/// member disk names via `/sys/block/<dev>/slaves`, following nesting
+/// (dm-on-md) a few levels deep. Returns `None` for plain devices.
+#[cfg(target_os = "linux")]
+fn sysfs_slaves(dev_path: &str) -> Option<Vec<String>> {
+    // /dev/mapper/* entries are symlinks to ../dm-N — resolve to the
+    // kernel name that /sys/block uses.
+    let kernel_name = match std::fs::read_link(dev_path) {
+        Ok(target) => target.file_name()?.to_string_lossy().into_owned(),
+        Err(_) => dev_path.trim_start_matches("/dev/").to_string(),
+    };
+
+    fn expand(name: &str, depth: u8, out: &mut Vec<String>) {
+        let slaves_dir = format!("/sys/block/{}/slaves", name);
+        let entries: Vec<String> = std::fs::read_dir(&slaves_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if entries.is_empty() || depth == 0 {
+            out.push(short_name(name));
+            return;
+        }
+        for slave in entries {
+            // Slaves may be partitions (sda1) — fold to the parent disk.
+            expand(&short_name(&slave), depth - 1, out);
+        }
+    }
+
+    if !std::path::Path::new(&format!("/sys/block/{}/slaves", kernel_name)).is_dir() {
+        return None;
+    }
+    let mut out = Vec::new();
+    expand(&kernel_name, 4, &mut out);
+    Some(out)
 }
 
 /// Returns (physical-or-container-disk, used_bytes) per sysinfo mount,
@@ -244,6 +348,7 @@ pub fn refresh_usage(devices: &mut [DeviceTick]) {
 /// label (`Macintosh HD`). The macOS path resolves the device path via
 /// the `mount` command's mount-point → device mapping; the Linux path
 /// keeps the existing behavior.
+#[cfg(not(target_os = "linux"))]
 fn sysinfo_mount_used() -> Vec<(String, u64)> {
     let disks = Disks::new_with_refreshed_list();
     #[cfg(target_os = "macos")]
@@ -304,29 +409,124 @@ fn macos_mount_table() -> HashMap<String, String> {
     map
 }
 
+/// Fold a device path or partition name to its whole-disk name:
+/// `/dev/sda1` → `sda`, `nvme0n1p2` → `nvme0n1`, `mmcblk0p2` → `mmcblk0`,
+/// `disk3s1` → `disk3` (macOS). Names with no partition suffix pass
+/// through unchanged (`md0`, `mmcblk0boot0`, `overlay`).
 fn short_name(raw: &str) -> String {
     let s = raw.trim_start_matches("/dev/");
+    // macOS: diskNsM → diskN
     if let Some(rest) = s.strip_prefix("disk") {
         let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if !n.is_empty() {
             return format!("disk{}", n);
         }
     }
-    if let Some(rest) = s.strip_prefix("nvme") {
-        let mut out = String::from("nvme");
-        for c in rest.chars() {
-            if c.is_ascii_digit() || c == 'n' {
-                out.push(c);
-            } else {
-                break;
-            }
+    // "<base>p<digits>" where base ends in a digit → base
+    // (nvme0n1p2 → nvme0n1, mmcblk0p2 → mmcblk0, md0p1 → md0)
+    if let Some(idx) = s.rfind('p') {
+        let (base, part) = (&s[..idx], &s[idx + 1..]);
+        if base.ends_with(|c: char| c.is_ascii_digit())
+            && !part.is_empty()
+            && part.chars().all(|c| c.is_ascii_digit())
+        {
+            return base.to_string();
         }
-        return out;
     }
-    if s.starts_with("sd") && s.len() >= 3 {
+    // Trailing partition digits on letter-named disks (sda1 → sda,
+    // vdb2 → vdb, xvda1 → xvda). Digits are part of the name elsewhere
+    // (md0, loop3), so only these prefixes are folded.
+    if ["sd", "hd", "vd", "xvd"].iter().any(|p| s.starts_with(p)) {
         return s.chars().take_while(|c| !c.is_ascii_digit()).collect();
     }
     s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_name_folds_partitions() {
+        assert_eq!(short_name("/dev/sda1"), "sda");
+        assert_eq!(short_name("/dev/sda"), "sda");
+        assert_eq!(short_name("/dev/nvme0n1p2"), "nvme0n1");
+        assert_eq!(short_name("/dev/nvme0n1"), "nvme0n1");
+        assert_eq!(short_name("/dev/mmcblk0p2"), "mmcblk0");
+        assert_eq!(short_name("/dev/mmcblk0"), "mmcblk0");
+        assert_eq!(short_name("/dev/mmcblk0boot0"), "mmcblk0boot0");
+        assert_eq!(short_name("/dev/md0"), "md0");
+        assert_eq!(short_name("/dev/md0p1"), "md0");
+        assert_eq!(short_name("/dev/vdb2"), "vdb");
+        assert_eq!(short_name("/dev/xvda1"), "xvda");
+        assert_eq!(short_name("/dev/disk3s1"), "disk3");
+        assert_eq!(short_name("overlay"), "overlay");
+    }
+
+    fn no_slaves(_: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    fn sources(list: &[(&str, u64)]) -> HashMap<String, u64> {
+        list.iter().map(|(s, u)| (s.to_string(), *u)).collect()
+    }
+
+    #[test]
+    fn plain_partition_attributes_to_parent_disk() {
+        let by_source = sources(&[("/dev/mmcblk0p2", 27_000), ("/dev/mmcblk0p1", 300)]);
+        let out = attribute_sources(&by_source, &no_slaves);
+        assert_eq!(out.get("mmcblk0"), Some(&27_300));
+    }
+
+    #[test]
+    fn bcachefs_multi_device_splits_across_members() {
+        // Issue #4: 8× 480 GB bcachefs. v0.1.1 credited the whole fs to
+        // every attached device; the fs usage must be split across its
+        // members and land nowhere else.
+        let members = (b'a'..=b'h')
+            .map(|c| format!("/dev/sd{}", c as char))
+            .collect::<Vec<_>>()
+            .join(":");
+        let by_source = sources(&[(members.as_str(), 640_000_000)]);
+        let out = attribute_sources(&by_source, &no_slaves);
+        assert_eq!(out.get("sda"), Some(&80_000_000));
+        assert_eq!(out.get("sdh"), Some(&80_000_000));
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn md_array_splits_across_slaves() {
+        // Issue #4 (second report): RAID0 across USB disks. The array's
+        // usage splits across its members via the slaves map.
+        let slaves = |dev: &str| -> Option<Vec<String>> {
+            (dev == "/dev/md0")
+                .then(|| vec!["sdd".into(), "sdb".into(), "sde".into(), "sdc".into()])
+        };
+        let by_source = sources(&[("/dev/md0", 4_000_000), ("/dev/nvme0n1p1", 5_000)]);
+        let out = attribute_sources(&by_source, &slaves);
+        assert_eq!(out.get("sdd"), Some(&1_000_000));
+        assert_eq!(out.get("sdc"), Some(&1_000_000));
+        assert_eq!(out.get("nvme0n1"), Some(&5_000));
+        assert_eq!(out.get("md0"), None);
+    }
+
+    #[test]
+    fn virtual_sources_attribute_to_nothing() {
+        let by_source = sources(&[
+            ("overlay", 640_000_000),
+            ("tmpfs", 1_000),
+            ("pool/dataset", 9_000),
+        ]);
+        let out = attribute_sources(&by_source, &no_slaves);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn same_disk_partitions_sum() {
+        let by_source = sources(&[("/dev/sda1", 100), ("/dev/sda2", 250)]);
+        let out = attribute_sources(&by_source, &no_slaves);
+        assert_eq!(out.get("sda"), Some(&350));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
