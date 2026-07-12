@@ -490,23 +490,38 @@ mod tests {
             "Free",
             "B/s",
             "IOPS",
-            "sda detail",
+            "sda |",
             "READ",
             "WRITE",
             "Await",
-            "VFS activity",
+            "VFS | 10s",
         ] {
             assert!(
                 text.contains(expected),
                 "missing {expected:?} at {width}x{height}"
             );
         }
+        for removed in [
+            "j/k selects detail",
+            "latency distribution",
+            "requested rates",
+            "VFS activity",
+        ] {
+            assert!(
+                !text.contains(removed),
+                "stale {removed:?} at {width}x{height}"
+            );
+        }
+        assert!(text.lines().any(|line| line.starts_with('+')));
+        assert!(text.lines().any(|line| line.starts_with('|')));
     }
 
     #[test]
     fn populated_screen_renders_overview_and_detail_at_responsive_sizes() {
         assert_populated_screen(130, 36);
         assert_populated_screen(110, 30);
+        let _ = render_screen(&fixture_app(true), 60, 20);
+        let _ = render_screen(&fixture_app(true), 24, 10);
     }
 
     #[test]

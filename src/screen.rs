@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols::border::Set as BorderSet;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -42,10 +43,20 @@ const HEAT_LABELS: [&str; 7] = [
     ">=256ms",
 ];
 const WIDE_DETAIL_HEIGHT: u16 = 28;
-const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 1;
-const COMPACT_DETAIL_HEIGHT: u16 = 21;
-const DIRECTION_DETAIL_HEIGHT: u16 = 13;
+const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 2;
+const COMPACT_DETAIL_HEIGHT: u16 = 23;
+const DIRECTION_DETAIL_HEIGHT: u16 = 14;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
+const ASCII_BORDER: BorderSet = BorderSet {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
@@ -57,30 +68,31 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(md_state.is_some() as u16),
-            Constraint::Length(1),
             Constraint::Min(1),
         ])
         .split(area);
 
-    draw_summary_line(f, rows[0], app);
     if let Some(state) = md_state {
-        draw_md_exception(f, rows[1], &state);
+        draw_md_exception(f, rows[0], &state);
     }
-    draw_scale_legend(f, rows[2]);
-    draw_master_detail(f, rows[3], app);
+    draw_master_detail(f, rows[1], app);
+}
+
+fn ascii_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(ASCII_BORDER)
+        .border_style(Style::default().fg(p::FAINT).bg(p::BG))
+        .title(title)
+        .style(Style::default().bg(p::BG))
 }
 
 fn draw_empty(f: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p::FAINT).bg(p::BG))
-        .title(Span::styled(
-            " IO ",
-            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(p::BG));
+    let block = ascii_block(Span::styled(
+        " IO ",
+        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -96,12 +108,12 @@ fn draw_empty(f: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_summary_line(f: &mut Frame, area: Rect, app: &App) {
+fn overview_title(app: &App) -> Line<'static> {
     let source = match app.io.latency_source() {
         LatencySource::AggregateAwait => "AGGREGATE AWAIT",
         LatencySource::EbpfPerRequest => "PER-REQUEST eBPF",
     };
-    let mut spans = vec![
+    let spans = vec![
         Span::raw(" "),
         Span::styled(
             source,
@@ -109,42 +121,20 @@ fn draw_summary_line(f: &mut Frame, area: Rect, app: &App) {
                 .fg(p::BR_WHITE)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
-    spans.push(Span::raw("   "));
-    spans.push(Span::styled(
-        format!(
-            "{} device{}",
-            app.io.latest.len(),
-            if app.io.latest.len() == 1 { "" } else { "s" }
+        Span::styled(" | ", Style::default().fg(p::FAINT)),
+        Span::styled(
+            if app.io_show_unmounted {
+                "all"
+            } else {
+                "mounted"
+            },
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
         ),
-        Style::default().fg(p::DIM),
-    ));
-    spans.push(Span::raw("   "));
-    spans.push(Span::styled("view ", Style::default().fg(p::DIM)));
-    spans.push(Span::styled(
-        if app.io_show_unmounted {
-            "all"
-        } else {
-            "mounted"
-        },
-        Style::default()
-            .fg(p::BR_WHITE)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(" (u toggles)", Style::default().fg(p::DIM)));
-    spans.push(Span::styled(
-        "   j/k selects detail",
-        Style::default().fg(p::DIM),
-    ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(p::BG)),
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: 1,
-        },
-    );
+        Span::raw(" "),
+    ];
+    Line::from(spans)
 }
 
 fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
@@ -159,21 +149,37 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(overview_height),
-            Constraint::Length((detail_height > 0) as u16),
             Constraint::Length(detail_height),
             Constraint::Min(0),
         ])
         .split(area);
     let selected = app.selected_io.min(visible.len() - 1);
     let (throughput_scale, iops_scale) = overview_workload_scales(&visible, app);
-    let (start, count, _) = visible_band_window(sections[0].height, visible.len(), selected);
+    let overview_block = ascii_block(overview_title(app));
+    let overview_inner = overview_block.inner(sections[0]);
+    f.render_widget(overview_block, sections[0]);
+    if overview_inner.height > 0 {
+        draw_scale_legend(
+            f,
+            Rect {
+                height: 1,
+                ..overview_inner
+            },
+        );
+    }
+    let device_area = Rect {
+        y: overview_inner.y.saturating_add(1),
+        height: overview_inner.height.saturating_sub(1),
+        ..overview_inner
+    };
+    let (start, count, _) = visible_band_window(device_area.height, visible.len(), selected);
     for (slot, tick) in visible.iter().skip(start).take(count).enumerate() {
         draw_overview_row(
             f,
             Rect {
-                x: sections[0].x,
-                y: sections[0].y + slot as u16,
-                width: sections[0].width,
+                x: device_area.x,
+                y: device_area.y + slot as u16,
+                width: device_area.width,
                 height: 1,
             },
             tick,
@@ -183,15 +189,18 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             iops_scale,
         );
     }
-    draw_detail(f, sections[2], visible[selected], app);
+    draw_detail(f, sections[1], visible[selected], app);
 }
 
 fn visible_band_window(height: u16, total: usize, selected: usize) -> (usize, usize, usize) {
     if total == 0 {
         return (0, 0, 0);
     }
-    let slots = (height.max(1) as usize).min(total);
     let selected = selected.min(total - 1);
+    if height == 0 {
+        return (selected, 0, selected);
+    }
+    let slots = (height as usize).min(total);
     let start = selected
         .saturating_add(1)
         .saturating_sub(slots)
@@ -215,14 +224,10 @@ pub(crate) fn visible_device_count(app: &App) -> usize {
 }
 
 fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p::FAINT).bg(p::BG))
-        .title(Span::styled(
-            " IO ",
-            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(p::BG));
+    let block = ascii_block(Span::styled(
+        " IO ",
+        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -473,23 +478,23 @@ fn row_geometry(width: u16) -> RowGeometry {
 }
 
 fn master_detail_heights(height: u16, device_count: usize) -> (u16, u16) {
-    if height <= 2 {
+    if height <= 3 {
         return (height, 0);
     }
-    let detail_reserve = if height >= 32 {
+    let detail_reserve = if height >= 34 {
         WIDE_DETAIL_HEIGHT
-    } else if height >= 24 {
+    } else if height >= 26 {
         COMPACT_DETAIL_HEIGHT
     } else {
-        height.saturating_sub(6).min(WIDE_DETAIL_HEIGHT)
+        height.saturating_sub(4).min(WIDE_DETAIL_HEIGHT)
     };
-    let max_overview = height.saturating_sub(detail_reserve + 1).max(1);
+    let min_overview = height.min(4);
+    let detail = detail_reserve.min(height.saturating_sub(min_overview));
+    let max_overview = height.saturating_sub(detail).max(1);
     let devices = device_count.max(1).min(u16::MAX as usize) as u16;
-    let overview = devices.min(max_overview);
-    (
-        overview,
-        detail_reserve.min(height.saturating_sub(overview + 1)),
-    )
+    // Top and bottom borders plus the shared column/latency scale row.
+    let overview = devices.saturating_add(3).min(max_overview);
+    (overview, detail.min(height.saturating_sub(overview)))
 }
 
 fn draw_overview_row(
@@ -678,25 +683,19 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         return;
     }
     let header = detail_header(&tick.device, &app.filesystems, &app.volumes);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            header,
-            Style::default()
-                .fg(p::BR_WHITE)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: 1,
-        },
-    );
-    if area.height <= 1 {
+    let block = ascii_block(Span::styled(
+        header,
+        Style::default()
+            .fg(p::BR_WHITE)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
         return;
     }
     let context = detail_context_lines(tick, app);
-    let context_rows = detail_context_row_count(area.height, context.len());
+    let context_rows = detail_context_row_count(inner.height, context.len());
     for (offset, line) in context.iter().take(context_rows as usize).enumerate() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -704,17 +703,17 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
                 Style::default().fg(p::DIM),
             )),
             Rect {
-                x: area.x,
-                y: area.y + 1 + offset as u16,
-                width: area.width,
+                x: inner.x,
+                y: inner.y + offset as u16,
+                width: inner.width,
                 height: 1,
             },
         );
     }
     let body = Rect {
-        y: area.y + 1 + context_rows,
-        height: area.height.saturating_sub(1 + context_rows),
-        ..area
+        y: inner.y + context_rows,
+        height: inner.height.saturating_sub(context_rows),
+        ..inner
     };
     let (read_area, write_area, vfs_area) = detail_areas(body);
     let workload = app
@@ -750,7 +749,7 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
 fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
     (available_lines as u16)
         .min(MAX_DETAIL_CONTEXT_ROWS)
-        .min(detail_height.saturating_sub(1 + DIRECTION_DETAIL_HEIGHT))
+        .min(detail_height.saturating_sub(DIRECTION_DETAIL_HEIGHT))
 }
 
 fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
@@ -821,29 +820,26 @@ fn draw_direction_detail(
         IoLane::Write => ("WRITE", p::CYAN),
     };
     let total = histogram.iter().sum::<u64>();
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {name}"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · last 60s · latency distribution · {total}"),
-                Style::default().fg(p::DIM),
-            ),
-        ])),
-        Rect { height: 1, ..area },
-    );
-    let label_width = 11.min(area.width);
-    for band in 0..7.min(area.height.saturating_sub(1) as usize) {
-        let y = area.y + 1 + band as u16;
+    let block = ascii_block(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            name,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" | 60s | n={total} "), Style::default().fg(p::DIM)),
+    ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let label_width = 11.min(inner.width);
+    for band in 0..7.min(inner.height as usize) {
+        let y = inner.y + band as u16;
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!(" {:<10}", HEAT_LABELS[band]),
                 Style::default().fg(p::DIM),
             )),
             Rect {
-                x: area.x,
+                x: inner.x,
                 y,
                 width: label_width,
                 height: 1,
@@ -852,9 +848,9 @@ fn draw_direction_detail(
         draw_histogram_lane(
             f,
             Rect {
-                x: area.x + label_width,
+                x: inner.x + label_width,
                 y,
-                width: area.width.saturating_sub(label_width),
+                width: inner.width.saturating_sub(label_width),
                 height: 1,
             },
             histogram[band],
@@ -863,7 +859,7 @@ fn draw_direction_detail(
         );
     }
 
-    if area.height <= 8 {
+    if inner.height <= 7 {
         return;
     }
     let metric_rows = Layout::default()
@@ -876,9 +872,9 @@ fn draw_direction_detail(
             Constraint::Length(1),
         ])
         .split(Rect {
-            y: area.y + 8,
-            height: area.height - 8,
-            ..area
+            y: inner.y + 7,
+            height: inner.height - 7,
+            ..inner
         });
     draw_direction_metrics(f, &metric_rows, lane, workload, await_view);
 }
@@ -1243,34 +1239,27 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let data_rows = area.height.saturating_sub(1);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " VFS activity · rolling 10s",
-                Style::default()
-                    .fg(p::BR_WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · requested rates · ops/s", Style::default().fg(p::DIM)),
-            if data_rows == 0 {
-                Span::styled(" · need 2 data rows", Style::default().fg(p::DIM))
-            } else {
-                Span::raw("")
-            },
-        ])),
-        Rect { height: 1, ..area },
-    );
-    if area.height <= 1 {
+    let block = ascii_block(Line::from(vec![
+        Span::styled(
+            " VFS ",
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("| 10s ", Style::default().fg(p::DIM)),
+    ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
         return;
     }
-    if vfs_entry_capacity(data_rows) == 0 {
-        draw_vfs_status(f, area, "need 2 rows to show VFS activity");
+    if vfs_entry_capacity(inner.height) == 0 {
+        draw_vfs_status(f, inner, "need 2 rows");
         return;
     }
 
     if app.io.hot_files_source() != VfsActivitySource::EbpfRequestedBytes {
-        draw_vfs_status(f, area, vfs_unavailable_message(app.io.hot_files_status()));
+        draw_vfs_status(f, inner, vfs_unavailable_message(app.io.hot_files_status()));
         return;
     }
 
@@ -1282,20 +1271,20 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         } else {
             "no VFS activity in the last 10s"
         };
-        draw_vfs_status(f, area, status);
+        draw_vfs_status(f, inner, status);
         return;
     }
 
-    let capacity = vfs_entry_capacity(data_rows);
+    let capacity = vfs_entry_capacity(inner.height);
     let visible: Vec<_> = entries.into_iter().take(capacity).collect();
     let scale = vfs_activity_scale(&visible);
     for (row, item) in visible.into_iter().enumerate() {
         draw_vfs_entry(
             f,
             Rect {
-                x: area.x,
-                y: area.y + 1 + row as u16 * 2,
-                width: area.width,
+                x: inner.x,
+                y: inner.y + row as u16 * 2,
+                width: inner.width,
                 height: 2,
             },
             item,
@@ -1320,7 +1309,7 @@ fn draw_vfs_status(f: &mut Frame, area: Rect, message: &str) {
             Style::default().fg(p::DIM),
         )),
         Rect {
-            y: area.y + 1,
+            y: area.y,
             height: 1,
             ..area
         },
@@ -1903,14 +1892,14 @@ fn detail_header(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> 
     chains.sort_unstable();
     chains.dedup();
     if chains.is_empty() {
-        return format!(" {device} detail · [no attributed mount]");
+        return format!(" {device} | no mount ");
     }
     let extra = chains.len().saturating_sub(2);
     let mut topology = chains.into_iter().take(2).collect::<Vec<_>>().join("; ");
     if extra > 0 {
         topology.push_str(&format!(" +{extra} mounts"));
     }
-    format!(" {device} detail · {topology}")
+    format!(" {device} | {topology} ")
 }
 
 fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
@@ -2651,11 +2640,11 @@ mod tests {
 
         assert_eq!(
             detail_header("sda", &filesystems, &VolumeTick::default()),
-            " sda detail · / → sda1 → sda; /home → sda2 → sda"
+            " sda | / → sda1 → sda; /home → sda2 → sda "
         );
         assert_eq!(
             detail_header("sdb", &filesystems, &VolumeTick::default()),
-            " sdb detail · [no attributed mount]"
+            " sdb | no mount "
         );
     }
 
@@ -2669,7 +2658,7 @@ mod tests {
 
         assert_eq!(
             detail_header("sdd", &filesystems, &volumes),
-            " sdd detail · /mnt/data → md0/raid1 → {sdd1 (selected),sde1}"
+            " sdd | /mnt/data → md0/raid1 → {sdd1 (selected),sde1} "
         );
     }
 
@@ -2687,7 +2676,7 @@ mod tests {
 
         assert_eq!(
             detail_header("disk0", &filesystems, &volumes),
-            " disk0 detail · / → disk3s1 → disk3 → disk0s2 → disk0"
+            " disk0 | / → disk3s1 → disk3 → disk0s2 → disk0 "
         );
         assert_eq!(
             attributable_filesystems("disk0", &filesystems, &volumes).len(),
@@ -2879,11 +2868,11 @@ mod tests {
     fn context_rows_preserve_directional_and_normal_vfs_bodies() {
         assert_eq!(detail_context_row_count(28, 2), 2);
         let (_, _, tall_vfs) = detail_areas(Rect::new(0, 0, 130, 25));
-        assert_eq!(tall_vfs.height, 11);
+        assert_eq!(tall_vfs.height, 10);
 
-        assert_eq!(detail_context_row_count(21, 2), 2);
+        assert_eq!(detail_context_row_count(23, 2), 2);
         let (_, _, compact_vfs) = detail_areas(Rect::new(0, 0, 110, 18));
-        assert_eq!(compact_vfs.height, 4);
+        assert_eq!(compact_vfs.height, 3);
 
         assert_eq!(detail_context_row_count(14, 2), 0);
         let (read, write, _) = detail_areas(Rect::new(0, 0, 60, 13));
@@ -2900,17 +2889,18 @@ mod tests {
     #[test]
     fn undersized_band_area_still_has_one_visible_device() {
         assert_eq!(visible_band_window(1, 10, 7), (7, 1, 7));
+        assert_eq!(visible_band_window(0, 10, 7), (7, 0, 7));
         assert_eq!(visible_band_window(0, 0, 0), (0, 0, 0));
     }
 
     #[test]
-    fn compact_layout_reserves_exactly_one_separator_row() {
-        assert_eq!(master_detail_heights(28, 30), (6, 21));
-        assert_eq!(master_detail_heights(28, 8), (6, 21));
-        assert_eq!(master_detail_heights(8, 8), (5, 2));
+    fn pane_layout_reserves_borders_and_one_separator_row() {
+        assert_eq!(master_detail_heights(28, 30), (5, 23));
+        assert_eq!(master_detail_heights(28, 8), (5, 23));
+        assert_eq!(master_detail_heights(8, 8), (4, 4));
         assert_eq!(master_detail_heights(1, 8), (1, 0));
         let (overview, detail) = master_detail_heights(28, 8);
-        assert!(overview + 1 + detail <= 28);
+        assert!(overview + detail <= 28);
         assert_eq!(row_geometry(60).label + row_geometry(60).plot, 60);
         assert_eq!(row_geometry(130).label, 43);
         assert_eq!(row_geometry(130).plot, 87);
@@ -3109,6 +3099,23 @@ mod tests {
     }
 
     #[test]
+    fn pane_borders_are_literal_ascii() {
+        let backend = TestBackend::new(24, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget(ascii_block(" pane "), frame.area()))
+            .expect("draw pane");
+        let buffer = terminal.backend().buffer();
+
+        for (x, y) in [(0, 0), (23, 0), (0, 3), (23, 3)] {
+            assert_eq!(buffer.cell((x, y)).unwrap().symbol(), "+");
+        }
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "|");
+        assert_eq!(buffer.cell((23, 1)).unwrap().symbol(), "|");
+        assert_eq!(buffer.cell((12, 3)).unwrap().symbol(), "-");
+    }
+
+    #[test]
     fn histogram_percentages_use_directional_totals() {
         assert_eq!(histogram_percent(1, 4), 25.0);
         assert_eq!(histogram_percent(0, 0), 0.0);
@@ -3128,23 +3135,23 @@ mod tests {
     fn detail_layout_is_responsive_and_bounded() {
         let wide = Rect::new(0, 0, 130, 18);
         let (read, write, vfs) = detail_areas(wide);
-        assert_eq!((read.height, write.height), (13, 13));
+        assert_eq!((read.height, write.height), (14, 14));
         assert_eq!((read.width, write.width), (64, 65));
         assert_eq!(write.x, read.x + read.width + 1);
         assert_eq!(vfs.width, 130);
-        assert_eq!(vfs.height, 4);
-        assert_eq!(vfs.y, 14);
+        assert_eq!(vfs.height, 3);
+        assert_eq!(vfs.y, 15);
 
         let tall = Rect::new(0, 0, 130, 70);
         let (read, write, vfs) = detail_areas(tall);
-        assert_eq!((read.height, write.height), (13, 13));
-        assert_eq!((vfs.y, vfs.height), (14, 13));
-        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(1)), 6);
+        assert_eq!((read.height, write.height), (14, 14));
+        assert_eq!((vfs.y, vfs.height), (15, 11));
+        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(2)), 4);
         assert_eq!(vfs.y + vfs.height, WIDE_DETAIL_BODY_HEIGHT);
 
         let (overview, detail) = master_detail_heights(68, 5);
-        assert_eq!((overview, detail), (5, WIDE_DETAIL_HEIGHT));
-        assert_eq!(overview + 1 + detail, 34);
+        assert_eq!((overview, detail), (8, WIDE_DETAIL_HEIGHT));
+        assert_eq!(overview + detail, 36);
 
         let narrow = Rect::new(0, 0, 72, 12);
         let (read, write, vfs) = detail_areas(narrow);
@@ -3424,6 +3431,12 @@ mod tests {
                 .collect::<String>()
         };
 
+        let title = (0..64)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect::<String>();
+        assert!(title.contains("READ | 60s | n=0"));
+        assert!(!title.contains("last 60s"));
+        assert!(!title.contains("latency distribution"));
         assert!(row(8).contains("IOPS"));
         assert!(row(9).contains("Throughput"));
         assert!(row(10).contains("Request size"));
