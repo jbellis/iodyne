@@ -1,7 +1,7 @@
+use std::env;
 use std::io::{self, Write};
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{bail, Result};
 
 mod app;
 mod collect;
@@ -9,23 +9,18 @@ mod config;
 mod screen;
 mod ui;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "iodyne",
-    version,
-    about = "Live per-device disk IO, latency, topology, and health TUI"
-)]
-struct Cli {
-    /// Print collected state and exit without launching the TUI.
-    /// Useful for diagnosing what each collector is seeing.
-    #[arg(long)]
-    diag: bool,
+#[derive(Debug)]
+enum Command {
+    Run,
+    Diag,
+    Help,
+    Version,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if cli.diag {
-        return match run_diag() {
+    match parse_args(env::args().skip(1))? {
+        Command::Run => app::run(),
+        Command::Diag => match run_diag() {
             Err(error)
                 if error
                     .downcast_ref::<io::Error>()
@@ -34,9 +29,33 @@ fn main() -> Result<()> {
                 Ok(())
             }
             result => result,
+        },
+        Command::Help => {
+            println!("{}", help_text());
+            Ok(())
+        }
+        Command::Version => {
+            println!("iodyne {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
+    let mut command = Command::Run;
+    for arg in args {
+        command = match arg.as_str() {
+            "--diag" => Command::Diag,
+            "-h" | "--help" => Command::Help,
+            "-V" | "--version" => Command::Version,
+            _ => bail!("unexpected argument: {arg}\n\n{}", help_text()),
         };
     }
-    app::run()
+    Ok(command)
+}
+
+fn help_text() -> &'static str {
+    "Live per-device disk IO, latency, topology, and health TUI\n\nUsage: iodyne [--diag]\n\nOptions:\n      --diag     Print collected state and exit without launching the TUI\n  -h, --help     Print help\n  -V, --version  Print version"
 }
 
 fn run_diag() -> Result<()> {
@@ -106,4 +125,37 @@ fn run_diag() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_supported_flags() {
+        assert!(matches!(parse_args(args(&[])).unwrap(), Command::Run));
+        assert!(matches!(
+            parse_args(args(&["--diag"])).unwrap(),
+            Command::Diag
+        ));
+        assert!(matches!(
+            parse_args(args(&["--help"])).unwrap(),
+            Command::Help
+        ));
+        assert!(matches!(
+            parse_args(args(&["-V"])).unwrap(),
+            Command::Version
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_flags_with_help() {
+        let error = parse_args(args(&["--wat"])).unwrap_err().to_string();
+        assert!(error.contains("unexpected argument: --wat"));
+        assert!(error.contains("Usage: iodyne [--diag]"));
+    }
 }

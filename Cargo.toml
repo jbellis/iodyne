@@ -17,8 +17,7 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-sysinfo = "0.32"
-clap = { version = "4", features = ["derive"] }
+sysinfo = { version = "0.32", default-features = false, features = ["disk", "system"] }
 anyhow = "1"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
