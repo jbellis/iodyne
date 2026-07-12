@@ -165,7 +165,7 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
     let selected = app.selected_io.min(visible.len() - 1);
-    let throughput_scale = overview_throughput_scale(&visible, app);
+    let (throughput_scale, iops_scale) = overview_workload_scales(&visible, app);
     let (start, count, _) = visible_band_window(sections[0].height, visible.len(), selected);
     for (slot, tick) in visible.iter().skip(start).take(count).enumerate() {
         draw_overview_row(
@@ -180,6 +180,7 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             app,
             start + slot == selected,
             throughput_scale,
+            iops_scale,
         );
     }
     draw_detail(f, sections[2], visible[selected], app);
@@ -383,7 +384,8 @@ struct RowGeometry {
 struct OverviewPrefixGeometry {
     device: u16,
     free: u16,
-    activity: u16,
+    throughput: u16,
+    iops: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,13 +420,16 @@ fn overview_prefix_geometry(width: u16) -> OverviewPrefixGeometry {
     } else {
         (width.saturating_sub(1), 0)
     };
-    // Selection marker, device, one-cell gutters, free %, and a trailing
-    // gutter that separates the activity sparkline from the R latency lane.
-    let fixed = 1 + device + (free > 0) as u16 * (1 + free + 1) + 1;
+    // Selection marker, device, free %, a gutter between the two workload
+    // sparklines, and a trailing gutter before the R latency lane.
+    let fixed = 1 + device + (free > 0) as u16 * (1 + free + 1) + 2;
+    let workload = width.saturating_sub(fixed);
+    let throughput = workload.saturating_add(1) / 2;
     OverviewPrefixGeometry {
         device,
         free,
-        activity: width.saturating_sub(fixed),
+        throughput,
+        iops: workload.saturating_sub(throughput),
     }
 }
 
@@ -441,15 +446,20 @@ fn overview_prefix_header(width: u16) -> String {
     }
     header.push_str(&format!(
         "{:<width$} ",
-        fit_overview_device("Activity", geometry.activity as usize),
-        width = geometry.activity as usize
+        fit_overview_device("B/s", geometry.throughput as usize),
+        width = geometry.throughput as usize
+    ));
+    header.push_str(&format!(
+        "{:<width$} ",
+        fit_overview_device("IOPS", geometry.iops as usize),
+        width = geometry.iops as usize
     ));
     header
 }
 
 fn row_geometry(width: u16) -> RowGeometry {
     let label = if width >= 100 {
-        30
+        43
     } else if width >= 70 {
         19
     } else {
@@ -489,6 +499,7 @@ fn draw_overview_row(
     app: &App,
     selected: bool,
     throughput_scale: f64,
+    iops_scale: f64,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -500,6 +511,12 @@ fn draw_overview_row(
         .get(&tick.device)
         .map(|history| combined_throughput(&history.workload_samples))
         .unwrap_or_default();
+    let iops = app
+        .io
+        .history
+        .get(&tick.device)
+        .map(|history| combined_iops(&history.workload_samples))
+        .unwrap_or_default();
     draw_overview_prefix(
         f,
         Rect {
@@ -510,6 +527,8 @@ fn draw_overview_row(
         filesystem_free_pct(&tick.device, &app.filesystems, &app.volumes),
         &throughput,
         throughput_scale,
+        &iops,
+        iops_scale,
         selected,
     );
 
@@ -562,6 +581,8 @@ fn draw_overview_prefix(
     free: Option<u32>,
     throughput: &[f64],
     throughput_scale: f64,
+    iops: &[f64],
+    iops_scale: f64,
     selected: bool,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -586,8 +607,9 @@ fn draw_overview_prefix(
     }
     let text_width = area
         .width
-        .saturating_sub(geometry.activity)
-        .saturating_sub(1);
+        .saturating_sub(geometry.throughput)
+        .saturating_sub(geometry.iops)
+        .saturating_sub(2);
     f.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect {
@@ -595,14 +617,26 @@ fn draw_overview_prefix(
             ..area
         },
     );
-    if geometry.activity > 0 {
+    if geometry.throughput > 0 {
         f.render_widget(
             BaselineSparkline::new(throughput)
                 .max(throughput_scale)
                 .style(Style::default().fg(p::YELLOW).bg(p::BG)),
             Rect {
                 x: area.x + text_width,
-                width: geometry.activity,
+                width: geometry.throughput,
+                ..area
+            },
+        );
+    }
+    if geometry.iops > 0 {
+        f.render_widget(
+            BaselineSparkline::new(iops)
+                .max(iops_scale)
+                .style(Style::default().fg(p::MAGENTA).bg(p::BG)),
+            Rect {
+                x: area.x + text_width + geometry.throughput + 1,
+                width: geometry.iops,
                 ..area
             },
         );
@@ -941,7 +975,14 @@ fn combined_throughput(samples: &VecDeque<WorkloadSample>) -> Vec<f64> {
         .collect()
 }
 
-fn shared_throughput_scale<'a>(series: impl IntoIterator<Item = &'a [f64]>) -> f64 {
+fn combined_iops(samples: &VecDeque<WorkloadSample>) -> Vec<f64> {
+    samples
+        .iter()
+        .map(|sample| sample.read_iops + sample.write_iops)
+        .collect()
+}
+
+fn shared_workload_scale<'a>(series: impl IntoIterator<Item = &'a [f64]>) -> f64 {
     series
         .into_iter()
         .flatten()
@@ -951,8 +992,8 @@ fn shared_throughput_scale<'a>(series: impl IntoIterator<Item = &'a [f64]>) -> f
         .max(1.0)
 }
 
-fn overview_throughput_scale(visible: &[&IoTick], app: &App) -> f64 {
-    let series: Vec<Vec<f64>> = visible
+fn overview_workload_scales(visible: &[&IoTick], app: &App) -> (f64, f64) {
+    let throughput: Vec<Vec<f64>> = visible
         .iter()
         .map(|tick| {
             app.io
@@ -962,7 +1003,20 @@ fn overview_throughput_scale(visible: &[&IoTick], app: &App) -> f64 {
                 .unwrap_or_default()
         })
         .collect();
-    shared_throughput_scale(series.iter().map(Vec::as_slice))
+    let iops: Vec<Vec<f64>> = visible
+        .iter()
+        .map(|tick| {
+            app.io
+                .history
+                .get(&tick.device)
+                .map(|history| combined_iops(&history.workload_samples))
+                .unwrap_or_default()
+        })
+        .collect();
+    (
+        shared_workload_scale(throughput.iter().map(Vec::as_slice)),
+        shared_workload_scale(iops.iter().map(Vec::as_slice)),
+    )
 }
 
 #[derive(Debug, PartialEq)]
@@ -2858,30 +2912,43 @@ mod tests {
         let (overview, detail) = master_detail_heights(28, 8);
         assert!(overview + 1 + detail <= 28);
         assert_eq!(row_geometry(60).label + row_geometry(60).plot, 60);
-        assert_eq!(row_geometry(130).label.saturating_sub(1), 29);
-        assert_eq!(row_geometry(130).plot, 100);
+        assert_eq!(row_geometry(130).label, 43);
+        assert_eq!(row_geometry(130).plot, 87);
+        assert_eq!(latency_plot_geometry(row_geometry(110).plot).read, 31);
     }
 
     #[test]
-    fn overview_throughput_combines_directions_and_shares_visible_scale() {
+    fn overview_workload_combines_directions_and_shares_visible_scales() {
         let slow = VecDeque::from([WorkloadSample {
+            read_iops: 1.0,
+            write_iops: 2.0,
             read_bps: 10.0,
             write_bps: 20.0,
             ..WorkloadSample::default()
         }]);
         let fast = VecDeque::from([WorkloadSample {
+            read_iops: 10.0,
+            write_iops: 30.0,
             read_bps: 100.0,
             write_bps: 300.0,
             ..WorkloadSample::default()
         }]);
-        let slow = combined_throughput(&slow);
-        let fast = combined_throughput(&fast);
+        let slow_throughput = combined_throughput(&slow);
+        let fast_throughput = combined_throughput(&fast);
+        let slow_iops = combined_iops(&slow);
+        let fast_iops = combined_iops(&fast);
 
-        assert_eq!(slow, vec![30.0]);
-        assert_eq!(fast, vec![400.0]);
+        assert_eq!(slow_throughput, vec![30.0]);
+        assert_eq!(fast_throughput, vec![400.0]);
+        assert_eq!(slow_iops, vec![3.0]);
+        assert_eq!(fast_iops, vec![40.0]);
         assert_eq!(
-            shared_throughput_scale([slow.as_slice(), fast.as_slice()]),
+            shared_workload_scale([slow_throughput.as_slice(), fast_throughput.as_slice()]),
             400.0
+        );
+        assert_eq!(
+            shared_workload_scale([slow_iops.as_slice(), fast_iops.as_slice()]),
+            40.0
         );
     }
 
@@ -2890,9 +2957,20 @@ mod tests {
         let width = 60;
         let geometry = row_geometry(width);
         assert_eq!(geometry.label, 13);
-        assert_eq!(overview_prefix_geometry(geometry.label).activity, 1);
-        assert_eq!(overview_prefix_header(30), " Device     Free Activity     ");
+        assert_eq!(overview_prefix_geometry(geometry.label).throughput, 0);
+        assert_eq!(overview_prefix_geometry(geometry.label).iops, 0);
+        assert_eq!(
+            overview_prefix_geometry(30),
+            OverviewPrefixGeometry {
+                device: 10,
+                free: 4,
+                throughput: 6,
+                iops: 5,
+            }
+        );
+        assert_eq!(overview_prefix_header(30), " Device     Free B/s    IOPS  ");
         assert_eq!(overview_prefix_header(30).chars().count(), 30);
+        assert_eq!(overview_prefix_header(43).chars().count(), 43);
         let lanes = latency_plot_geometry(geometry.plot);
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2905,6 +2983,8 @@ mod tests {
                     Some(85),
                     &[100.0],
                     100.0,
+                    &[10.0],
+                    10.0,
                     true,
                 );
                 draw_latency_plot(
@@ -2923,6 +3003,36 @@ mod tests {
         assert!(line.starts_with("▌nvm~  85%"));
         assert_eq!(buffer.cell((geometry.label - 1, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((geometry.label, 0)).unwrap().symbol(), "R");
+    }
+
+    #[test]
+    fn overview_workload_sparklines_keep_separate_gutters() {
+        let width = 44;
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw_overview_prefix(
+                    frame,
+                    Rect::new(0, 0, 43, 1),
+                    "nvme0n1",
+                    Some(85),
+                    &[100.0],
+                    100.0,
+                    &[10.0],
+                    10.0,
+                    true,
+                );
+                frame.render_widget(Paragraph::new("R"), Rect::new(43, 0, 1, 1));
+            })
+            .expect("draw overview prefix");
+        let buffer = terminal.backend().buffer();
+
+        assert_ne!(buffer.cell((28, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((29, 0)).unwrap().symbol(), " ");
+        assert_ne!(buffer.cell((41, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((42, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((43, 0)).unwrap().symbol(), "R");
     }
 
     #[test]

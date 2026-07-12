@@ -488,7 +488,8 @@ mod tests {
         for expected in [
             "Device",
             "Free",
-            "Activity",
+            "B/s",
+            "IOPS",
             "sda detail",
             "READ",
             "WRITE",
