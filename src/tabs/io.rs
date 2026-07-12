@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::collect::{DeviceHistory, IoTick};
+use crate::collect::{DeviceHistory, FsTick, IoTick};
 use crate::ui::format::fmt_rate;
 use crate::ui::palette as p;
 use crate::ui::sparkline::BaselineSparkline;
@@ -112,7 +112,7 @@ fn draw_panel_grid(f: &mut Frame, area: Rect, app: &App) {
     let panels = panel_areas(area, app.io.latest.len());
     for (panel_area, tick) in panels.into_iter().zip(app.io.latest.iter()) {
         let history = app.io.history.get(&tick.device);
-        draw_panel(f, panel_area, tick, history);
+        draw_panel(f, panel_area, tick, history, &app.filesystems);
     }
 }
 
@@ -213,12 +213,22 @@ fn latency_line(tick: &IoTick) -> Line<'static> {
     ])
 }
 
-fn draw_panel(f: &mut Frame, area: Rect, tick: &IoTick, history: Option<&DeviceHistory>) {
+fn draw_panel(
+    f: &mut Frame,
+    area: Rect,
+    tick: &IoTick,
+    history: Option<&DeviceHistory>,
+    filesystems: &[FsTick],
+) {
+    let title = match mounts_for_device(&tick.device, filesystems) {
+        Some(mounts) => format!(" {}  {} ", tick.device, mounts),
+        None => format!(" {} ", tick.device),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(Span::styled(
-            format!(" {} ", tick.device),
+            title,
             Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(p::BG));
@@ -304,6 +314,139 @@ fn draw_panel(f: &mut Frame, area: Rect, tick: &IoTick, history: Option<&DeviceH
                 width: inner.width.saturating_sub(2),
                 height: 1,
             },
+        );
+    }
+}
+
+fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
+    let mut mounts: Vec<&str> = filesystems
+        .iter()
+        .filter(|fs| fs_belongs_to_device(&fs.device, device))
+        .map(|fs| fs.mount.as_str())
+        .collect();
+    mounts.sort_unstable();
+    mounts.dedup();
+
+    if mounts.is_empty() {
+        return None;
+    }
+
+    const MAX_MOUNTS: usize = 2;
+    let extra = mounts.len().saturating_sub(MAX_MOUNTS);
+    let mut label = mounts
+        .iter()
+        .take(MAX_MOUNTS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if extra > 0 {
+        label.push_str(&format!(" +{extra}"));
+    }
+    Some(label)
+}
+
+fn fs_belongs_to_device(fs_device: &str, io_device: &str) -> bool {
+    let fs = disk_name(fs_device);
+    let io = disk_name(io_device);
+
+    fs == io || whole_disk_name(fs) == io
+}
+
+fn disk_name(device: &str) -> &str {
+    device.strip_prefix("/dev/").unwrap_or(device)
+}
+
+fn whole_disk_name(device: &str) -> &str {
+    if let Some((base, part)) = device.rsplit_once('p') {
+        if base.starts_with("nvme") || base.starts_with("mmcblk") {
+            if part.chars().all(|c| c.is_ascii_digit()) {
+                return base;
+            }
+        }
+    }
+
+    if let Some(stripped) = device.strip_prefix("disk") {
+        if let Some(idx) = stripped.find('s') {
+            let base_len = "disk".len() + idx;
+            let (_, suffix) = stripped.split_at(idx + 1);
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return &device[..base_len];
+            }
+        }
+    }
+
+    let split = device
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(idx, c)| idx + c.len_utf8())
+        .unwrap_or(0);
+    if split > 0 && split < device.len() {
+        &device[..split]
+    } else {
+        device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fs(device: &str, mount: &str) -> FsTick {
+        FsTick {
+            mount: mount.to_string(),
+            device: device.to_string(),
+            fs_type: "ext4".to_string(),
+            size_bytes: 0,
+            used_bytes: 0,
+            avail_bytes: 0,
+            inode_pct: None,
+            is_removable: false,
+            is_system: false,
+        }
+    }
+
+    #[test]
+    fn maps_linux_partition_mounts_to_whole_disk() {
+        let filesystems = vec![fs("/dev/sda1", "/"), fs("/dev/sda2", "/home")];
+
+        assert_eq!(
+            mounts_for_device("sda", &filesystems),
+            Some("/, /home".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_nvme_partition_mounts_to_whole_disk() {
+        let filesystems = vec![fs("/dev/nvme0n1p2", "/")];
+
+        assert_eq!(
+            mounts_for_device("nvme0n1", &filesystems),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_macos_slice_mounts_to_whole_disk() {
+        let filesystems = vec![fs("/dev/disk3s1", "/System/Volumes/Data")];
+
+        assert_eq!(
+            mounts_for_device("disk3", &filesystems),
+            Some("/System/Volumes/Data".to_string())
+        );
+    }
+
+    #[test]
+    fn abbreviates_long_mount_lists() {
+        let filesystems = vec![
+            fs("/dev/sdb1", "/a"),
+            fs("/dev/sdb2", "/b"),
+            fs("/dev/sdb3", "/c"),
+        ];
+
+        assert_eq!(
+            mounts_for_device("sdb", &filesystems),
+            Some("/a, /b +1".to_string())
         );
     }
 }
