@@ -99,17 +99,7 @@ fn parse_block(base: &Path, name: &str) -> LinuxDevice {
         model.clone()
     };
 
-    let kind = if name.starts_with("nvme") {
-        LinuxKind::Nvme
-    } else if removable {
-        LinuxKind::UsbMassStorage
-    } else if rotational {
-        LinuxKind::Hdd
-    } else if !model.is_empty() {
-        LinuxKind::Ssd
-    } else {
-        LinuxKind::Unknown
-    };
+    let kind = classify(name, &vendor, &model, removable, rotational);
 
     LinuxDevice {
         name: name.to_string(),
@@ -120,6 +110,24 @@ fn parse_block(base: &Path, name: &str) -> LinuxDevice {
         size_bytes: size_sectors.saturating_mul(SECTOR_BYTES),
         removable,
         rotational,
+    }
+}
+
+fn classify(name: &str, vendor: &str, model: &str, removable: bool, rotational: bool) -> LinuxKind {
+    let explicitly_nvme = vendor.eq_ignore_ascii_case("nvme")
+        || model
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word.eq_ignore_ascii_case("nvme"));
+    if name.starts_with("nvme") || explicitly_nvme {
+        LinuxKind::Nvme
+    } else if removable {
+        LinuxKind::UsbMassStorage
+    } else if rotational {
+        LinuxKind::Hdd
+    } else if !model.is_empty() {
+        LinuxKind::Ssd
+    } else {
+        LinuxKind::Unknown
     }
 }
 
@@ -136,4 +144,21 @@ fn read_trim(path: &Path) -> Option<String> {
 fn read_u64(path: &Path) -> Option<u64> {
     let s = fs::read_to_string(path).ok()?;
     s.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_nvme_identity_beats_virtual_rotational_flag() {
+        assert_eq!(
+            classify("sdf", "NVMe", "WD_BLACK SN850X", false, true),
+            LinuxKind::Nvme
+        );
+        assert_eq!(
+            classify("sdf", "", "NVMe WD_BLACK SN850X", false, true),
+            LinuxKind::Nvme
+        );
+    }
 }

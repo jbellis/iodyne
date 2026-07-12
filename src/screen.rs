@@ -2003,16 +2003,19 @@ fn device_and_filesystem_facts(
     let mut facts = Vec::new();
     if let Some(device) = device {
         if meaningful_fact(&device.model) {
-            facts.push(format!("model {}", device.model));
+            facts.push(device.model.clone());
         }
-        if meaningful_fact(&device.bus) {
-            facts.push(format!("bus {}", device.bus));
-        }
-        if device.kind.label() != "?" {
-            facts.push(format!("kind {}", device.kind.label()));
-        }
-        if device.size_bytes > 0 {
-            facts.push(format!("device {}", fmt_size(device.size_bytes)));
+
+        // Some virtualized environments expose NVMe media as an sd* SCSI disk
+        // and report rotational=1. Keep the model, but do not present the
+        // resulting SATA/HDD guesses as physical facts.
+        if !model_encodes_nvme_identity(device) {
+            if meaningful_fact(&device.bus) {
+                facts.push(device.bus.clone());
+            }
+            if device.kind.label() != "?" {
+                facts.push(device.kind.label().to_string());
+            }
         }
     }
 
@@ -2024,7 +2027,7 @@ fn device_and_filesystem_facts(
     fs_types.sort_unstable();
     fs_types.dedup();
     if !fs_types.is_empty() {
-        facts.push(format!("fs {}", fs_types.join(",")));
+        facts.push(fs_types.join(","));
     }
 
     let mut seen = HashSet::new();
@@ -2044,18 +2047,25 @@ fn device_and_filesystem_facts(
             )
         });
     if total > 0 {
-        facts.push(format!("free {} / {}", fmt_size(free), fmt_size(total)));
+        facts.push(format!("{} free / {}", fmt_size(free), fmt_size(total)));
     }
     let inode_values: Vec<u32> = filesystems.iter().filter_map(|fs| fs.inode_pct).collect();
     if let Some(max_inode) = inode_values.iter().copied().max() {
         let label = if inode_values.len() > 1 {
-            "inode max used"
+            "inodes max"
         } else {
-            "inode used"
+            "inodes"
         };
-        facts.push(format!("{label} {max_inode}%"));
+        facts.push(format!("{label} {max_inode}% used"));
     }
     (!facts.is_empty()).then(|| format!(" {}", facts.join(" · ")))
+}
+
+fn model_encodes_nvme_identity(device: &DeviceTick) -> bool {
+    let model = device.model.to_ascii_lowercase();
+    model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "nvme")
 }
 
 fn smart_facts(smart: Option<&SmartTick>, fallback: Option<bool>) -> Option<String> {
@@ -2691,9 +2701,15 @@ mod tests {
             ..fs("/dev/sda1", "/")
         };
         let facts = device_and_filesystem_facts(Some(&device), &[&filesystem]).unwrap();
-        assert!(facts.contains("model FastDisk"));
-        assert!(facts.contains("bus SATA · kind SSD"));
-        assert!(facts.contains("fs ext4 · free 25 GiB / 100 GiB · inode used 42%"));
+        assert_eq!(
+            facts,
+            " FastDisk · SATA · SSD · ext4 · 25 GiB free / 100 GiB · inodes 42% used"
+        );
+        assert!(!facts.contains("device 1 TiB"));
+        assert!(!facts.contains("model "));
+        assert!(!facts.contains("bus "));
+        assert!(!facts.contains("kind "));
+        assert!(!facts.contains("fs "));
         assert!(!facts.contains("--"));
         assert!(!facts.contains("healthy"));
 
@@ -2725,6 +2741,38 @@ mod tests {
             smart_facts(None, Some(false)).as_deref(),
             Some(" SMART reported failing")
         );
+    }
+
+    #[test]
+    fn nvme_model_suppresses_contradictory_virtualized_bus_and_kind() {
+        let device = DeviceTick {
+            name: "sdf".into(),
+            kind: crate::collect::devices::DeviceKind::Hdd,
+            model: "NVMe WD_BLACK SN850X".into(),
+            bus: "SATA / internal".into(),
+            size_bytes: 4 << 40,
+            used_bytes: 0,
+            is_removable: false,
+            firmware: None,
+            serial: None,
+            smart_ok: None,
+            idle: false,
+        };
+        let filesystem = FsTick {
+            fs_type: "ext4".into(),
+            size_bytes: 100 << 30,
+            avail_bytes: 25 << 30,
+            ..fs("/dev/sdf1", "/home")
+        };
+
+        let facts = device_and_filesystem_facts(Some(&device), &[&filesystem]).unwrap();
+        assert_eq!(
+            facts,
+            " NVMe WD_BLACK SN850X · ext4 · 25 GiB free / 100 GiB"
+        );
+        assert!(!facts.contains("SATA"));
+        assert!(!facts.contains("HDD"));
+        assert!(!facts.contains("4 TiB"));
     }
 
     #[test]

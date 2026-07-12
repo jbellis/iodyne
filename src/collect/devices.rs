@@ -124,7 +124,10 @@ pub fn collect() -> Vec<DeviceTick> {
                 let bus = match kind {
                     DeviceKind::Nvme => "PCIe / NVMe".to_string(),
                     DeviceKind::UsbMassStorage => "USB".to_string(),
-                    DeviceKind::Hdd | DeviceKind::Ssd => "SATA / internal".to_string(),
+                    // sysfs rotation data distinguishes spinning from solid-state
+                    // media, but says nothing about SATA. In particular, WSL often
+                    // presents physical NVMe storage as a synthetic SCSI disk.
+                    DeviceKind::Hdd | DeviceKind::Ssd => "—".to_string(),
                     DeviceKind::Unknown => "—".to_string(),
                 };
                 let used = used_by_device.get(&l.name).copied().unwrap_or(0);
