@@ -475,7 +475,7 @@ fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(Span::styled(
-            " VFS ACTIVITY  requested rates · ops/s ",
+            " VFS ACTIVITY  rolling 10s · requested rates · ops/s ",
             Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(p::BG));
@@ -490,10 +490,12 @@ fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
     }
     let entries = host_hot_files(&app.io.hot_files);
     if entries.is_empty() {
-        draw_vfs_status(f, inner, "no VFS activity this interval");
+        draw_vfs_status(f, inner, "no VFS activity in the last 10s");
         return;
     }
-    for (row, item) in entries.into_iter().take(inner.height as usize).enumerate() {
+    let visible: Vec<_> = entries.into_iter().take(inner.height as usize).collect();
+    let scale = crate::tabs::io::vfs_activity_scale(&visible);
+    for (row, item) in visible.into_iter().enumerate() {
         crate::tabs::io::draw_vfs_row(
             f,
             Rect {
@@ -503,6 +505,7 @@ fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
                 height: 1,
             },
             item,
+            scale,
         );
     }
 }

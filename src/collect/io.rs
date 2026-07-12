@@ -41,12 +41,16 @@ const LATENCY_WINDOW: usize = 60;
 /// Maximum host-wide VFS entries retained for presentation. Kernel memory is
 /// separately bounded by the 8192-entry LRU map.
 const HOT_FILE_LIMIT: usize = 64;
+/// Smooth VFS activity over ten seconds so short collector intervals do not
+/// make the hottest-file ranking flicker. Samples remain bounded by the
+/// kernel's 8192-entry LRU map and this finite time window.
+const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const PROC_FD_SCAN_LIMIT: usize = 256;
 
-/// One interval of host-wide VFS activity attributed to a file and process.
-/// Byte rates are requested byte counts at VFS entry, not returned bytes or
-/// physical disk traffic.
+/// Rolling host-wide VFS activity attributed to a file and process. Rates are
+/// averaged over up to the most recent ten seconds. Byte rates are requested
+/// byte counts at VFS entry, not returned bytes or physical disk traffic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VfsFileActivity {
     pub fs_device: BlockDeviceId,
@@ -295,6 +299,7 @@ pub struct IoCollector {
     pub latest: Vec<IoTick>,
     /// Bounded, host-wide VFS requested-byte activity sorted hottest first.
     pub hot_files: Vec<VfsFileActivity>,
+    vfs_activity_window: VfsActivityWindow,
     latency_probe: EbpfLatencyCollector,
 }
 
@@ -308,6 +313,7 @@ impl IoCollector {
             traced_history: HashMap::new(),
             latest: Vec::new(),
             hot_files: Vec::new(),
+            vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::new(),
         }
     }
@@ -332,6 +338,7 @@ impl IoCollector {
         self.last_sample = Instant::now();
         self.latency_probe.reset_baseline();
         self.hot_files.clear();
+        self.vfs_activity_window.clear();
         clear_histories_after_pause(&mut self.history, &mut self.traced_history);
     }
 
@@ -411,14 +418,17 @@ impl IoCollector {
     fn sample_hot_files(&mut self, elapsed: f64) {
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
             self.hot_files.clear();
+            self.vfs_activity_window.clear();
             return;
         }
         let deltas = self.latency_probe.vfs_snapshot();
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
             self.hot_files.clear();
+            self.vfs_activity_window.clear();
             return;
         }
-        self.hot_files = rank_vfs_activity(deltas, elapsed, HOT_FILE_LIMIT);
+        self.vfs_activity_window.push(deltas, elapsed);
+        self.hot_files = self.vfs_activity_window.ranked(HOT_FILE_LIMIT);
         resolve_hot_file_paths(&mut self.hot_files);
     }
 
@@ -484,28 +494,202 @@ fn fallback_file_path(basename: &str, inode: u64) -> String {
     }
 }
 
-fn rank_vfs_activity(
-    deltas: Vec<VfsActivityDelta>,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VfsActivityKey {
+    device: BlockDeviceId,
+    inode: u64,
+    tgid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VfsActivityCounts {
+    read_bytes: f64,
+    write_bytes: f64,
+    read_ops: f64,
+    write_ops: f64,
+}
+
+impl VfsActivityCounts {
+    fn add(&mut self, other: Self) {
+        self.read_bytes += other.read_bytes;
+        self.write_bytes += other.write_bytes;
+        self.read_ops += other.read_ops;
+        self.write_ops += other.write_ops;
+    }
+
+    fn subtract_scaled(&mut self, other: Self, scale: f64) {
+        self.read_bytes = (self.read_bytes - other.read_bytes * scale).max(0.0);
+        self.write_bytes = (self.write_bytes - other.write_bytes * scale).max(0.0);
+        self.read_ops = (self.read_ops - other.read_ops * scale).max(0.0);
+        self.write_ops = (self.write_ops - other.write_ops * scale).max(0.0);
+    }
+
+    fn scale(&mut self, scale: f64) {
+        self.read_bytes *= scale;
+        self.write_bytes *= scale;
+        self.read_ops *= scale;
+        self.write_ops *= scale;
+    }
+
+    fn is_empty(self) -> bool {
+        self.read_bytes == 0.0
+            && self.write_bytes == 0.0
+            && self.read_ops == 0.0
+            && self.write_ops == 0.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VfsActivityTotal {
+    counts: VfsActivityCounts,
+    pid: u32,
+    comm: String,
+    basename: String,
+}
+
+#[derive(Debug)]
+struct VfsActivityFrame {
     elapsed: f64,
-    limit: usize,
-) -> Vec<VfsFileActivity> {
-    let elapsed = elapsed.max(0.001);
-    let mut activity: Vec<_> = deltas
-        .into_iter()
-        .map(|delta| VfsFileActivity {
-            fs_device: delta.device,
-            inode: delta.inode,
-            pid: delta.pid,
-            tgid: delta.tgid,
-            path: fallback_file_path(&delta.basename, delta.inode),
-            comm: delta.comm,
-            basename: delta.basename,
-            read_bps: delta.read_bytes as f64 / elapsed,
-            write_bps: delta.write_bytes as f64 / elapsed,
-            read_ops: delta.read_ops as f64 / elapsed,
-            write_ops: delta.write_ops as f64 / elapsed,
-        })
-        .collect();
+    counts: HashMap<VfsActivityKey, VfsActivityCounts>,
+}
+
+/// A time-weighted rolling sum of requested VFS operations. The eBPF map is
+/// bounded to 8192 live keys; this queue retains only frames intersecting the
+/// last ten seconds and therefore has a fixed time/memory bound at the 1 Hz
+/// collector cadence. No file tree is watched or traversed.
+#[derive(Debug, Default)]
+struct VfsActivityWindow {
+    frames: VecDeque<VfsActivityFrame>,
+    totals: HashMap<VfsActivityKey, VfsActivityTotal>,
+    elapsed: f64,
+}
+
+impl VfsActivityWindow {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.totals.clear();
+        self.elapsed = 0.0;
+    }
+
+    fn push(&mut self, deltas: Vec<VfsActivityDelta>, elapsed: f64) {
+        let window = VFS_ACTIVITY_WINDOW.as_secs_f64();
+        let elapsed = elapsed.max(0.001);
+        let retained_elapsed = elapsed.min(window);
+        // If collection was delayed beyond the window, assume activity was
+        // uniform across that interval. This preserves the observed rate
+        // without presenting old counts as a ten-second burst.
+        let retained_fraction = retained_elapsed / elapsed;
+        let mut frame_counts = HashMap::<VfsActivityKey, VfsActivityCounts>::new();
+
+        if elapsed >= window {
+            self.clear();
+        }
+
+        for delta in deltas {
+            let key = VfsActivityKey {
+                device: delta.device,
+                inode: delta.inode,
+                tgid: delta.tgid,
+            };
+            let mut counts = VfsActivityCounts {
+                read_bytes: delta.read_bytes as f64,
+                write_bytes: delta.write_bytes as f64,
+                read_ops: delta.read_ops as f64,
+                write_ops: delta.write_ops as f64,
+            };
+            counts.scale(retained_fraction);
+            frame_counts.entry(key.clone()).or_default().add(counts);
+            let total = self.totals.entry(key).or_insert_with(|| VfsActivityTotal {
+                counts: VfsActivityCounts::default(),
+                pid: delta.pid,
+                comm: delta.comm.clone(),
+                basename: delta.basename.clone(),
+            });
+            total.counts.add(counts);
+            // Keep presentation metadata current if a PID or filename is
+            // refreshed while the same filesystem identity remains hot.
+            total.pid = delta.pid;
+            total.comm = delta.comm;
+            total.basename = delta.basename;
+        }
+
+        self.frames.push_back(VfsActivityFrame {
+            elapsed: retained_elapsed,
+            counts: frame_counts,
+        });
+        self.elapsed += retained_elapsed;
+        self.trim_to(window);
+    }
+
+    fn trim_to(&mut self, window: f64) {
+        let mut overflow = (self.elapsed - window).max(0.0);
+        while overflow > f64::EPSILON {
+            let Some(front_elapsed) = self.frames.front().map(|frame| frame.elapsed) else {
+                break;
+            };
+            if front_elapsed <= overflow + f64::EPSILON {
+                let frame = self.frames.pop_front().expect("front frame exists");
+                subtract_vfs_counts(&mut self.totals, &frame.counts, 1.0);
+                self.elapsed -= frame.elapsed;
+                overflow -= frame.elapsed;
+            } else {
+                let scale = overflow / front_elapsed;
+                let frame = self.frames.front_mut().expect("front frame exists");
+                subtract_vfs_counts(&mut self.totals, &frame.counts, scale);
+                for counts in frame.counts.values_mut() {
+                    counts.scale(1.0 - scale);
+                }
+                frame.elapsed -= overflow;
+                self.elapsed -= overflow;
+                overflow = 0.0;
+            }
+        }
+    }
+
+    fn ranked(&self, limit: usize) -> Vec<VfsFileActivity> {
+        let elapsed = self.elapsed.max(0.001);
+        let mut activity: Vec<_> = self
+            .totals
+            .iter()
+            .map(|(key, total)| VfsFileActivity {
+                fs_device: key.device,
+                inode: key.inode,
+                pid: total.pid,
+                tgid: key.tgid,
+                path: fallback_file_path(&total.basename, key.inode),
+                comm: total.comm.clone(),
+                basename: total.basename.clone(),
+                read_bps: total.counts.read_bytes / elapsed,
+                write_bps: total.counts.write_bytes / elapsed,
+                read_ops: total.counts.read_ops / elapsed,
+                write_ops: total.counts.write_ops / elapsed,
+            })
+            .collect();
+        rank_vfs_activity(&mut activity, limit);
+        activity
+    }
+}
+
+fn subtract_vfs_counts(
+    totals: &mut HashMap<VfsActivityKey, VfsActivityTotal>,
+    counts: &HashMap<VfsActivityKey, VfsActivityCounts>,
+    scale: f64,
+) {
+    let mut empty = Vec::new();
+    for (key, contribution) in counts {
+        if let Some(total) = totals.get_mut(key) {
+            total.counts.subtract_scaled(*contribution, scale);
+            if total.counts.is_empty() {
+                empty.push(key.clone());
+            }
+        }
+    }
+    for key in empty {
+        totals.remove(&key);
+    }
+}
+
+fn rank_vfs_activity(activity: &mut Vec<VfsFileActivity>, limit: usize) {
     activity.sort_by(|a, b| {
         let a_total = a.read_bps + a.write_bps;
         let b_total = b.read_bps + b.write_bps;
@@ -516,7 +700,6 @@ fn rank_vfs_activity(
             .then_with(|| a.inode.cmp(&b.inode))
     });
     activity.truncate(limit);
-    activity
 }
 
 /// Opportunistically resolves only already-ranked candidates. Each process's
@@ -833,13 +1016,72 @@ mod tests {
 
     #[test]
     fn hot_file_ranking_uses_total_requested_rate_and_limit() {
-        let ranked = rank_vfs_activity(vec![vfs_delta(1, 100, 0), vfs_delta(2, 50, 200)], 0.5, 1);
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 100, 0), vfs_delta(2, 50, 200)], 0.5);
+        let ranked = window.ranked(1);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].inode, 2);
         assert_near(ranked[0].read_bps, 100.0);
         assert_near(ranked[0].write_bps, 400.0);
         assert_near(ranked[0].read_ops, 4.0);
         assert_near(ranked[0].write_ops, 6.0);
+    }
+
+    #[test]
+    fn hot_file_rates_average_over_rolling_window_including_idle_time() {
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 1_000, 0)], 1.0);
+        window.push(Vec::new(), 1.0);
+
+        let ranked = window.ranked(64);
+        assert_eq!(ranked.len(), 1);
+        assert_near(ranked[0].read_bps, 500.0);
+        assert_near(ranked[0].read_ops, 1.0);
+    }
+
+    #[test]
+    fn hot_file_activity_expires_after_ten_seconds() {
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 1_000, 0)], 1.0);
+        window.push(Vec::new(), 9.0);
+        assert_near(window.ranked(64)[0].read_bps, 100.0);
+
+        window.push(Vec::new(), 1.0);
+        assert!(window.ranked(64).is_empty());
+        assert_near(window.elapsed, 10.0);
+    }
+
+    #[test]
+    fn hot_file_window_trims_only_expired_fraction_of_oldest_sample() {
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 600, 0)], 6.0);
+        window.push(vec![vfs_delta(1, 800, 0)], 8.0);
+
+        // Four of the first sample's six seconds expired, leaving 200 + 800
+        // requested bytes in the ten-second window.
+        assert_near(window.ranked(64)[0].read_bps, 100.0);
+        assert_near(window.elapsed, 10.0);
+    }
+
+    #[test]
+    fn delayed_hot_file_sample_preserves_observed_rate() {
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 20_000, 0)], 20.0);
+
+        assert_near(window.ranked(64)[0].read_bps, 1_000.0);
+        assert_near(window.elapsed, 10.0);
+        assert_eq!(window.frames.len(), 1);
+    }
+
+    #[test]
+    fn clearing_hot_file_window_discards_rates_and_frames() {
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![vfs_delta(1, 100, 0)], 1.0);
+        window.clear();
+
+        assert!(window.ranked(64).is_empty());
+        assert!(window.frames.is_empty());
+        assert_near(window.elapsed, 0.0);
     }
 
     #[test]

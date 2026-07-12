@@ -232,9 +232,11 @@ fn draw_scale_legend(f: &mut Frame, area: Rect, source: LatencySource) {
         return;
     }
     let geometry = row_geometry(area.width);
-    let mode = match source {
-        LatencySource::AggregateAwait => "interval-average await",
-        LatencySource::EbpfPerRequest => "request latency density",
+    let mode = match (source, geometry.label >= 24) {
+        (LatencySource::AggregateAwait, true) => "interval await · ◆ peak",
+        (LatencySource::EbpfPerRequest, true) => "request density · ◆ p99",
+        (LatencySource::AggregateAwait, false) => "◆peak await",
+        (LatencySource::EbpfPerRequest, false) => "◆p99 density",
     };
     let mut line = vec![Span::styled(
         format!(
@@ -260,20 +262,6 @@ fn draw_scale_legend(f: &mut Frame, area: Rect, source: LatencySource) {
     );
 }
 
-fn format_latency(us: f64) -> String {
-    if us <= 0.0 || !us.is_finite() {
-        "--".to_string()
-    } else if us >= 1_000_000.0 {
-        format!("{:.1}s", us / 1_000_000.0)
-    } else if us >= 10_000.0 {
-        format!("{:.0}ms", us / 1_000.0)
-    } else if us >= 1_000.0 {
-        format!("{:.1}ms", us / 1_000.0)
-    } else {
-        format!("{:.0}us", us)
-    }
-}
-
 fn log_latency(us: f64) -> f64 {
     if us <= 0.0 || !us.is_finite() {
         return 0.0;
@@ -287,7 +275,6 @@ fn log_latency(us: f64) -> f64 {
 struct RowGeometry {
     label: u16,
     plot: u16,
-    annotation: u16,
 }
 
 fn row_geometry(width: u16) -> RowGeometry {
@@ -299,18 +286,9 @@ fn row_geometry(width: u16) -> RowGeometry {
         13
     }
     .min(width);
-    let annotation = if width >= 100 {
-        17
-    } else if width >= 70 {
-        17
-    } else {
-        10
-    }
-    .min(width.saturating_sub(label));
     RowGeometry {
         label,
-        plot: width.saturating_sub(label + annotation),
-        annotation,
+        plot: width.saturating_sub(label),
     }
 }
 
@@ -357,62 +335,45 @@ fn draw_overview_row(f: &mut Frame, area: Rect, tick: &IoTick, app: &App, select
         },
     );
 
-    let (read_visual, write_visual, annotation) =
-        if app.io.latency_source() == LatencySource::EbpfPerRequest {
-            let samples = app.io.traced_history.get(&tick.device);
-            let lane_width = g.plot.saturating_sub(4) as usize / 2;
-            let read = samples
-                .map(|s| request_spectrum(s, lane_width, IoLane::Read))
-                .unwrap_or_else(|| "·".repeat(lane_width));
-            let write = samples
-                .map(|s| request_spectrum(s, lane_width, IoLane::Write))
-                .unwrap_or_else(|| "·".repeat(lane_width));
-            let read_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Read, 0.99));
-            let write_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Write, 0.99));
-            (
-                read,
-                write,
-                format!(
-                    "R{} W{}",
-                    read_p99.map(format_latency).unwrap_or_else(|| "--".into()),
-                    write_p99.map(format_latency).unwrap_or_else(|| "--".into()),
-                ),
-            )
-        } else {
-            let samples = app.io.history.get(&tick.device).map(|h| &h.await_samples);
-            let lane_width = g.plot.saturating_sub(4) as usize / 2;
-            let read = samples
-                .map(|s| await_spectrum(s, lane_width, IoLane::Read))
-                .unwrap_or_else(|| "·".repeat(lane_width));
-            let write = samples
-                .map(|s| await_spectrum(s, lane_width, IoLane::Write))
-                .unwrap_or_else(|| "·".repeat(lane_width));
-            let read_peak = samples.and_then(|s| await_peak(s, IoLane::Read));
-            let write_peak = samples.and_then(|s| await_peak(s, IoLane::Write));
-            (
-                read,
-                write,
-                format!(
-                    "R{} W{}",
-                    read_peak.map(format_latency).unwrap_or_else(|| "--".into()),
-                    write_peak
-                        .map(format_latency)
-                        .unwrap_or_else(|| "--".into()),
-                ),
-            )
-        };
-    let plot_spans = vec![
-        Span::styled(
-            "R ",
-            Style::default().fg(p::GREEN).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(read_visual, Style::default().fg(p::GREEN)),
-        Span::styled(
-            " W ",
-            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(write_visual, Style::default().fg(p::CYAN)),
-    ];
+    let (read_visual, write_visual) = if app.io.latency_source() == LatencySource::EbpfPerRequest {
+        let samples = app.io.traced_history.get(&tick.device);
+        let lane_width = g.plot.saturating_sub(4) as usize / 2;
+        let mut read = samples
+            .map(|s| request_spectrum(s, lane_width, IoLane::Read))
+            .unwrap_or_else(|| "·".repeat(lane_width));
+        let mut write = samples
+            .map(|s| request_spectrum(s, lane_width, IoLane::Write))
+            .unwrap_or_else(|| "·".repeat(lane_width));
+        let read_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Read, 0.99));
+        let write_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Write, 0.99));
+        overlay_latency_marker(&mut read, read_p99);
+        overlay_latency_marker(&mut write, write_p99);
+        (read, write)
+    } else {
+        let samples = app.io.history.get(&tick.device).map(|h| &h.await_samples);
+        let lane_width = g.plot.saturating_sub(4) as usize / 2;
+        let mut read = samples
+            .map(|s| await_spectrum(s, lane_width, IoLane::Read))
+            .unwrap_or_else(|| "·".repeat(lane_width));
+        let mut write = samples
+            .map(|s| await_spectrum(s, lane_width, IoLane::Write))
+            .unwrap_or_else(|| "·".repeat(lane_width));
+        let read_peak = samples.and_then(|s| await_peak(s, IoLane::Read));
+        let write_peak = samples.and_then(|s| await_peak(s, IoLane::Write));
+        overlay_latency_marker(&mut read, read_peak);
+        overlay_latency_marker(&mut write, write_peak);
+        (read, write)
+    };
+    let mut plot_spans = vec![Span::styled(
+        "R ",
+        Style::default().fg(p::GREEN).add_modifier(Modifier::BOLD),
+    )];
+    plot_spans.extend(spectrum_spans(read_visual, p::GREEN));
+    plot_spans.push(Span::styled(
+        " W ",
+        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+    ));
+    plot_spans.extend(spectrum_spans(write_visual, p::CYAN));
     f.render_widget(
         Paragraph::new(Line::from(plot_spans)),
         Rect {
@@ -422,20 +383,6 @@ fn draw_overview_row(f: &mut Frame, area: Rect, tick: &IoTick, app: &App, select
             height: 1,
         },
     );
-    if g.annotation > 0 {
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {annotation}"),
-                Style::default().fg(p::DIM),
-            )),
-            Rect {
-                x: area.x + g.label + g.plot,
-                y: area.y,
-                width: g.annotation,
-                height: 1,
-            },
-        );
-    }
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
@@ -545,9 +492,9 @@ fn draw_direction_detail(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (name, lane_char, color) = match lane {
-        IoLane::Read => ("READ", 'R', p::GREEN),
-        IoLane::Write => ("WRITE", 'W', p::CYAN),
+    let (name, color) = match lane {
+        IoLane::Read => ("READ", p::GREEN),
+        IoLane::Write => ("WRITE", p::CYAN),
     };
     let total = histogram.iter().sum::<u64>();
     f.render_widget(
@@ -557,7 +504,7 @@ fn draw_direction_detail(
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" latency distribution · {total}"),
+                format!(" · last 60s · latency distribution · {total}"),
                 Style::default().fg(p::DIM),
             ),
         ])),
@@ -586,7 +533,6 @@ fn draw_direction_detail(
                 width: area.width.saturating_sub(label_width),
                 height: 1,
             },
-            lane_char,
             histogram[band],
             total,
             color,
@@ -615,7 +561,6 @@ fn draw_direction_detail(
 fn draw_histogram_lane(
     f: &mut Frame,
     area: Rect,
-    lane: char,
     count: u64,
     total: u64,
     color: ratatui::style::Color,
@@ -629,13 +574,9 @@ fn draw_histogram_lane(
     } else {
         String::new()
     };
-    let bar_width = area.width.saturating_sub(2 + suffix.len() as u16) as usize;
+    let bar_width = area.width.saturating_sub(suffix.len() as u16) as usize;
     let filled = histogram_filled_cells(pct, bar_width);
     let spans = vec![
-        Span::styled(
-            format!("{lane} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
         Span::styled("█".repeat(filled), Style::default().fg(color)),
         Span::styled(
             "·".repeat(bar_width.saturating_sub(filled)),
@@ -880,7 +821,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " VFS activity",
+                " VFS activity · rolling 10s",
                 Style::default()
                     .fg(p::BR_WHITE)
                     .add_modifier(Modifier::BOLD),
@@ -904,17 +845,18 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         let status = if fs_devices.is_empty() {
             "no mounted filesystem attribution"
         } else {
-            "no VFS activity this interval"
+            "no VFS activity in the last 10s"
         };
         draw_vfs_status(f, area, status);
         return;
     }
 
-    for (row, item) in entries
+    let visible: Vec<_> = entries
         .into_iter()
         .take(area.height.saturating_sub(1) as usize)
-        .enumerate()
-    {
+        .collect();
+    let scale = vfs_activity_scale(&visible);
+    for (row, item) in visible.into_iter().enumerate() {
         draw_vfs_row(
             f,
             Rect {
@@ -924,6 +866,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
                 height: 1,
             },
             item,
+            scale,
         );
     }
 }
@@ -951,7 +894,7 @@ fn draw_vfs_status(f: &mut Frame, area: Rect, message: &str) {
     );
 }
 
-pub(crate) fn draw_vfs_row(f: &mut Frame, area: Rect, item: &VfsFileActivity) {
+pub(crate) fn draw_vfs_row(f: &mut Frame, area: Rect, item: &VfsFileActivity, scale: f64) {
     if area.width == 0 {
         return;
     }
@@ -965,12 +908,24 @@ pub(crate) fn draw_vfs_row(f: &mut Frame, area: Rect, item: &VfsFileActivity) {
     } else {
         item.comm.clone()
     };
-    let spans = if area.width >= 58 {
-        // R rates (19), W rates (20), and the process column (14).
-        const FIXED_WIDTH: u16 = 53;
-        let process = truncate_text(&process, 12);
-        let path = truncate_text(&path, area.width.saturating_sub(FIXED_WIDTH) as usize);
-        vec![
+    let (bar_width, process_width) = vfs_row_layout(area.width);
+    let bar = vfs_bar_segments(item.read_bps, item.write_bps, scale, bar_width);
+    let mut spans = vec![
+        Span::styled("█".repeat(bar.read), Style::default().fg(p::GREEN)),
+        Span::styled(
+            "▀".repeat(bar.mixed),
+            Style::default().fg(p::GREEN).bg(p::CYAN),
+        ),
+        Span::styled("█".repeat(bar.write), Style::default().fg(p::CYAN)),
+        Span::styled("·".repeat(bar.empty), Style::default().fg(p::FAINT)),
+        Span::raw(" "),
+    ];
+    if area.width >= 58 {
+        // Rates (39), compact activity bar, and process column.
+        let fixed_width = 42 + process_width as u16 + bar_width as u16;
+        let process = truncate_text(&process, process_width);
+        let path = truncate_text(&path, area.width.saturating_sub(fixed_width) as usize);
+        spans.extend([
             Span::styled(
                 format!(" R {read:>8} {read_ops:>5}/s"),
                 Style::default().fg(p::GREEN),
@@ -979,11 +934,14 @@ pub(crate) fn draw_vfs_row(f: &mut Frame, area: Rect, item: &VfsFileActivity) {
                 format!("  W {write:>8} {write_ops:>5}/s"),
                 Style::default().fg(p::CYAN),
             ),
-            Span::styled(format!("  {process:<12}"), Style::default().fg(p::FG)),
+            Span::styled(
+                format!("  {process:<process_width$}"),
+                Style::default().fg(p::FG),
+            ),
             Span::styled(path, Style::default().fg(p::DIM)),
-        ]
+        ]);
     } else {
-        vec![
+        spans.extend([
             Span::styled(
                 format!(" R {read}/{read_ops}"),
                 Style::default().fg(p::GREEN),
@@ -994,9 +952,72 @@ pub(crate) fn draw_vfs_row(f: &mut Frame, area: Rect, item: &VfsFileActivity) {
             ),
             Span::styled(format!(" {process} "), Style::default().fg(p::FG)),
             Span::styled(path, Style::default().fg(p::DIM)),
-        ]
-    };
+        ]);
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+pub(crate) fn vfs_activity_scale(entries: &[&VfsFileActivity]) -> f64 {
+    entries
+        .iter()
+        .map(|item| item.read_bps + item.write_bps)
+        .filter(|rate| rate.is_finite())
+        .fold(0.0_f64, f64::max)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VfsBarSegments {
+    read: usize,
+    mixed: usize,
+    write: usize,
+    empty: usize,
+}
+
+fn vfs_bar_segments(read: f64, write: f64, scale: f64, width: usize) -> VfsBarSegments {
+    let read = read.max(0.0);
+    let write = write.max(0.0);
+    let total = read + write;
+    if width == 0 || !total.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return VfsBarSegments {
+            read: 0,
+            mixed: 0,
+            write: 0,
+            empty: width,
+        };
+    }
+    let filled = if total > 0.0 {
+        (((total / scale).clamp(0.0, 1.0) * width as f64).round() as usize).max(1)
+    } else {
+        0
+    };
+    let (read_cells, mixed_cells, write_cells) = if filled == 1 && read > 0.0 && write > 0.0 {
+        (0, 1, 0)
+    } else {
+        let mut read_cells = if total > 0.0 {
+            ((read / total) * filled as f64).round() as usize
+        } else {
+            0
+        };
+        if filled >= 2 && read > 0.0 && write > 0.0 {
+            read_cells = read_cells.clamp(1, filled - 1);
+        }
+        let read_cells = read_cells.min(filled);
+        (read_cells, 0, filled - read_cells)
+    };
+    VfsBarSegments {
+        read: read_cells,
+        mixed: mixed_cells,
+        write: write_cells,
+        empty: width - filled,
+    }
+}
+
+fn vfs_row_layout(width: u16) -> (usize, usize) {
+    if width >= 90 {
+        (7, 10)
+    } else {
+        (3, 6)
+    }
 }
 
 fn truncate_text(value: &str, width: usize) -> String {
@@ -1159,10 +1180,10 @@ fn request_spectrum(samples: &VecDeque<TracedLatencySample>, width: usize, lane:
             })
         })
         .collect();
-    let max = counts.iter().copied().max().unwrap_or(0);
+    let total = counts.iter().copied().sum();
     let mut chars = vec!['·'; width];
     for (bucket, span) in bucket_spans(width) {
-        let ch = density_char(counts[bucket], max);
+        let ch = density_char(counts[bucket], total);
         chars[span].fill(ch);
     }
     let first_bucket = bucket_for_column(0, width);
@@ -1170,10 +1191,10 @@ fn request_spectrum(samples: &VecDeque<TracedLatencySample>, width: usize, lane:
     let below: u64 = counts[..first_bucket].iter().copied().sum();
     let above: u64 = counts[last_bucket + 1..].iter().copied().sum();
     if below > 0 {
-        chars[0] = density_char(below, max.max(below));
+        chars[0] = density_char(below, total);
     }
     if above > 0 {
-        chars[width - 1] = density_char(above, max.max(above));
+        chars[width - 1] = density_char(above, total);
     }
     chars.into_iter().collect()
 }
@@ -1187,23 +1208,70 @@ fn await_spectrum(samples: &VecDeque<AwaitSample>, width: usize, lane: IoLane) -
         let column = (log_latency(value) * width.saturating_sub(1) as f64).round() as usize;
         counts[column] += 1;
     }
-    let max = counts.iter().copied().max().unwrap_or(0);
+    let total = counts.iter().copied().sum();
     counts
         .into_iter()
-        .map(|count| density_char(count, max))
+        .map(|count| density_char(count, total))
         .collect()
 }
 
-fn density_char(count: u64, max: u64) -> char {
-    if count == 0 || max == 0 {
+/// Fixed lane-share thresholds keep density comparable across devices:
+/// <1%, 1-5%, 5-20%, and >=20% of the lane's observations.
+fn density_char(count: u64, total: u64) -> char {
+    if count == 0 || total == 0 {
         return '·';
     }
-    match ((count as f64).ln_1p() / (max as f64).ln_1p() * 4.0).ceil() as u8 {
-        0 | 1 => '░',
-        2 => '▒',
-        3 => '▓',
-        _ => '█',
+    let percent = count as f64 * 100.0 / total as f64;
+    if percent < 1.0 {
+        '░'
+    } else if percent < 5.0 {
+        '▒'
+    } else if percent < 20.0 {
+        '▓'
+    } else {
+        '█'
     }
+}
+
+fn overlay_latency_marker(spectrum: &mut String, latency_us: Option<f64>) {
+    let Some(latency_us) = latency_us else {
+        return;
+    };
+    let mut chars: Vec<char> = spectrum.chars().collect();
+    if chars.is_empty() {
+        return;
+    }
+    let position =
+        (log_latency(latency_us) * chars.len().saturating_sub(1) as f64).round() as usize;
+    chars[position] = '◆';
+    *spectrum = chars.into_iter().collect();
+}
+
+fn spectrum_spans(spectrum: String, color: ratatui::style::Color) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut density = String::new();
+    for ch in spectrum.chars() {
+        if ch == '◆' {
+            if !density.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut density),
+                    Style::default().fg(color),
+                ));
+            }
+            spans.push(Span::styled(
+                "◆",
+                Style::default()
+                    .fg(p::BR_WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            density.push(ch);
+        }
+    }
+    if !density.is_empty() {
+        spans.push(Span::styled(density, Style::default().fg(color)));
+    }
+    spans
 }
 
 fn latency_band(us: f64) -> usize {
@@ -1426,6 +1494,8 @@ fn whole_disk_name(device: &str) -> &str {
 mod tests {
     use super::*;
     use crate::collect::ebpf::BlockDeviceId;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn fs(device: &str, mount: &str) -> FsTick {
         FsTick {
@@ -1681,11 +1751,9 @@ mod tests {
         assert_eq!(master_detail_heights(1, 8), (1, 0));
         let (overview, detail) = master_detail_heights(28, 8);
         assert!(overview + 1 + detail <= 28);
-        assert_eq!(
-            row_geometry(60).label + row_geometry(60).plot + row_geometry(60).annotation,
-            60
-        );
+        assert_eq!(row_geometry(60).label + row_geometry(60).plot, 60);
         assert_eq!(row_geometry(130).label.saturating_sub(1), 29);
+        assert_eq!(row_geometry(130).plot, 100);
     }
 
     #[test]
@@ -1698,10 +1766,28 @@ mod tests {
     }
 
     #[test]
-    fn latency_annotations_use_compact_units() {
-        assert_eq!(format_latency(2_097_152.0), "2.1s");
-        assert_eq!(format_latency(58_600.0), "59ms");
-        assert_eq!(format_latency(2_048.0), "2.0ms");
+    fn density_glyphs_have_fixed_lane_share_meaning() {
+        assert_eq!(density_char(0, 100), '·');
+        assert_eq!(density_char(1, 200), '░'); // 0.5%
+        assert_eq!(density_char(1, 100), '▒'); // 1%
+        assert_eq!(density_char(5, 100), '▓'); // 5%
+        assert_eq!(density_char(20, 100), '█'); // 20%
+        assert_eq!(density_char(50, 1_000), density_char(5, 100));
+    }
+
+    #[test]
+    fn latency_marker_uses_fixed_log_axis_and_preserves_width() {
+        let mut spectrum = "·········".to_string();
+        overlay_latency_marker(&mut spectrum, Some(LATENCY_MIN_US));
+        assert_eq!(spectrum.chars().next(), Some('◆'));
+        assert_eq!(spectrum.chars().count(), 9);
+
+        overlay_latency_marker(&mut spectrum, Some(LATENCY_MAX_US));
+        assert_eq!(spectrum.chars().last(), Some('◆'));
+
+        let unchanged = spectrum.clone();
+        overlay_latency_marker(&mut spectrum, None);
+        assert_eq!(spectrum, unchanged);
     }
 
     #[test]
@@ -1785,6 +1871,91 @@ mod tests {
         assert_eq!(truncate_text("Cache worker foo", 12), "Cache wor...");
         assert_eq!(truncate_text("short", 12), "short");
         assert_eq!(truncate_text("long", 3), "...");
+    }
+
+    #[test]
+    fn vfs_activity_bars_share_a_combined_rate_scale() {
+        let hot = hot_file(8, 1, 75.0, 25.0);
+        let cool = hot_file(8, 1, 10.0, 10.0);
+        let entries = [&hot, &cool];
+        let scale = vfs_activity_scale(&entries);
+
+        assert_eq!(scale, 100.0);
+        assert_eq!(
+            vfs_bar_segments(75.0, 25.0, scale, 4),
+            VfsBarSegments {
+                read: 3,
+                mixed: 0,
+                write: 1,
+                empty: 0,
+            }
+        );
+        assert_eq!(
+            vfs_bar_segments(10.0, 10.0, scale, 4),
+            VfsBarSegments {
+                read: 0,
+                mixed: 1,
+                write: 0,
+                empty: 3,
+            }
+        );
+        assert_eq!(vfs_bar_segments(0.01, 0.01, scale, 4).mixed, 1);
+        assert_eq!(
+            vfs_bar_segments(0.0, 0.0, scale, 4),
+            VfsBarSegments {
+                read: 0,
+                mixed: 0,
+                write: 0,
+                empty: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn vfs_row_renders_colored_microbar_before_exact_rates() {
+        let item = hot_file(8, 1, 75.0, 25.0);
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_vfs_row(frame, frame.area(), &item, 100.0))
+            .expect("draw VFS row");
+        let buffer = terminal.backend().buffer();
+
+        for x in 0..2 {
+            let cell = buffer.cell((x, 0)).expect("read bar cell");
+            assert_eq!(cell.symbol(), "█");
+            assert_eq!(cell.fg, p::GREEN);
+        }
+        let write_cell = buffer.cell((2, 0)).expect("write bar cell");
+        assert_eq!(write_cell.symbol(), "█");
+        assert_eq!(write_cell.fg, p::CYAN);
+        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "R");
+    }
+
+    #[test]
+    fn vfs_row_renders_one_cell_mixed_activity_in_both_colors() {
+        let item = hot_file(8, 1, 10.0, 10.0);
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_vfs_row(frame, frame.area(), &item, 100.0))
+            .expect("draw VFS row");
+        let cell = terminal.backend().buffer().cell((0, 0)).unwrap();
+
+        assert_eq!(cell.symbol(), "▀");
+        assert_eq!(cell.fg, p::GREEN);
+        assert_eq!(cell.bg, p::CYAN);
+    }
+
+    #[test]
+    fn compact_vfs_layout_preserves_a_usable_path_budget() {
+        let (bar_width, process_width) = vfs_row_layout(58);
+        let fixed_width = 42 + process_width + bar_width;
+
+        assert_eq!((bar_width, process_width), (3, 6));
+        assert_eq!(58 - fixed_width, 7);
+        assert_eq!(vfs_row_layout(90), (7, 10));
     }
 
     #[test]

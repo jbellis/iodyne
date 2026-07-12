@@ -3,12 +3,11 @@
 //! Differences from `ratatui::widgets::Sparkline`:
 //! 1. **High resolution.** Each terminal cell carries a 2x4 braille dot
 //!    grid, giving smoother graphs without increasing layout size.
-//! 2. **Visible baseline.** Cells without data, and zero-valued cells,
-//!    keep a bottom-row dot so the chart is visually grounded.
+//! 2. **Quiet baseline.** Sampled zeroes keep a dim bottom-row dot, while
+//!    columns without data remain blank.
 //! 3. **Right-anchored.** Newest sample is at the right edge. If the
-//!    sample series is shorter than the area, the leading cells show
-//!    the baseline; once the ring fills, samples scroll left as
-//!    expected.
+//!    sample series is shorter than the area, the leading cells remain
+//!    blank; once the ring fills, samples scroll left as expected.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -65,7 +64,7 @@ impl<'a> Widget for BaselineSparkline<'a> {
         let dot_w = w * 2;
         let dot_h = area.height as usize * 4;
         let n = self.samples.len();
-        // How many leading dot-columns lack real data — baseline-fill them.
+        // How many leading dot-columns lack real data.
         let leading = dot_w.saturating_sub(n);
         // Slice the rightmost `dot_w` samples from the data.
         let start = n.saturating_sub(dot_w);
@@ -77,13 +76,10 @@ impl<'a> Widget for BaselineSparkline<'a> {
         };
 
         let mut dots = vec![0_u8; w * area.height as usize];
+        let mut has_signal = vec![false; w * area.height as usize];
 
-        for x in 0..dot_w {
-            let value = if x < leading {
-                0.0
-            } else {
-                visible[x - leading]
-            };
+        for (visible_x, value) in visible.iter().copied().enumerate() {
+            let x = leading + visible_x;
             let normalized = (value / max).clamp(0.0, 1.0);
             let filled = (normalized * dot_h as f64).round() as usize;
             let filled = filled.max(1).min(dot_h);
@@ -96,19 +92,78 @@ impl<'a> Widget for BaselineSparkline<'a> {
                 let dot_row = dot_y % 4;
                 let idx = cell_y * w + cell_x;
                 dots[idx] |= BRAILLE_DOTS[dot_x][dot_row];
+                has_signal[idx] |= value > 0.0;
             }
         }
 
         for cell_y in 0..area.height as usize {
             for cell_x in 0..w {
                 let mask = dots[cell_y * w + cell_x];
-                let ch = char::from_u32(BRAILLE_BASE + mask as u32).unwrap_or('\u{2800}');
+                let ch = if mask == 0 {
+                    ' '
+                } else {
+                    char::from_u32(BRAILLE_BASE + mask as u32).unwrap_or(' ')
+                };
                 let cx = area.x + cell_x as u16;
                 let cy = area.y + cell_y as u16;
                 if let Some(cell) = buf.cell_mut((cx, cy)) {
-                    cell.set_char(ch).set_fg(self.fg).set_bg(self.bg);
+                    let fg = if mask != 0 && !has_signal[cell_y * w + cell_x] {
+                        Color::DarkGray
+                    } else {
+                        self.fg
+                    };
+                    cell.set_char(ch).set_fg(fg).set_bg(self.bg);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(samples: &[f64]) -> Buffer {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        BaselineSparkline::new(samples)
+            .style(Style::default().fg(Color::Cyan))
+            .render(area, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn empty_series_renders_blank_cells() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "xxxx", Style::default().fg(Color::Red));
+        BaselineSparkline::new(&[])
+            .style(Style::default().fg(Color::Cyan))
+            .render(area, &mut buf);
+
+        for x in 0..4 {
+            assert_eq!(buf.cell((x, 0)).unwrap().symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn sampled_zeroes_are_dim_and_right_anchored() {
+        let buf = render(&[0.0, 0.0]);
+
+        for x in 0..3 {
+            assert_eq!(buf.cell((x, 0)).unwrap().symbol(), " ");
+        }
+        let last = buf.cell((3, 0)).unwrap();
+        assert_eq!(last.symbol(), "\u{28c0}");
+        assert_eq!(last.fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn positive_samples_use_metric_color() {
+        let buf = render(&[0.0, 1.0]);
+        let last = buf.cell((3, 0)).unwrap();
+
+        assert_ne!(last.symbol(), "\u{2800}");
+        assert_eq!(last.fg, Color::Cyan);
     }
 }
