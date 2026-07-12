@@ -223,22 +223,37 @@ impl HotFileWatcher {
 }
 
 /// Sensible default roots that show real user activity without drowning
-/// in /System churn. /private/tmp and /private/var/log are useful on
-/// macOS; on Linux we want /home and /var/log.
+/// in system churn.
+///
+/// On Linux, recursive inotify requires one watch per directory. Watching
+/// all of `$HOME` can mean hundreds of thousands of watches and seconds
+/// of startup work, so the default is the current working directory plus
+/// small system scratch/log locations. macOS FSEvents does not have the
+/// same per-directory watch explosion, so it can safely watch `$HOME`.
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home));
-    }
+
     #[cfg(target_os = "macos")]
     {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home));
+        }
         roots.push(PathBuf::from("/private/var/log"));
         roots.push(PathBuf::from("/private/tmp"));
     }
     #[cfg(target_os = "linux")]
     {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Ok(cwd) = std::env::current_dir() {
+            let is_home = home.as_ref().is_some_and(|h| h == &cwd);
+            if cwd != Path::new("/") && !is_home {
+                roots.push(cwd);
+            }
+        }
         roots.push(PathBuf::from("/var/log"));
         roots.push(PathBuf::from("/tmp"));
     }
+    roots.sort();
+    roots.dedup();
     roots
 }
