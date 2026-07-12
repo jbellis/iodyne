@@ -1,6 +1,6 @@
 //! IO tab — port of `dwRenderIo`.
 //!
-//! 4-up grid of per-device panels. Each shows read/write rates,
+//! 2-column grid of per-device panels. Each shows read/write rates,
 //! sparkline history, and inline summary stats. Latency / queue depth
 //! are deferred; the panel shows "—" for those slots.
 
@@ -16,6 +16,8 @@ use crate::ui::format::fmt_rate;
 use crate::ui::palette as p;
 use crate::ui::sparkline::BaselineSparkline;
 
+const MIN_PANEL_HEIGHT: u16 = 5;
+
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
         draw_empty(f, area);
@@ -24,11 +26,16 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(MIN_PANEL_HEIGHT),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     draw_summary_line(f, rows[0], app);
     draw_panel_grid(f, rows[1], app);
+    draw_latency_note(f, rows[2]);
 }
 
 fn draw_empty(f: &mut Frame, area: Rect) {
@@ -117,13 +124,15 @@ fn draw_panel_grid(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn panel_areas(area: Rect, n: usize) -> Vec<Rect> {
-    // Up to a 2x2 grid; for >4 devices, render the first 4 (rare on
-    // workstations).
-    let n = n.min(4);
     if n == 0 {
         return Vec::new();
     }
-    let cols = if n == 1 { 1 } else { 2 };
+
+    // A 2xN grid scales down proportionally as device count grows. Keep
+    // rows at least tall enough for border + rate + latency + sparkline.
+    let cols = if n == 1 { 1_usize } else { 2 };
+    let max_rows = (area.height / MIN_PANEL_HEIGHT).max(1) as usize;
+    let n = n.min(max_rows.saturating_mul(cols));
     let rows = n.div_ceil(cols);
 
     let row_constraints: Vec<Constraint> = (0..rows)
@@ -156,6 +165,32 @@ fn panel_areas(area: Rect, n: usize) -> Vec<Rect> {
         }
     }
     out
+}
+
+fn draw_latency_note(f: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let note = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "latency",
+            Style::default().fg(p::DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " p50/p99 are per-tick averages; micro-spikes need eBPF/IOReport",
+            Style::default().fg(p::DIM),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(note).style(Style::default().bg(p::BG)),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+    );
 }
 
 fn latency_line(tick: &IoTick) -> Line<'static> {
@@ -286,7 +321,7 @@ fn draw_panel(
     // Single sparkline of combined throughput. Baseline-aware so the
     // panel is visually filled from the first sample.
     if let Some(h) = history {
-        let panel_inner_h = inner.height.saturating_sub(3);
+        let panel_inner_h = inner.height.saturating_sub(2);
         let data: Vec<f64> = h.combined.iter().copied().collect();
         f.render_widget(
             BaselineSparkline::new(&data).style(Style::default().fg(p::CYAN).bg(p::BG)),
@@ -295,24 +330,6 @@ fn draw_panel(
                 y: inner.y + 2,
                 width: inner.width.saturating_sub(2),
                 height: panel_inner_h,
-            },
-        );
-    }
-
-    // Footer note explains the percentile semantics so the user knows
-    // what they're looking at.
-    if inner.height >= 6 {
-        let lat = Line::from(vec![Span::styled(
-            "  p50/p99 of per-tick averages — micro-spikes invisible without eBPF/IOReport",
-            Style::default().fg(p::DIM),
-        )]);
-        f.render_widget(
-            Paragraph::new(lat).style(Style::default().bg(p::BG)),
-            Rect {
-                x: inner.x + 1,
-                y: inner.y + inner.height - 1,
-                width: inner.width.saturating_sub(2),
-                height: 1,
             },
         );
     }
@@ -448,5 +465,36 @@ mod tests {
             mounts_for_device("sdb", &filesystems),
             Some("/a, /b +1".to_string())
         );
+    }
+
+    #[test]
+    fn panel_grid_uses_two_columns_for_more_than_one_device() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 15,
+        };
+
+        let panels = panel_areas(area, 6);
+
+        assert_eq!(panels.len(), 6);
+        assert_eq!(panels[0].height, 5);
+        assert_eq!(panels[0].width, 50);
+    }
+
+    #[test]
+    fn panel_grid_limits_to_complete_rows_that_fit() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 11,
+        };
+
+        let panels = panel_areas(area, 10);
+
+        assert_eq!(panels.len(), 4);
+        assert!(panels.iter().all(|panel| panel.height >= MIN_PANEL_HEIGHT));
     }
 }
