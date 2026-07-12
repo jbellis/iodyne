@@ -164,6 +164,11 @@ static __inline __attribute__((always_inline)) int record_vfs(
     if (!value)
         return 0;
 
+    // The thread handling the latest operation can have a descriptor table
+    // that is not visible through the thread-group leader. Keep its PID so
+    // userspace can try /proc/<pid>/fd before falling back to the TGID.
+    value->pid = (__u32)pid_tgid;
+
     __u64 count = vfs_count_arg(ctx);
     if (direction == 0) {
         __sync_fetch_and_add(&value->read_bytes, count);

@@ -721,21 +721,29 @@ fn rank_vfs_activity(activity: &mut Vec<VfsFileActivity>, limit: usize) {
 /// tree traversal occurs.
 #[cfg(target_os = "linux")]
 fn resolve_hot_file_paths(activity: &mut [VfsFileActivity]) {
+    resolve_hot_file_paths_at(activity, std::path::Path::new("/proc"));
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_hot_file_paths_at(activity: &mut [VfsFileActivity], proc_root: &std::path::Path) {
     use std::collections::{HashMap as StdHashMap, HashSet};
     use std::os::unix::fs::MetadataExt;
 
-    let mut wanted: StdHashMap<u32, HashSet<(u32, u32, u64)>> = StdHashMap::new();
+    let mut wanted: StdHashMap<u32, HashSet<(u32, u32, u32, u64)>> = StdHashMap::new();
     for item in activity.iter() {
-        wanted.entry(item.tgid).or_default().insert((
+        let identity = (
+            item.tgid,
             item.fs_device.major,
             item.fs_device.minor,
             item.inode,
-        ));
+        );
+        wanted.entry(item.pid).or_default().insert(identity);
+        wanted.entry(item.tgid).or_default().insert(identity);
     }
 
     let mut resolved: StdHashMap<(u32, u32, u32, u64), String> = StdHashMap::new();
-    for (tgid, keys) in wanted {
-        let Ok(entries) = std::fs::read_dir(format!("/proc/{tgid}/fd")) else {
+    for (pid, keys) in wanted {
+        let Ok(entries) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
             continue;
         };
         for entry in entries.flatten().take(PROC_FD_SCAN_LIMIT) {
@@ -745,15 +753,15 @@ fn resolve_hot_file_paths(activity: &mut [VfsFileActivity]) {
                 continue;
             };
             let dev = metadata.dev();
-            let key = (linux_dev_major(dev), linux_dev_minor(dev), metadata.ino());
-            if !keys.contains(&key) {
+            let file_identity = (linux_dev_major(dev), linux_dev_minor(dev), metadata.ino());
+            let Some(key) = keys
+                .iter()
+                .find(|key| (key.1, key.2, key.3) == file_identity)
+            else {
                 continue;
-            }
+            };
             if let Ok(path) = std::fs::read_link(entry.path()) {
-                resolved.insert(
-                    (tgid, key.0, key.1, key.2),
-                    path.to_string_lossy().into_owned(),
-                );
+                resolved.insert(*key, path.to_string_lossy().into_owned());
             }
         }
     }
@@ -1122,6 +1130,50 @@ mod tests {
         }];
         resolve_hot_file_paths(&mut activity);
         assert!(activity[0].path.ends_with("Cargo.toml"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_fd_resolution_checks_the_recorded_task_before_the_group_leader() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        let metadata = file.metadata().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "diskwatch-proc-fixture-{}-{}",
+            std::process::id(),
+            metadata.ino()
+        ));
+        let task_pid = 2001;
+        let leader_pid = 2000;
+        let fd_dir = root.join(task_pid.to_string()).join("fd");
+        std::fs::create_dir_all(&fd_dir).unwrap();
+        symlink(
+            std::fs::canonicalize("Cargo.toml").unwrap(),
+            fd_dir.join("7"),
+        )
+        .unwrap();
+
+        let mut activity = vec![VfsFileActivity {
+            fs_device: BlockDeviceId {
+                major: linux_dev_major(metadata.dev()),
+                minor: linux_dev_minor(metadata.dev()),
+            },
+            inode: metadata.ino(),
+            pid: task_pid,
+            tgid: leader_pid,
+            comm: "worker".into(),
+            basename: "Cargo.toml".into(),
+            path: fallback_file_path("Cargo.toml", metadata.ino()),
+            read_bps: 1.0,
+            write_bps: 0.0,
+            read_ops: 1.0,
+            write_ops: 0.0,
+        }];
+
+        resolve_hot_file_paths_at(&mut activity, &root);
+        assert!(activity[0].path.ends_with("Cargo.toml"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
