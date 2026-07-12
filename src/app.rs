@@ -451,7 +451,7 @@ mod tests {
             "Free",
             "B/s",
             "IOPS",
-            "all | 1 device",
+            "1 device",
             "LIVE",
             "READ",
             "WRITE",
@@ -468,6 +468,7 @@ mod tests {
             "latency distribution",
             "requested rates",
             "VFS activity",
+            "all | 1 device",
         ] {
             assert!(
                 !text.contains(removed),

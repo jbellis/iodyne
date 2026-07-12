@@ -103,7 +103,7 @@ fn overview_title(app: &App) -> Line<'static> {
         LatencySource::AggregateAwait => "AGGREGATE AWAIT",
         LatencySource::EbpfPerRequest => "PER-REQUEST eBPF",
     };
-    let spans = vec![
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             source,
@@ -111,19 +111,23 @@ fn overview_title(app: &App) -> Line<'static> {
                 .fg(p::BR_WHITE)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" | ", Style::default().fg(p::FAINT)),
-        Span::styled(
-            if app.io_show_unmounted {
-                "all"
-            } else {
-                "mounted"
-            },
-            Style::default()
-                .fg(p::BR_WHITE)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
     ];
+    if app.io.latest.len() > 1 {
+        spans.extend([
+            Span::styled(" | ", Style::default().fg(p::FAINT)),
+            Span::styled(
+                if app.io_show_unmounted {
+                    "all"
+                } else {
+                    "mounted"
+                },
+                Style::default()
+                    .fg(p::BR_WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    spans.push(Span::raw(" "));
     Line::from(spans)
 }
 
@@ -922,17 +926,26 @@ fn draw_aggregate_detail(f: &mut Frame, area: Rect, aggregate: &AggregateIo, app
     draw_detail_data(
         f,
         area,
-        format!(
-            " all | {} device{} ",
-            aggregate.device_count,
-            if aggregate.device_count == 1 { "" } else { "s" }
-        ),
+        aggregate_detail_header(aggregate.device_count, app.io.latest.len()),
         Vec::new(),
         Some(&aggregate.history),
         histograms,
         None,
         app,
     );
+}
+
+fn aggregate_detail_header(device_count: usize, total_io_devices: usize) -> String {
+    let count = format!(
+        "{} device{}",
+        device_count,
+        if device_count == 1 { "" } else { "s" }
+    );
+    if total_io_devices > 1 {
+        format!(" all | {count} ")
+    } else {
+        format!(" {count} ")
+    }
 }
 
 fn draw_detail_data(
@@ -2766,6 +2779,13 @@ mod tests {
             mounts_for_device("nvme0n1", &filesystems),
             Some("/".to_string())
         );
+    }
+
+    #[test]
+    fn aggregate_header_omits_all_for_single_sampled_device_only() {
+        assert_eq!(aggregate_detail_header(1, 1), " 1 device ");
+        assert_eq!(aggregate_detail_header(1, 2), " all | 1 device ");
+        assert_eq!(aggregate_detail_header(2, 2), " all | 2 devices ");
     }
 
     #[test]
