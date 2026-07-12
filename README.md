@@ -124,8 +124,8 @@ otherwise under `~/.config/iodyne/`.
 Rust 1.75 or newer is required to build from source:
 
 ```sh
-git clone https://github.com/matthart1983/diskwatch.git
-cd diskwatch
+git clone https://github.com/matthart1983/iodyne.git
+cd iodyne
 cargo build --release
 ./target/release/iodyne
 ```
