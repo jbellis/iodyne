@@ -59,7 +59,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     draw_summary_line(f, rows[0], app);
-    draw_scale_legend(f, rows[1], app.io.latency_source());
+    draw_scale_legend(f, rows[1]);
     draw_master_detail(f, rows[2], app);
 }
 
@@ -229,20 +229,13 @@ fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_scale_legend(f: &mut Frame, area: Rect, source: LatencySource) {
+fn draw_scale_legend(f: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
     }
     let geometry = row_geometry(area.width);
-    let mode = match source {
-        LatencySource::AggregateAwait => "◆ peak",
-        LatencySource::EbpfPerRequest => "◆ p99",
-    };
     let mut line = vec![Span::styled(
-        format!(
-            " {mode:<width$}",
-            width = geometry.label.saturating_sub(1) as usize
-        ),
+        overview_prefix_header(geometry.label),
         Style::default().fg(p::DIM),
     )];
     let lanes = latency_plot_geometry(geometry.plot);
@@ -280,8 +273,8 @@ struct RowGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OverviewPrefixGeometry {
     device: u16,
-    fullness: u16,
-    throughput: u16,
+    free: u16,
+    activity: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,21 +300,42 @@ fn latency_plot_geometry(width: u16) -> LatencyPlotGeometry {
 }
 
 fn overview_prefix_geometry(width: u16) -> OverviewPrefixGeometry {
-    let (device, fullness) = if width >= 24 {
+    let (device, free) = if width >= 24 {
         (10, 4)
     } else if width >= 16 {
         (7, 4)
     } else if width >= 10 {
-        (width.saturating_sub(8), 4)
+        (width.saturating_sub(9), 4)
     } else {
         (width.saturating_sub(1), 0)
     };
-    let fixed = 1 + device + (fullness > 0) as u16 * (1 + fullness + 1);
+    // Selection marker, device, one-cell gutters, free %, and a trailing
+    // gutter that separates the activity sparkline from the R latency lane.
+    let fixed = 1 + device + (free > 0) as u16 * (1 + free + 1) + 1;
     OverviewPrefixGeometry {
         device,
-        fullness,
-        throughput: width.saturating_sub(fixed),
+        free,
+        activity: width.saturating_sub(fixed),
     }
+}
+
+fn overview_prefix_header(width: u16) -> String {
+    let geometry = overview_prefix_geometry(width);
+    let device = fit_overview_device("Device", geometry.device as usize);
+    let mut header = format!(" {device:<width$}", width = geometry.device as usize);
+    if geometry.free > 0 {
+        header.push_str(&format!(
+            " {:>width$} ",
+            fit_overview_device("Free", geometry.free as usize),
+            width = geometry.free as usize
+        ));
+    }
+    header.push_str(&format!(
+        "{:<width$} ",
+        fit_overview_device("Activity", geometry.activity as usize),
+        width = geometry.activity as usize
+    ));
+    header
 }
 
 fn row_geometry(width: u16) -> RowGeometry {
@@ -384,7 +398,7 @@ fn draw_overview_row(
             ..area
         },
         &tick.device,
-        filesystem_fullness_pct(&tick.device, &app.filesystems),
+        filesystem_free_pct(&tick.device, &app.filesystems),
         &throughput,
         throughput_scale,
         selected,
@@ -436,7 +450,7 @@ fn draw_overview_prefix(
     f: &mut Frame,
     area: Rect,
     device: &str,
-    fullness: Option<u32>,
+    free: Option<u32>,
     throughput: &[f64],
     throughput_scale: f64,
     selected: bool,
@@ -451,17 +465,20 @@ fn draw_overview_prefix(
         format!("{marker}{device:<width$}", width = geometry.device as usize),
         Style::default().fg(if selected { p::BR_WHITE } else { p::DIM }),
     )];
-    if geometry.fullness > 0 {
+    if geometry.free > 0 {
         spans.push(Span::styled(
             format!(
                 " {:>width$} ",
-                format_fullness(fullness),
-                width = geometry.fullness as usize
+                format_free(free),
+                width = geometry.free as usize
             ),
             Style::default().fg(p::DIM),
         ));
     }
-    let text_width = area.width.saturating_sub(geometry.throughput);
+    let text_width = area
+        .width
+        .saturating_sub(geometry.activity)
+        .saturating_sub(1);
     f.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect {
@@ -469,14 +486,14 @@ fn draw_overview_prefix(
             ..area
         },
     );
-    if geometry.throughput > 0 {
+    if geometry.activity > 0 {
         f.render_widget(
             BaselineSparkline::new(throughput)
                 .max(throughput_scale)
                 .style(Style::default().fg(p::YELLOW).bg(p::BG)),
             Rect {
                 x: area.x + text_width,
-                width: geometry.throughput,
+                width: geometry.activity,
                 ..area
             },
         );
@@ -494,9 +511,8 @@ fn fit_overview_device(device: &str, width: usize) -> String {
     }
 }
 
-fn format_fullness(fullness: Option<u32>) -> String {
-    fullness
-        .map(|percent| format!("{}%", percent.min(100)))
+fn format_free(free: Option<u32>) -> String {
+    free.map(|percent| format!("{}%", percent.min(100)))
         .unwrap_or_else(|| "--".into())
 }
 
@@ -1345,7 +1361,7 @@ fn filesystems_for_io_device<'a>(device: &str, filesystems: &'a [FsTick]) -> Vec
         .collect()
 }
 
-fn filesystem_fullness_pct(device: &str, filesystems: &[FsTick]) -> Option<u32> {
+fn filesystem_free_pct(device: &str, filesystems: &[FsTick]) -> Option<u32> {
     filesystems_for_io_device(device, filesystems)
         .into_iter()
         .filter(|fs| fs.size_bytes > 0)
@@ -1355,6 +1371,7 @@ fn filesystem_fullness_pct(device: &str, filesystems: &[FsTick]) -> Option<u32> 
                 .clamp(0.0, 100.0) as u32
         })
         .max()
+        .map(|used| 100 - used)
 }
 
 #[cfg(target_os = "linux")]
@@ -2049,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn fullness_uses_maximum_attributable_mounted_filesystem() {
+    fn free_space_uses_least_free_attributable_mounted_filesystem() {
         let filesystems = vec![
             fs_usage("/dev/sda1", "/", 40, 100),
             fs_usage("/dev/sda2", "/home", 85, 100),
@@ -2057,9 +2074,9 @@ mod tests {
             fs_usage("/dev/sdb1", "/other", 99, 100),
         ];
 
-        assert_eq!(filesystem_fullness_pct("sda", &filesystems), Some(85));
-        assert_eq!(filesystem_fullness_pct("sdb", &filesystems), Some(99));
-        assert_eq!(filesystem_fullness_pct("sdc", &filesystems), None);
+        assert_eq!(filesystem_free_pct("sda", &filesystems), Some(15));
+        assert_eq!(filesystem_free_pct("sdb", &filesystems), Some(1));
+        assert_eq!(filesystem_free_pct("sdc", &filesystems), None);
     }
 
     #[test]
@@ -2123,11 +2140,13 @@ mod tests {
     }
 
     #[test]
-    fn narrow_overview_prefix_keeps_fullness_and_throughput_before_latency() {
+    fn overview_headers_and_rows_share_column_and_latency_boundaries() {
         let width = 60;
         let geometry = row_geometry(width);
         assert_eq!(geometry.label, 13);
-        assert_eq!(overview_prefix_geometry(geometry.label).throughput, 1);
+        assert_eq!(overview_prefix_geometry(geometry.label).activity, 1);
+        assert_eq!(overview_prefix_header(30), " Device     Free Activity     ");
+        assert_eq!(overview_prefix_header(30).chars().count(), 30);
         let lanes = latency_plot_geometry(geometry.plot);
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2155,8 +2174,8 @@ mod tests {
             .map(|x| buffer.cell((x, 0)).unwrap().symbol())
             .collect::<String>();
 
-        assert!(line.starts_with("▌nvme~  85% "));
-        assert_ne!(buffer.cell((geometry.label - 1, 0)).unwrap().symbol(), " ");
+        assert!(line.starts_with("▌nvm~  85%"));
+        assert_eq!(buffer.cell((geometry.label - 1, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((geometry.label, 0)).unwrap().symbol(), "R");
     }
 
