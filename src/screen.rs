@@ -11,6 +11,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 
+use chrono::Local;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,8 +19,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::app::LiveState;
 use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
-use crate::collect::io::{VfsActivitySource, VfsFileActivity};
+use crate::collect::io::{DeviceHistory, VfsActivitySource, VfsFileActivity};
 use crate::collect::smart::{AtaAttr, SmartTick};
 use crate::collect::volumes::{ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick};
 use crate::collect::{
@@ -48,7 +50,7 @@ const DIRECTION_DETAIL_HEIGHT: u16 = 14;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
-        draw_empty(f, area);
+        draw_empty(f, area, app);
         return;
     }
 
@@ -75,11 +77,12 @@ fn pane_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
         .style(Style::default().bg(p::BG))
 }
 
-fn draw_empty(f: &mut Frame, area: Rect) {
+fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(Span::styled(
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-    ));
+    ))
+    .title(live_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -124,14 +127,28 @@ fn overview_title(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+fn live_title(app: &App) -> Line<'static> {
+    let (label, color) = match app.live {
+        LiveState::Live => ("LIVE", p::GREEN),
+        LiveState::Paused => ("PAUSE", p::YELLOW),
+    };
+    Line::from(vec![Span::styled(
+        format!(" ● {label}  {} ", Local::now().format("%H:%M:%S")),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )])
+    .right_aligned()
+}
+
 fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
     let visible = visible_io_ticks(app);
     if visible.is_empty() {
-        draw_no_mounted_io(f, area);
+        draw_no_mounted_io(f, area, app);
         return;
     }
 
-    let (overview_height, detail_height) = master_detail_heights(area.height, visible.len());
+    let aggregate = aggregate_io(&visible, app);
+    let row_count = visible.len() + 1;
+    let (overview_height, detail_height) = master_detail_heights(area.height, row_count);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -140,9 +157,10 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Min(0),
         ])
         .split(area);
-    let selected = app.selected_io.min(visible.len() - 1);
-    let (throughput_scale, iops_scale) = overview_workload_scales(&visible, app);
-    let overview_block = pane_block(overview_title(app));
+    let selected = app.selected_io.min(row_count - 1);
+    let (throughput_scale, iops_scale) =
+        overview_workload_scales(&visible, Some(&aggregate.history), app);
+    let overview_block = pane_block(overview_title(app)).title(live_title(app));
     let overview_inner = overview_block.inner(sections[0]);
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
@@ -159,24 +177,41 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         height: overview_inner.height.saturating_sub(1),
         ..overview_inner
     };
-    let (start, count, _) = visible_band_window(device_area.height, visible.len(), selected);
-    for (slot, tick) in visible.iter().skip(start).take(count).enumerate() {
-        draw_overview_row(
-            f,
-            Rect {
-                x: device_area.x,
-                y: device_area.y + slot as u16,
-                width: device_area.width,
-                height: 1,
-            },
-            tick,
-            app,
-            start + slot == selected,
-            throughput_scale,
-            iops_scale,
-        );
+    let (start, count, _) = visible_band_window(device_area.height, row_count, selected);
+    for (slot, index) in (start..start + count).enumerate() {
+        let row = Rect {
+            x: device_area.x,
+            y: device_area.y + slot as u16,
+            width: device_area.width,
+            height: 1,
+        };
+        if index == 0 {
+            draw_overview_aggregate_row(
+                f,
+                row,
+                &aggregate,
+                app,
+                selected == 0,
+                throughput_scale,
+                iops_scale,
+            );
+        } else {
+            draw_overview_row(
+                f,
+                row,
+                visible[index - 1],
+                app,
+                index == selected,
+                throughput_scale,
+                iops_scale,
+            );
+        }
     }
-    draw_detail(f, sections[1], visible[selected], app);
+    if selected == 0 {
+        draw_aggregate_detail(f, sections[1], &aggregate, app);
+    } else {
+        draw_detail(f, sections[1], visible[selected - 1], app);
+    }
 }
 
 fn visible_band_window(height: u16, total: usize, selected: usize) -> (usize, usize, usize) {
@@ -207,14 +242,144 @@ fn visible_io_ticks(app: &App) -> Vec<&IoTick> {
 }
 
 pub(crate) fn visible_device_count(app: &App) -> usize {
-    visible_io_ticks(app).len()
+    let physical = visible_io_ticks(app).len();
+    physical + usize::from(physical > 0)
 }
 
-fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
+#[derive(Debug, Default)]
+struct AggregateIo {
+    history: DeviceHistory,
+    traced: VecDeque<TracedLatencySample>,
+    device_count: usize,
+}
+
+fn aggregate_io(visible: &[&IoTick], app: &App) -> AggregateIo {
+    let histories: Vec<&DeviceHistory> = visible
+        .iter()
+        .filter_map(|tick| app.io.history.get(&tick.device))
+        .collect();
+    let traced_histories: Vec<&VecDeque<TracedLatencySample>> = visible
+        .iter()
+        .filter_map(|tick| app.io.traced_history.get(&tick.device))
+        .collect();
+    aggregate_histories(&histories, &traced_histories, visible.len())
+}
+
+fn aggregate_histories(
+    histories: &[&DeviceHistory],
+    traced_histories: &[&VecDeque<TracedLatencySample>],
+    device_count: usize,
+) -> AggregateIo {
+    let max_samples = histories
+        .iter()
+        .map(|history| history.workload_samples.len())
+        .max()
+        .unwrap_or(0);
+    let mut workload = VecDeque::with_capacity(max_samples);
+    let mut await_samples = VecDeque::with_capacity(max_samples);
+    for age in (0..max_samples).rev() {
+        let mut combined = WorkloadSample::default();
+        let mut read_await_weighted = 0.0;
+        let mut write_await_weighted = 0.0;
+        let mut read_await_iops = 0.0;
+        let mut write_await_iops = 0.0;
+        let mut merges_available = true;
+        let mut read_merges = 0.0;
+        let mut write_merges = 0.0;
+        let mut contributors = 0;
+        for history in histories {
+            let Some(sample_index) = history.workload_samples.len().checked_sub(age + 1) else {
+                continue;
+            };
+            let sample = history.workload_samples[sample_index];
+            contributors += 1;
+            combined.read_iops += sample.read_iops;
+            combined.write_iops += sample.write_iops;
+            combined.read_bps += sample.read_bps;
+            combined.write_bps += sample.write_bps;
+            match sample.merge_rates {
+                MergeRates::Available {
+                    read_per_sec,
+                    write_per_sec,
+                } => {
+                    read_merges += read_per_sec;
+                    write_merges += write_per_sec;
+                }
+                MergeRates::Unavailable => merges_available = false,
+            }
+            if let Some(await_sample) = history.await_samples.get(sample_index) {
+                if let Some(value) = await_sample.read_us.filter(|_| sample.read_iops > 0.0) {
+                    read_await_weighted += value * sample.read_iops;
+                    read_await_iops += sample.read_iops;
+                }
+                if let Some(value) = await_sample.write_us.filter(|_| sample.write_iops > 0.0) {
+                    write_await_weighted += value * sample.write_iops;
+                    write_await_iops += sample.write_iops;
+                }
+            }
+        }
+        combined.read_request_bytes =
+            (combined.read_iops > 0.0).then_some(combined.read_bps / combined.read_iops);
+        combined.write_request_bytes =
+            (combined.write_iops > 0.0).then_some(combined.write_bps / combined.write_iops);
+        combined.merge_rates = if contributors > 0 && merges_available {
+            MergeRates::Available {
+                read_per_sec: read_merges,
+                write_per_sec: write_merges,
+            }
+        } else {
+            MergeRates::Unavailable
+        };
+        workload.push_back(combined);
+        await_samples.push_back(AwaitSample {
+            read_us: (read_await_iops > 0.0).then_some(read_await_weighted / read_await_iops),
+            write_us: (write_await_iops > 0.0).then_some(write_await_weighted / write_await_iops),
+        });
+    }
+
+    let max_traced = traced_histories
+        .iter()
+        .map(|history| history.len())
+        .max()
+        .unwrap_or(0);
+    let mut traced = VecDeque::with_capacity(max_traced);
+    for age in (0..max_traced).rev() {
+        let mut combined = TracedLatencySample::default();
+        for history in traced_histories {
+            let Some(index) = history.len().checked_sub(age + 1) else {
+                continue;
+            };
+            for bucket in 0..LATENCY_BUCKETS {
+                combined.read[bucket] =
+                    combined.read[bucket].saturating_add(history[index].read[bucket]);
+                combined.write[bucket] =
+                    combined.write[bucket].saturating_add(history[index].write[bucket]);
+            }
+        }
+        traced.push_back(combined);
+    }
+
+    AggregateIo {
+        history: DeviceHistory {
+            combined: workload
+                .iter()
+                .map(|sample| sample.read_bps + sample.write_bps)
+                .collect(),
+            workload_samples: workload,
+            await_samples,
+            ..DeviceHistory::default()
+        },
+        traced,
+        device_count,
+    }
+}
+
+fn draw_no_mounted_io(f: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(Span::styled(
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-    ));
+    ))
+    .title(live_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -566,6 +731,75 @@ fn draw_overview_row(
     );
 }
 
+fn draw_overview_aggregate_row(
+    f: &mut Frame,
+    area: Rect,
+    aggregate: &AggregateIo,
+    app: &App,
+    selected: bool,
+    throughput_scale: f64,
+    iops_scale: f64,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let geometry = row_geometry(area.width);
+    let throughput = combined_throughput(&aggregate.history.workload_samples);
+    let iops = combined_iops(&aggregate.history.workload_samples);
+    draw_overview_prefix(
+        f,
+        Rect {
+            width: geometry.label,
+            ..area
+        },
+        "all",
+        None,
+        &throughput,
+        throughput_scale,
+        &iops,
+        iops_scale,
+        selected,
+    );
+
+    let lanes = latency_plot_geometry(geometry.plot);
+    let (mut read, mut write, read_marker, write_marker) =
+        if app.io.latency_source() == LatencySource::EbpfPerRequest {
+            (
+                request_spectrum(&aggregate.traced, lanes.read as usize, IoLane::Read),
+                request_spectrum(&aggregate.traced, lanes.write as usize, IoLane::Write),
+                directional_quantile(&aggregate.traced, IoLane::Read, 0.99),
+                directional_quantile(&aggregate.traced, IoLane::Write, 0.99),
+            )
+        } else {
+            (
+                await_spectrum(
+                    &aggregate.history.await_samples,
+                    lanes.read as usize,
+                    IoLane::Read,
+                ),
+                await_spectrum(
+                    &aggregate.history.await_samples,
+                    lanes.write as usize,
+                    IoLane::Write,
+                ),
+                await_peak(&aggregate.history.await_samples, IoLane::Read),
+                await_peak(&aggregate.history.await_samples, IoLane::Write),
+            )
+        };
+    overlay_latency_marker(&mut read, read_marker);
+    overlay_latency_marker(&mut write, write_marker);
+    draw_latency_plot(
+        f,
+        Rect {
+            x: area.x + geometry.label,
+            width: geometry.plot,
+            ..area
+        },
+        read,
+        write,
+    );
+}
+
 fn draw_overview_prefix(
     f: &mut Frame,
     area: Rect,
@@ -666,10 +900,54 @@ fn draw_latency_plot(f: &mut Frame, area: Rect, read: String, write: String) {
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
+    let workload = app.io.history.get(&tick.device);
+    let histograms = latency_histograms(tick, app);
+    draw_detail_data(
+        f,
+        area,
+        detail_header(&tick.device, &app.filesystems, &app.volumes),
+        detail_context_lines(tick, app),
+        workload,
+        histograms,
+        Some(tick),
+        app,
+    );
+}
+
+fn draw_aggregate_detail(f: &mut Frame, area: Rect, aggregate: &AggregateIo, app: &App) {
+    let histograms = match app.io.latency_source() {
+        LatencySource::EbpfPerRequest => request_histogram(&aggregate.traced),
+        LatencySource::AggregateAwait => await_histogram(&aggregate.history.await_samples),
+    };
+    draw_detail_data(
+        f,
+        area,
+        format!(
+            " all | {} device{} ",
+            aggregate.device_count,
+            if aggregate.device_count == 1 { "" } else { "s" }
+        ),
+        Vec::new(),
+        Some(&aggregate.history),
+        histograms,
+        None,
+        app,
+    );
+}
+
+fn draw_detail_data(
+    f: &mut Frame,
+    area: Rect,
+    header: String,
+    context: Vec<String>,
+    history: Option<&DeviceHistory>,
+    histograms: ([u64; 7], [u64; 7]),
+    tick: Option<&IoTick>,
+    app: &App,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let header = detail_header(&tick.device, &app.filesystems, &app.volumes);
     let block = pane_block(Span::styled(
         header,
         Style::default()
@@ -681,7 +959,6 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     if inner.height == 0 {
         return;
     }
-    let context = detail_context_lines(tick, app);
     let context_rows = detail_context_row_count(inner.height, context.len());
     for (offset, line) in context.iter().take(context_rows as usize).enumerate() {
         f.render_widget(
@@ -703,17 +980,8 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         ..inner
     };
     let (read_area, write_area, vfs_area) = detail_areas(body);
-    let workload = app
-        .io
-        .history
-        .get(&tick.device)
-        .map(|history| workload_view(&history.workload_samples));
-    let await_view = app
-        .io
-        .history
-        .get(&tick.device)
-        .map(|history| await_view(&history.await_samples));
-    let histograms = latency_histograms(tick, app);
+    let workload = history.map(|history| workload_view(&history.workload_samples));
+    let await_view = history.map(|history| await_view(&history.await_samples));
     draw_direction_detail(
         f,
         read_area,
@@ -975,8 +1243,12 @@ fn shared_workload_scale<'a>(series: impl IntoIterator<Item = &'a [f64]>) -> f64
         .max(1.0)
 }
 
-fn overview_workload_scales(visible: &[&IoTick], app: &App) -> (f64, f64) {
-    let throughput: Vec<Vec<f64>> = visible
+fn overview_workload_scales(
+    visible: &[&IoTick],
+    aggregate: Option<&DeviceHistory>,
+    app: &App,
+) -> (f64, f64) {
+    let mut throughput: Vec<Vec<f64>> = visible
         .iter()
         .map(|tick| {
             app.io
@@ -986,7 +1258,7 @@ fn overview_workload_scales(visible: &[&IoTick], app: &App) -> (f64, f64) {
                 .unwrap_or_default()
         })
         .collect();
-    let iops: Vec<Vec<f64>> = visible
+    let mut iops: Vec<Vec<f64>> = visible
         .iter()
         .map(|tick| {
             app.io
@@ -996,6 +1268,10 @@ fn overview_workload_scales(visible: &[&IoTick], app: &App) -> (f64, f64) {
                 .unwrap_or_default()
         })
         .collect();
+    if let Some(history) = aggregate {
+        throughput.push(combined_throughput(&history.workload_samples));
+        iops.push(combined_iops(&history.workload_samples));
+    }
     (
         shared_workload_scale(throughput.iter().map(Vec::as_slice)),
         shared_workload_scale(iops.iter().map(Vec::as_slice)),
@@ -1222,7 +1498,7 @@ fn direction_metric_label(title: &str, value: &str) -> String {
     format!(" {title:<12} {:>11} ", value.trim())
 }
 
-fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
+fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1250,10 +1526,13 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         return;
     }
 
-    let fs_devices = filesystem_device_ids_for_io(&tick.device, &app.filesystems);
-    let entries = hot_files_for_fs_devices(&app.io.hot_files, &fs_devices);
+    let fs_devices = tick.map(|tick| filesystem_device_ids_for_io(&tick.device, &app.filesystems));
+    let entries: Vec<_> = match &fs_devices {
+        Some(ids) => hot_files_for_fs_devices(&app.io.hot_files, ids),
+        None => app.io.hot_files.iter().collect(),
+    };
     if entries.is_empty() {
-        let status = if fs_devices.is_empty() {
+        let status = if fs_devices.as_ref().is_some_and(HashSet::is_empty) {
             "no mounted filesystem attribution"
         } else {
             "no VFS activity in the last 10s"
@@ -3446,5 +3725,96 @@ mod tests {
             ..WorkloadSample::default()
         }]);
         assert_eq!(workload_view(&samples).merges, None);
+    }
+
+    #[test]
+    fn aggregate_histories_tail_align_and_weight_directional_means() {
+        let first = DeviceHistory {
+            workload_samples: VecDeque::from([
+                WorkloadSample {
+                    read_iops: 1.0,
+                    read_bps: 50.0,
+                    merge_rates: MergeRates::Available {
+                        read_per_sec: 1.0,
+                        write_per_sec: 0.0,
+                    },
+                    ..WorkloadSample::default()
+                },
+                WorkloadSample {
+                    read_iops: 2.0,
+                    read_bps: 200.0,
+                    merge_rates: MergeRates::Available {
+                        read_per_sec: 3.0,
+                        write_per_sec: 0.0,
+                    },
+                    ..WorkloadSample::default()
+                },
+            ]),
+            await_samples: VecDeque::from([
+                AwaitSample {
+                    read_us: Some(50.0),
+                    write_us: None,
+                },
+                AwaitSample {
+                    read_us: Some(100.0),
+                    write_us: None,
+                },
+            ]),
+            ..DeviceHistory::default()
+        };
+        let second = DeviceHistory {
+            workload_samples: VecDeque::from([WorkloadSample {
+                read_iops: 8.0,
+                read_bps: 1_600.0,
+                merge_rates: MergeRates::Available {
+                    read_per_sec: 7.0,
+                    write_per_sec: 0.0,
+                },
+                ..WorkloadSample::default()
+            }]),
+            await_samples: VecDeque::from([AwaitSample {
+                read_us: Some(900.0),
+                write_us: None,
+            }]),
+            ..DeviceHistory::default()
+        };
+        let first_traced = VecDeque::from([
+            TracedLatencySample::default(),
+            TracedLatencySample {
+                read: {
+                    let mut buckets = [0; LATENCY_BUCKETS];
+                    buckets[4] = 2;
+                    buckets
+                },
+                write: [0; LATENCY_BUCKETS],
+            },
+        ]);
+        let second_traced = VecDeque::from([TracedLatencySample {
+            read: {
+                let mut buckets = [0; LATENCY_BUCKETS];
+                buckets[4] = 8;
+                buckets
+            },
+            write: [0; LATENCY_BUCKETS],
+        }]);
+
+        let aggregate =
+            aggregate_histories(&[&first, &second], &[&first_traced, &second_traced], 2);
+
+        assert_eq!(aggregate.history.workload_samples.len(), 2);
+        let newest = aggregate.history.workload_samples.back().unwrap();
+        assert_eq!(newest.read_iops, 10.0);
+        assert_eq!(newest.read_bps, 1_800.0);
+        assert_eq!(newest.read_request_bytes, Some(180.0));
+        assert_eq!(
+            newest.merge_rates,
+            MergeRates::Available {
+                read_per_sec: 10.0,
+                write_per_sec: 0.0
+            }
+        );
+        assert_eq!(aggregate.history.await_samples[0].read_us, Some(50.0));
+        assert_eq!(aggregate.history.await_samples[1].read_us, Some(740.0));
+        assert_eq!(aggregate.traced[1].read[4], 10);
     }
 }

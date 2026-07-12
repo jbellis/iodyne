@@ -1,78 +1,10 @@
-use chrono::Local;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{HostInfo, LiveState};
 use crate::ui::palette as p;
-
-pub fn draw_header(f: &mut Frame, area: Rect, host: &HostInfo, live: LiveState) {
-    let mut left: Vec<Span> = Vec::new();
-    left.push(Span::styled(" \u{25cf}", Style::default().fg(p::GREEN)));
-    left.push(Span::styled(
-        " iodyne",
-        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-    ));
-    left.push(Span::styled(
-        format!(" v{}", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(p::DIM),
-    ));
-    left.push(Span::styled("  \u{2502}  ", Style::default().fg(p::FAINT)));
-    left.push(Span::styled("host ", Style::default().fg(p::DIM)));
-    left.push(Span::styled(
-        host.hostname.clone(),
-        Style::default().fg(p::FG),
-    ));
-    left.push(Span::styled("  ", Style::default().fg(p::DIM)));
-    left.push(Span::styled(host.os.clone(), Style::default().fg(p::FG)));
-    left.push(Span::styled("  up ", Style::default().fg(p::DIM)));
-    left.push(Span::styled(
-        format_uptime(host.uptime_secs),
-        Style::default().fg(p::FG),
-    ));
-    left.push(Span::styled("  ", Style::default().fg(p::DIM)));
-    left.push(Span::styled(
-        format!("{} devs", host.device_count),
-        Style::default().fg(p::FG),
-    ));
-    left.push(Span::styled(" attached", Style::default().fg(p::DIM)));
-
-    let (label, color) = match live {
-        LiveState::Live => ("LIVE", p::GREEN),
-        LiveState::Paused => ("PAUSE", p::YELLOW),
-    };
-    let ts = Local::now().format("%H:%M:%S").to_string();
-    let right_text = format!("\u{25cf} {}  {}", label, ts);
-    let right_w = right_text.chars().count() as u16 + 1;
-    let right = vec![Span::styled(
-        right_text,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )];
-
-    let left_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width.saturating_sub(right_w),
-        height: 1,
-    };
-    let right_area = Rect {
-        x: area.x + area.width.saturating_sub(right_w),
-        y: area.y,
-        width: right_w,
-        height: 1,
-    };
-
-    f.render_widget(
-        Paragraph::new(Line::from(left)).style(Style::default().bg(p::BG).fg(p::FG)),
-        left_area,
-    );
-    f.render_widget(
-        Paragraph::new(Line::from(right)).style(Style::default().bg(p::BG)),
-        right_area,
-    );
-}
 
 pub fn draw_footer(f: &mut Frame, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
@@ -126,17 +58,6 @@ pub fn draw_footer(f: &mut Frame, area: Rect) {
         Paragraph::new(Line::from(spans)).style(Style::default().bg(p::BG)),
         text_area,
     );
-}
-
-fn format_uptime(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3600;
-    let m = (secs % 3600) / 60;
-    if d > 0 {
-        format!("{}d {:02}:{:02}", d, h, m)
-    } else {
-        format!("{:02}:{:02}", h, m)
-    }
 }
 
 #[cfg(test)]

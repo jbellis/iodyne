@@ -13,7 +13,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
-use sysinfo::System;
 
 use crate::collect;
 use crate::config::Settings;
@@ -27,17 +26,8 @@ pub enum LiveState {
     Paused,
 }
 
-#[derive(Debug, Clone)]
-pub struct HostInfo {
-    pub hostname: String,
-    pub os: String,
-    pub uptime_secs: u64,
-    pub device_count: usize,
-}
-
 pub struct App {
     pub live: LiveState,
-    pub host: HostInfo,
     pub devices: Vec<collect::DeviceTick>,
     pub filesystems: Vec<collect::FsTick>,
     pub volumes: collect::VolumeTick,
@@ -66,7 +56,6 @@ impl App {
         smart.refresh_if_due(&devices);
         Self {
             live: LiveState::Live,
-            host: read_host(devices.len()),
             selected_io: 0,
             devices,
             filesystems,
@@ -115,14 +104,12 @@ impl App {
         if usage_elapsed >= Duration::from_millis(1000) {
             collect::devices::refresh_usage(&mut self.devices);
             self.filesystems = collect::filesystems::collect();
-            self.host.uptime_secs = System::uptime();
             self.last_usage_refresh = Instant::now();
         }
         // Slow path: system_profiler + diskutil. Picks up new drives.
         if self.last_metadata_refresh.elapsed() >= Duration::from_secs(30) {
             self.devices = collect::devices::collect();
             self.volumes = collect::volumes::collect();
-            self.host.device_count = self.devices.len();
             self.last_metadata_refresh = Instant::now();
         }
         // SMART has its own 5-minute cadence handled inside the collector;
@@ -211,24 +198,22 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
             Constraint::Min(1),    // content
             Constraint::Length(2), // footer (divider + text)
         ])
         .split(full);
 
-    chrome::draw_header(f, layout[0], &app.host, app.live);
     let content = Rect {
-        x: layout[1].x,
-        y: layout[1].y,
-        width: layout[1].width,
-        height: layout[1].height,
+        x: layout[0].x,
+        y: layout[0].y,
+        width: layout[0].width,
+        height: layout[0].height,
     };
     crate::screen::draw(f, content, app);
     if app.show_settings {
         draw_settings_overlay(f, full, app);
     }
-    chrome::draw_footer(f, layout[2]);
+    chrome::draw_footer(f, layout[1]);
 }
 
 fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -299,24 +284,6 @@ fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .style(Style::default().bg(p::BG)),
         inner,
     );
-}
-
-fn read_host(device_count: usize) -> HostInfo {
-    let hostname = System::host_name().unwrap_or_else(|| "localhost".to_string());
-    let name = System::name().unwrap_or_else(|| "unknown".to_string());
-    let version = System::os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH;
-    let os = if version.is_empty() {
-        format!("{} {}", name, arch)
-    } else {
-        format!("{} {} {}", name, version, arch)
-    };
-    HostInfo {
-        hostname,
-        os,
-        uptime_secs: System::uptime(),
-        device_count,
-    }
 }
 
 #[cfg(test)]
@@ -447,12 +414,6 @@ mod tests {
 
         App {
             live: LiveState::Live,
-            host: HostInfo {
-                hostname: "fixture".into(),
-                os: "TestOS x86_64".into(),
-                uptime_secs: 3_600,
-                device_count: 1,
-            },
             devices,
             filesystems,
             volumes: VolumeTick::default(),
@@ -490,7 +451,8 @@ mod tests {
             "Free",
             "B/s",
             "IOPS",
-            "sda |",
+            "all | 1 device",
+            "LIVE",
             "READ",
             "WRITE",
             "Await",
@@ -527,7 +489,9 @@ mod tests {
     #[test]
     fn empty_and_undersized_screens_render_without_panicking() {
         let app = fixture_app(false);
-        assert!(render_screen(&app, 130, 40).contains("No IO data yet"));
+        let empty = render_screen(&app, 130, 40);
+        assert!(empty.contains("No IO data yet"));
+        assert!(empty.contains("LIVE"));
         let _ = render_screen(&app, 60, 20);
     }
 
@@ -556,5 +520,19 @@ mod tests {
                 app.should_quit,
             )
         );
+    }
+
+    #[test]
+    fn selection_moves_from_all_to_the_last_physical_device() {
+        let mut app = fixture_app(true);
+        assert_eq!(crate::screen::visible_device_count(&app), 2);
+        assert_eq!(app.selected_io, 0);
+
+        handle_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_io, 1);
+        handle_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_io, 1);
+        handle_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected_io, 0);
     }
 }
