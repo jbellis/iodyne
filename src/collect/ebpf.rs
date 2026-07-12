@@ -468,8 +468,8 @@ fn load_linux() -> Result<aya::Bpf, String> {
     let mut bpf = aya::Bpf::load(bytes).map_err(|error| format!("cannot load eBPF: {error}"))?;
 
     for (program_name, tracepoint_name) in [
-        ("diskwatch_block_issue", "block_rq_issue"),
-        ("diskwatch_block_complete", "block_rq_complete"),
+        ("iodyne_block_issue", "block_rq_issue"),
+        ("iodyne_block_complete", "block_rq_complete"),
     ] {
         let program: &mut RawTracePoint = bpf
             .program_mut(program_name)
@@ -501,8 +501,8 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
     let mut bpf =
         aya::Bpf::load(bytes).map_err(|error| format!("cannot load VFS eBPF object: {error}"))?;
     for (program_name, function_name) in [
-        ("diskwatch_vfs_read", "vfs_read"),
-        ("diskwatch_vfs_write", "vfs_write"),
+        ("iodyne_vfs_read", "vfs_read"),
+        ("iodyne_vfs_write", "vfs_write"),
     ] {
         let program: &mut KProbe = bpf
             .program_mut(program_name)
@@ -529,7 +529,7 @@ fn attach_vfs_path_linux(bpf: &mut aya::Bpf) -> Result<(), String> {
     use aya::Btf;
 
     let btf = Btf::from_sys_fs().map_err(|error| format!("cannot read kernel BTF: {error}"))?;
-    let program_name = "diskwatch_vfs_path";
+    let program_name = "iodyne_vfs_path";
     let program: &mut FEntry = bpf
         .program_mut(program_name)
         .ok_or_else(|| format!("eBPF program {program_name} is missing"))?

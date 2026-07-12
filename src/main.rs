@@ -11,7 +11,7 @@ mod ui;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "diskwatch",
+    name = "iodyne",
     version,
     about = "Live per-device disk IO, latency, topology, and health TUI"
 )]

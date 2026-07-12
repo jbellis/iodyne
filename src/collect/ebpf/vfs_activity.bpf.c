@@ -214,11 +214,11 @@ static __inline __attribute__((always_inline)) int record_vfs(
 }
 
 SEC("kprobe/vfs_read")
-int diskwatch_vfs_read(struct pt_regs *ctx) {
+int iodyne_vfs_read(struct pt_regs *ctx) {
     return record_vfs(ctx, 0);
 }
 SEC("kprobe/vfs_write")
-int diskwatch_vfs_write(struct pt_regs *ctx) {
+int iodyne_vfs_write(struct pt_regs *ctx) {
     return record_vfs(ctx, 1);
 }
 
@@ -226,7 +226,7 @@ int diskwatch_vfs_write(struct pt_regs *ctx) {
 // security_file_permission fentry programs. This hook runs while f_path is
 // valid, after the VFS entry probe has created the corresponding count key.
 SEC("fentry/security_file_permission")
-int diskwatch_vfs_path(__u64 *ctx) {
+int iodyne_vfs_path(__u64 *ctx) {
     struct file *file = (struct file *)ctx[0];
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct vfs_file_key key = {};

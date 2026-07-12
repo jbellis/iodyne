@@ -50,12 +50,12 @@ impl Settings {
 
 pub fn config_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("diskwatch/config.json"));
+        return Some(PathBuf::from(xdg).join("iodyne/config.json"));
     }
     std::env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join(".config")
-            .join("diskwatch")
+            .join("iodyne")
             .join("config.json")
     })
 }

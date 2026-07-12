@@ -12,7 +12,7 @@ pub fn draw_header(f: &mut Frame, area: Rect, host: &HostInfo, live: LiveState) 
     let mut left: Vec<Span> = Vec::new();
     left.push(Span::styled(" \u{25cf}", Style::default().fg(p::GREEN)));
     left.push(Span::styled(
-        " DiskWatch",
+        " iodyne",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(

@@ -1187,7 +1187,7 @@ mod tests {
         let file = std::fs::File::open("Cargo.toml").unwrap();
         let metadata = file.metadata().unwrap();
         let root = std::env::temp_dir().join(format!(
-            "diskwatch-proc-fixture-{}-{}",
+            "iodyne-proc-fixture-{}-{}",
             std::process::id(),
             metadata.ino()
         ));

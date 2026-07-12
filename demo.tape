@@ -11,7 +11,7 @@ Set Padding 10
 
 # Let histories warm before recording the single-screen workflow.
 Hide
-Type "./target/release/diskwatch"
+Type "./target/release/iodyne"
 Enter
 Sleep 8s
 Show

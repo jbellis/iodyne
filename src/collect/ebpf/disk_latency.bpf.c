@@ -88,7 +88,7 @@ static __inline __attribute__((always_inline)) __u32 latency_bucket(__u64 us) {
 }
 
 SEC("raw_tracepoint/block_rq_issue")
-int diskwatch_block_issue(struct bpf_raw_tracepoint_args *ctx) {
+int iodyne_block_issue(struct bpf_raw_tracepoint_args *ctx) {
     struct request *rq = (struct request *)ctx->args[0];
     if (!rq)
         return 0;
@@ -144,7 +144,7 @@ int diskwatch_block_issue(struct bpf_raw_tracepoint_args *ctx) {
 }
 
 SEC("raw_tracepoint/block_rq_complete")
-int diskwatch_block_complete(struct bpf_raw_tracepoint_args *ctx) {
+int iodyne_block_complete(struct bpf_raw_tracepoint_args *ctx) {
     struct request *rq = (struct request *)ctx->args[0];
     __u64 request_key = (__u64)rq;
     struct start_value *start = bpf_map_lookup_elem(&STARTS, &request_key);

@@ -351,21 +351,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diskwatch"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "aya",
- "chrono",
- "clap",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "sysinfo",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,6 +491,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "iodyne"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "aya",
+ "chrono",
+ "clap",
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sysinfo",
 ]
 
 [[package]]

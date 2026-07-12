@@ -284,7 +284,7 @@ fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(io_mode, Style::default().fg(p::FG)),
         ]),
         Line::from(Span::styled(
-            "   persists to ~/.config/diskwatch/config.json",
+            "   persists to ~/.config/iodyne/config.json",
             Style::default().fg(p::DIM),
         )),
         Line::from(""),
