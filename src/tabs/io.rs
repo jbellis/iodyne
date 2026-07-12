@@ -4,8 +4,9 @@
 //! read and write lanes. The selected device drives a compact histogram and
 //! aligned workload graphs.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
@@ -19,10 +20,12 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
 use crate::collect::io::{VfsActivitySource, VfsFileActivity};
+use crate::collect::smart::{AtaAttr, SmartTick};
+use crate::collect::volumes::{ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick};
 use crate::collect::{
-    AwaitSample, FsTick, IoTick, MergeRates, TracedLatencySample, WorkloadSample,
+    AwaitSample, DeviceTick, FsTick, IoTick, MergeRates, TracedLatencySample, WorkloadSample,
 };
-use crate::ui::format::{fmt_rate, unit_mode, UnitMode};
+use crate::ui::format::{fmt_rate, fmt_size, unit_mode, UnitMode};
 use crate::ui::palette as p;
 use crate::ui::sparkline::BaselineSparkline;
 
@@ -38,10 +41,11 @@ const HEAT_LABELS: [&str; 7] = [
     "64-256ms",
     ">=256ms",
 ];
-const WIDE_DETAIL_HEIGHT: u16 = 26;
+const WIDE_DETAIL_HEIGHT: u16 = 28;
 const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 1;
-const COMPACT_DETAIL_HEIGHT: u16 = 19;
+const COMPACT_DETAIL_HEIGHT: u16 = 21;
 const DIRECTION_DETAIL_HEIGHT: u16 = 13;
+const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
@@ -49,18 +53,23 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let md_state = md_exception_summary(&app.volumes.mdraid);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(md_state.is_some() as u16),
             Constraint::Length(1),
             Constraint::Min(1),
         ])
         .split(area);
 
     draw_summary_line(f, rows[0], app);
-    draw_scale_legend(f, rows[1]);
-    draw_master_detail(f, rows[2], app);
+    if let Some(state) = md_state {
+        draw_md_exception(f, rows[1], &state);
+    }
+    draw_scale_legend(f, rows[2]);
+    draw_master_detail(f, rows[3], app);
 }
 
 fn draw_empty(f: &mut Frame, area: Rect) {
@@ -194,7 +203,8 @@ fn visible_io_ticks(app: &App) -> Vec<&IoTick> {
         .latest
         .iter()
         .filter(|tick| {
-            app.io_show_unmounted || io_device_is_mounted(&tick.device, &app.filesystems)
+            app.io_show_unmounted
+                || io_device_is_mounted(&tick.device, &app.filesystems, &app.volumes)
         })
         .collect()
 }
@@ -227,6 +237,105 @@ fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
             height: 1,
         },
     );
+}
+
+fn draw_md_exception(f: &mut Frame, area: Rect, summary: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_line(summary, area.width as usize),
+            Style::default().fg(p::YELLOW),
+        )),
+        area,
+    );
+}
+
+fn md_exception_summary(arrays: &[MdRaidArray]) -> Option<String> {
+    let mut exceptions: Vec<(u8, String)> = arrays
+        .iter()
+        .filter_map(|array| {
+            let inactive = !array.state.eq_ignore_ascii_case("active");
+            let missing = (array.members_total > 0 && array.members_present < array.members_total)
+                || array.member_state.contains('_');
+            let flagged = array
+                .members
+                .iter()
+                .any(|member| member.flag.as_deref().is_some_and(md_failure_flag));
+            let progressing = array.progress.is_some();
+            if !(inactive || missing || flagged || progressing) {
+                return None;
+            }
+
+            let mut facts = vec![array.name.clone()];
+            if inactive && !array.state.is_empty() {
+                facts.push(array.state.clone());
+            }
+            if missing || array.members_total > 0 {
+                facts.push(format!(
+                    "{}/{} members",
+                    array.members_present, array.members_total
+                ));
+            }
+            let flags: Vec<String> = array
+                .members
+                .iter()
+                .filter_map(|member| {
+                    member
+                        .flag
+                        .as_ref()
+                        .map(|flag| format!("{}{}", member.device, flag))
+                })
+                .collect();
+            if !flags.is_empty() {
+                facts.push(format!("flags {}", flags.join(",")));
+            }
+            if let Some(progress) = &array.progress {
+                let percent = if (progress.percent - progress.percent.round()).abs() < 0.05 {
+                    format!("{:.0}%", progress.percent)
+                } else {
+                    format!("{:.1}%", progress.percent)
+                };
+                let mut operation = format!("{} {percent}", progress.op);
+                if !progress.speed.is_empty() {
+                    operation.push_str(&format!(" @ {}", progress.speed));
+                }
+                if !progress.eta.is_empty() {
+                    operation.push_str(&format!(" · ETA {}", progress.eta));
+                }
+                facts.push(operation);
+            }
+            let mut affected: Vec<String> = array
+                .members
+                .iter()
+                .map(|member| whole_disk_name(&member.device).to_string())
+                .collect();
+            affected.sort_unstable();
+            affected.dedup();
+            if !affected.is_empty() {
+                let extra = affected.len().saturating_sub(3);
+                let mut label = affected.into_iter().take(3).collect::<Vec<_>>().join(",");
+                if extra > 0 {
+                    label.push_str(&format!(" +{extra}"));
+                }
+                facts.push(format!("affects {label}"));
+            }
+            let score =
+                inactive as u8 * 8 + missing as u8 * 4 + flagged as u8 * 2 + progressing as u8;
+            Some((score, format!(" {}", facts.join(" · "))))
+        })
+        .collect();
+    exceptions.sort_by(|a, b| b.0.cmp(&a.0));
+    let (_, mut summary) = exceptions.first()?.clone();
+    if exceptions.len() > 1 {
+        summary.push_str(&format!(" · +{} arrays", exceptions.len() - 1));
+    }
+    Some(summary)
+}
+
+fn md_failure_flag(flag: &str) -> bool {
+    flag.trim_matches(['(', ')']).eq_ignore_ascii_case("f")
 }
 
 fn draw_scale_legend(f: &mut Frame, area: Rect) {
@@ -398,7 +507,7 @@ fn draw_overview_row(
             ..area
         },
         &tick.device,
-        filesystem_free_pct(&tick.device, &app.filesystems),
+        filesystem_free_pct(&tick.device, &app.filesystems, &app.volumes),
         &throughput,
         throughput_scale,
         selected,
@@ -534,7 +643,7 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let header = detail_header(&tick.device, &app.filesystems);
+    let header = detail_header(&tick.device, &app.filesystems, &app.volumes);
     f.render_widget(
         Paragraph::new(Span::styled(
             header,
@@ -552,9 +661,25 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     if area.height <= 1 {
         return;
     }
+    let context = detail_context_lines(tick, app);
+    let context_rows = detail_context_row_count(area.height, context.len());
+    for (offset, line) in context.iter().take(context_rows as usize).enumerate() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate_line(line, area.width as usize),
+                Style::default().fg(p::DIM),
+            )),
+            Rect {
+                x: area.x,
+                y: area.y + 1 + offset as u16,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
     let body = Rect {
-        y: area.y + 1,
-        height: area.height - 1,
+        y: area.y + 1 + context_rows,
+        height: area.height.saturating_sub(1 + context_rows),
         ..area
     };
     let (read_area, write_area, vfs_area) = detail_areas(body);
@@ -586,6 +711,12 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         await_view.as_ref(),
     );
     draw_vfs_activity(f, vfs_area, tick, app);
+}
+
+fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
+    (available_lines as u16)
+        .min(MAX_DETAIL_CONTEXT_ROWS)
+        .min(detail_height.saturating_sub(1 + DIRECTION_DETAIL_HEIGHT))
 }
 
 fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
@@ -1331,6 +1462,19 @@ fn truncate_text(value: &str, width: usize) -> String {
     truncated
 }
 
+fn truncate_line(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return value.chars().take(width).collect();
+    }
+    let mut truncated: String = value.chars().take(width - 3).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 fn vfs_display_path(item: &VfsFileActivity) -> String {
     let fallback = if item.basename.is_empty() {
         format!("inode {}", item.inode)
@@ -1370,8 +1514,8 @@ fn filesystems_for_io_device<'a>(device: &str, filesystems: &'a [FsTick]) -> Vec
         .collect()
 }
 
-fn filesystem_free_pct(device: &str, filesystems: &[FsTick]) -> Option<u32> {
-    filesystems_for_io_device(device, filesystems)
+fn filesystem_free_pct(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> Option<u32> {
+    attributable_filesystems(device, filesystems, volumes)
         .into_iter()
         .filter(|fs| fs.size_bytes > 0)
         .map(|fs| {
@@ -1697,15 +1841,280 @@ fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
     Some(label)
 }
 
-fn detail_header(device: &str, filesystems: &[FsTick]) -> String {
-    let mounts = mounts_for_device(device, filesystems).unwrap_or_else(|| "[unmounted]".into());
-    format!(" {device} detail · {mounts}")
+fn detail_header(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> String {
+    let mut chains: Vec<String> = attributable_filesystems(device, filesystems, volumes)
+        .into_iter()
+        .map(|fs| topology_chain(device, fs, volumes))
+        .collect();
+    chains.sort_unstable();
+    chains.dedup();
+    if chains.is_empty() {
+        return format!(" {device} detail · [no attributed mount]");
+    }
+    let extra = chains.len().saturating_sub(2);
+    let mut topology = chains.into_iter().take(2).collect::<Vec<_>>().join("; ");
+    if extra > 0 {
+        topology.push_str(&format!(" +{extra} mounts"));
+    }
+    format!(" {device} detail · {topology}")
 }
 
-fn io_device_is_mounted(device: &str, filesystems: &[FsTick]) -> bool {
+fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
+    let source = disk_name(&fs.device);
+    if let Some(array) = md_array_for_source(source, &volumes.mdraid) {
+        let array_label = if array.level.is_empty() {
+            array.name.clone()
+        } else {
+            format!("{}/{}", array.name, array.level)
+        };
+        let members = format_md_members(&array.members, device);
+        if members.is_empty() {
+            return format!("{} → {array_label}", fs.mount);
+        }
+        return format!("{} → {array_label} → {{{members}}}", fs.mount);
+    }
+
+    if let Some(container) = apfs_container_for_source(source, &volumes.containers) {
+        let mut nodes = vec![fs.mount.clone(), source.to_string(), container.bsd.clone()];
+        if let Some(store) = container.physical_store.as_deref() {
+            nodes.push(store.to_string());
+            let whole = whole_disk_name(store);
+            if whole != store {
+                nodes.push(whole.to_string());
+            }
+        }
+        nodes.dedup();
+        return nodes.join(" → ");
+    }
+
+    let mut nodes = vec![fs.mount.clone(), source.to_string()];
+    let resolved = resolved_block_name(&fs.device);
+    if resolved != source {
+        nodes.push(resolved.clone());
+    }
+    let whole = whole_disk_name(&resolved);
+    if whole != resolved && whole == disk_name(device) {
+        nodes.push(whole.to_string());
+    }
+    nodes.dedup();
+    nodes.join(" → ")
+}
+
+fn format_md_members(members: &[MdRaidMember], selected: &str) -> String {
+    members
+        .iter()
+        .map(|member| {
+            let marker = if whole_disk_name(&member.device) == disk_name(selected) {
+                " (selected)"
+            } else {
+                ""
+            };
+            format!("{}{marker}", member.device)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn md_array_for_source<'a>(source: &str, arrays: &'a [MdRaidArray]) -> Option<&'a MdRaidArray> {
+    arrays
+        .iter()
+        .find(|array| disk_name(&array.name) == disk_name(source))
+}
+
+fn md_array_contains_device(array: &MdRaidArray, device: &str) -> bool {
+    array
+        .members
+        .iter()
+        .any(|member| whole_disk_name(&member.device) == disk_name(device))
+}
+
+fn apfs_container_for_source<'a>(
+    source: &str,
+    containers: &'a [ApfsContainer],
+) -> Option<&'a ApfsContainer> {
+    containers
+        .iter()
+        .find(|container| disk_name(&container.bsd) == whole_disk_name(source))
+}
+
+fn apfs_container_contains_device(container: &ApfsContainer, device: &str) -> bool {
+    container
+        .physical_store
+        .as_deref()
+        .is_some_and(|store| whole_disk_name(disk_name(store)) == disk_name(device))
+}
+
+fn attributable_filesystems<'a>(
+    device: &str,
+    filesystems: &'a [FsTick],
+    volumes: &VolumeTick,
+) -> Vec<&'a FsTick> {
     filesystems
         .iter()
-        .any(|fs| mount_label_for_device(fs, device).is_some())
+        .filter(|fs| {
+            direct_mount_label_for_device(fs, device).is_some()
+                || md_array_for_source(disk_name(&fs.device), &volumes.mdraid).is_some_and(
+                    |array| {
+                        disk_name(&array.name) == disk_name(device)
+                            || md_array_contains_device(array, device)
+                    },
+                )
+                || apfs_container_for_source(disk_name(&fs.device), &volumes.containers)
+                    .is_some_and(|container| apfs_container_contains_device(container, device))
+                || mount_label_for_device(fs, device).is_some()
+        })
+        .collect()
+}
+
+fn detail_context_lines(tick: &IoTick, app: &App) -> Vec<String> {
+    let device = device_for_io(&tick.device, &app.devices);
+    let filesystems = attributable_filesystems(&tick.device, &app.filesystems, &app.volumes);
+    let mut lines = Vec::new();
+    if let Some(facts) = device_and_filesystem_facts(device, &filesystems) {
+        lines.push(facts);
+    }
+    let smart = smart_for_io(&tick.device, device, &app.smart.by_device);
+    if let Some(facts) = smart_facts(smart, device.and_then(|device| device.smart_ok)) {
+        lines.push(facts);
+    }
+    lines
+}
+
+fn device_for_io<'a>(device: &str, devices: &'a [DeviceTick]) -> Option<&'a DeviceTick> {
+    devices
+        .iter()
+        .find(|candidate| disk_name(&candidate.name) == disk_name(device))
+}
+
+fn smart_for_io<'a>(
+    device: &str,
+    device_tick: Option<&DeviceTick>,
+    smart: &'a HashMap<String, SmartTick>,
+) -> Option<&'a SmartTick> {
+    smart
+        .get(disk_name(device))
+        .or_else(|| device_tick.and_then(|device| smart.get(disk_name(&device.name))))
+}
+
+fn device_and_filesystem_facts(
+    device: Option<&DeviceTick>,
+    filesystems: &[&FsTick],
+) -> Option<String> {
+    let mut facts = Vec::new();
+    if let Some(device) = device {
+        if meaningful_fact(&device.model) {
+            facts.push(format!("model {}", device.model));
+        }
+        if meaningful_fact(&device.bus) {
+            facts.push(format!("bus {}", device.bus));
+        }
+        if device.kind.label() != "?" {
+            facts.push(format!("kind {}", device.kind.label()));
+        }
+        if device.size_bytes > 0 {
+            facts.push(format!("device {}", fmt_size(device.size_bytes)));
+        }
+    }
+
+    let mut fs_types: Vec<&str> = filesystems
+        .iter()
+        .map(|fs| fs.fs_type.as_str())
+        .filter(|fs_type| meaningful_fact(fs_type))
+        .collect();
+    fs_types.sort_unstable();
+    fs_types.dedup();
+    if !fs_types.is_empty() {
+        facts.push(format!("fs {}", fs_types.join(",")));
+    }
+
+    let mut seen = HashSet::new();
+    let (free, total) = filesystems
+        .iter()
+        .filter(|fs| fs.size_bytes > 0)
+        .filter(|fs| {
+            seen.insert(format!(
+                "{}:{}:{}",
+                fs.device, fs.size_bytes, fs.avail_bytes
+            ))
+        })
+        .fold((0_u64, 0_u64), |(free, total), fs| {
+            (
+                free.saturating_add(fs.avail_bytes),
+                total.saturating_add(fs.size_bytes),
+            )
+        });
+    if total > 0 {
+        facts.push(format!("free {} / {}", fmt_size(free), fmt_size(total)));
+    }
+    let inode_values: Vec<u32> = filesystems.iter().filter_map(|fs| fs.inode_pct).collect();
+    if let Some(max_inode) = inode_values.iter().copied().max() {
+        let label = if inode_values.len() > 1 {
+            "inode max used"
+        } else {
+            "inode used"
+        };
+        facts.push(format!("{label} {max_inode}%"));
+    }
+    (!facts.is_empty()).then(|| format!(" {}", facts.join(" · ")))
+}
+
+fn smart_facts(smart: Option<&SmartTick>, fallback: Option<bool>) -> Option<String> {
+    let mut facts = Vec::new();
+    if let Some(smart) = smart {
+        if let Some(temperature) = smart.temperature_c {
+            facts.push(format!("SMART temp {temperature}C"));
+        }
+        if let Some(wear) = smart.percentage_used {
+            facts.push(format!("wear {wear}%"));
+        }
+        if let Some(spare) = smart.available_spare {
+            facts.push(format!("spare {spare}%"));
+        }
+        if let Some(hours) = smart.power_on_hours {
+            facts.push(format!("power-on {hours}h"));
+        }
+        for attr in &smart.ata_attrs {
+            if let Some(label) = ata_evidence_label(attr) {
+                let raw = if attr.raw.is_empty() {
+                    attr.value.to_string()
+                } else {
+                    attr.raw.clone()
+                };
+                facts.push(format!("{label} raw {raw}"));
+            }
+        }
+    } else if let Some(ok) = fallback {
+        facts.push(if ok {
+            "SMART reported verified".into()
+        } else {
+            "SMART reported failing".into()
+        });
+    }
+    (!facts.is_empty()).then(|| format!(" {}", facts.join(" · ")))
+}
+
+fn ata_evidence_label(attr: &AtaAttr) -> Option<&'static str> {
+    match attr.id {
+        5 => Some("reallocated"),
+        187 => Some("reported uncorrectable"),
+        197 => Some("pending"),
+        198 => Some("offline uncorrectable"),
+        _ if attr.name.to_ascii_lowercase().contains("media") => Some("media errors"),
+        _ => None,
+    }
+}
+
+fn meaningful_fact(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value != "—"
+        && value != "-"
+        && value != "?"
+        && !value.eq_ignore_ascii_case("unknown")
+}
+
+fn io_device_is_mounted(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> bool {
+    !attributable_filesystems(device, filesystems, volumes).is_empty()
 }
 
 fn mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
@@ -1713,18 +2122,21 @@ fn mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
         return Some(label);
     }
 
-    let fs_device = disk_name(&fs.device);
-    let stacked = stacked_members(fs_device)?;
+    let stacked = stacked_members(&fs.device)?;
     mount_label_for_device_with_members(fs, io_device, &stacked)
 }
 
 fn direct_mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
-    let fs_device = disk_name(&fs.device);
-    let io = disk_name(io_device);
-    if fs_device == io || whole_disk_name(fs_device) == io {
+    let fs_device = resolved_block_name(&fs.device);
+    if block_source_matches_io(&fs_device, io_device) {
         return Some(fs.mount.clone());
     }
     None
+}
+
+fn block_source_matches_io(source: &str, io_device: &str) -> bool {
+    let io = disk_name(io_device);
+    source == io || whole_disk_name(source) == io
 }
 
 fn mount_label_for_device_with_members(
@@ -1777,14 +2189,14 @@ fn sysfs_stacked_members(device: &str) -> Option<Vec<String>> {
         }
     }
 
-    let kernel_name = device.trim_start_matches("/dev/");
+    let kernel_name = resolved_block_name(device);
     let slaves_dir = format!("/sys/block/{}/slaves", kernel_name);
     if !std::path::Path::new(&slaves_dir).is_dir() {
         return None;
     }
 
     let mut out = Vec::new();
-    expand(kernel_name, 4, &mut out);
+    expand(&kernel_name, 4, &mut out);
     out.sort();
     out.dedup();
     Some(out)
@@ -1794,13 +2206,53 @@ fn disk_name(device: &str) -> &str {
     device.strip_prefix("/dev/").unwrap_or(device)
 }
 
+fn block_name_with_mapper_target(device: &str, target: Option<&Path>) -> String {
+    let name = disk_name(device);
+    if !name.starts_with("mapper/") {
+        return name.to_string();
+    }
+    target
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn resolved_block_name(device: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let target = disk_name(device)
+            .starts_with("mapper/")
+            .then(|| std::fs::read_link(format!("/dev/{}", disk_name(device))).ok())
+            .flatten();
+        block_name_with_mapper_target(device, target.as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        block_name_with_mapper_target(device, None)
+    }
+}
+
 fn whole_disk_name(device: &str) -> &str {
     if let Some((base, part)) = device.rsplit_once('p') {
-        if base.starts_with("nvme") || base.starts_with("mmcblk") {
+        if base.starts_with("nvme")
+            || base.starts_with("mmcblk")
+            || base.starts_with("md")
+            || base.starts_with("dm-")
+        {
             if part.chars().all(|c| c.is_ascii_digit()) {
                 return base;
             }
         }
+    }
+
+    if device
+        .strip_prefix("md")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+        || device
+            .strip_prefix("dm-")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+    {
+        return device;
     }
 
     if let Some(stripped) = device.strip_prefix("disk") {
@@ -1855,6 +2307,31 @@ mod tests {
         }
     }
 
+    fn md_array() -> MdRaidArray {
+        MdRaidArray {
+            name: "md0".into(),
+            level: "raid1".into(),
+            state: "active".into(),
+            size_bytes: 1 << 30,
+            members_total: 2,
+            members_present: 2,
+            member_state: "UU".into(),
+            members: vec![
+                MdRaidMember {
+                    device: "sdd1".into(),
+                    index: 0,
+                    flag: None,
+                },
+                MdRaidMember {
+                    device: "sde1".into(),
+                    index: 1,
+                    flag: None,
+                },
+            ],
+            progress: None,
+        }
+    }
+
     fn hot_file(major: u32, minor: u32, read_bps: f64, write_bps: f64) -> VfsFileActivity {
         VfsFileActivity {
             fs_device: BlockDeviceId { major, minor },
@@ -1879,8 +2356,16 @@ mod tests {
             mounts_for_device("sda", &filesystems),
             Some("/, /home".to_string())
         );
-        assert!(io_device_is_mounted("sda", &filesystems));
-        assert!(!io_device_is_mounted("sdb", &filesystems));
+        assert!(io_device_is_mounted(
+            "sda",
+            &filesystems,
+            &VolumeTick::default()
+        ));
+        assert!(!io_device_is_mounted(
+            "sdb",
+            &filesystems,
+            &VolumeTick::default()
+        ));
     }
 
     #[test]
@@ -2090,20 +2575,217 @@ mod tests {
             fs_usage("/dev/sdb1", "/other", 99, 100),
         ];
 
-        assert_eq!(filesystem_free_pct("sda", &filesystems), Some(15));
-        assert_eq!(filesystem_free_pct("sdb", &filesystems), Some(1));
-        assert_eq!(filesystem_free_pct("sdc", &filesystems), None);
+        let volumes = VolumeTick::default();
+        assert_eq!(filesystem_free_pct("sda", &filesystems, &volumes), Some(15));
+        assert_eq!(filesystem_free_pct("sdb", &filesystems, &volumes), Some(1));
+        assert_eq!(filesystem_free_pct("sdc", &filesystems, &volumes), None);
     }
 
     #[test]
     fn detail_header_moves_mount_attribution_and_has_factual_fallback() {
         let filesystems = vec![fs("/dev/sda1", "/"), fs("/dev/sda2", "/home")];
 
-        assert_eq!(detail_header("sda", &filesystems), " sda detail · /, /home");
         assert_eq!(
-            detail_header("sdb", &filesystems),
-            " sdb detail · [unmounted]"
+            detail_header("sda", &filesystems, &VolumeTick::default()),
+            " sda detail · / → sda1 → sda; /home → sda2 → sda"
         );
+        assert_eq!(
+            detail_header("sdb", &filesystems, &VolumeTick::default()),
+            " sdb detail · [no attributed mount]"
+        );
+    }
+
+    #[test]
+    fn detail_header_renders_collected_md_topology_and_selected_member() {
+        let filesystems = vec![fs("/dev/md0", "/mnt/data")];
+        let volumes = VolumeTick {
+            mdraid: vec![md_array()],
+            ..VolumeTick::default()
+        };
+
+        assert_eq!(
+            detail_header("sdd", &filesystems, &volumes),
+            " sdd detail · /mnt/data → md0/raid1 → {sdd1 (selected),sde1}"
+        );
+    }
+
+    #[test]
+    fn apfs_topology_uses_collected_container_and_physical_store() {
+        let filesystems = vec![fs("/dev/disk3s1", "/")];
+        let volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk3".into(),
+                physical_store: Some("disk0s2".into()),
+                ..ApfsContainer::default()
+            }],
+            ..VolumeTick::default()
+        };
+
+        assert_eq!(
+            detail_header("disk0", &filesystems, &volumes),
+            " disk0 detail · / → disk3s1 → disk3 → disk0s2 → disk0"
+        );
+        assert_eq!(
+            attributable_filesystems("disk0", &filesystems, &volumes).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn logical_devices_do_not_inherit_member_device_or_smart_facts() {
+        let member = DeviceTick {
+            name: "sda".into(),
+            kind: crate::collect::DeviceKind::Ssd,
+            model: "member model".into(),
+            bus: "SATA".into(),
+            size_bytes: 1,
+            used_bytes: 0,
+            is_removable: false,
+            firmware: None,
+            serial: None,
+            smart_ok: Some(true),
+            idle: false,
+        };
+        let smart = HashMap::from([("sda".into(), SmartTick::default())]);
+
+        assert!(device_for_io("md0", std::slice::from_ref(&member)).is_none());
+        assert!(device_for_io("dm-0", std::slice::from_ref(&member)).is_none());
+        assert!(smart_for_io("md0", None, &smart).is_none());
+        assert!(smart_for_io("dm-0", None, &smart).is_none());
+    }
+
+    #[test]
+    fn mapper_and_physical_device_normalization_is_explicit() {
+        assert_eq!(
+            block_name_with_mapper_target("/dev/mapper/vg-data", Some(Path::new("../dm-0"))),
+            "dm-0"
+        );
+        assert!(block_source_matches_io("dm-0", "dm-0"));
+        assert_eq!(whole_disk_name("sda1"), "sda");
+        assert_eq!(whole_disk_name("nvme0n1p1"), "nvme0n1");
+        assert_eq!(whole_disk_name("md0"), "md0");
+        assert_eq!(whole_disk_name("dm-0"), "dm-0");
+        assert!(!md_array_contains_device(&md_array(), "md0"));
+    }
+
+    #[test]
+    fn device_filesystem_and_smart_facts_only_emit_available_evidence() {
+        let device = DeviceTick {
+            name: "sda".into(),
+            kind: crate::collect::DeviceKind::Ssd,
+            model: "FastDisk".into(),
+            bus: "SATA".into(),
+            size_bytes: 1 << 40,
+            used_bytes: 0,
+            is_removable: false,
+            firmware: None,
+            serial: None,
+            smart_ok: Some(true),
+            idle: false,
+        };
+        let filesystem = FsTick {
+            fs_type: "ext4".into(),
+            size_bytes: 100 << 30,
+            avail_bytes: 25 << 30,
+            inode_pct: Some(42),
+            ..fs("/dev/sda1", "/")
+        };
+        let facts = device_and_filesystem_facts(Some(&device), &[&filesystem]).unwrap();
+        assert!(facts.contains("model FastDisk"));
+        assert!(facts.contains("bus SATA · kind SSD"));
+        assert!(facts.contains("fs ext4 · free 25 GiB / 100 GiB · inode used 42%"));
+        assert!(!facts.contains("--"));
+        assert!(!facts.contains("healthy"));
+
+        let smart = SmartTick {
+            temperature_c: Some(37),
+            percentage_used: Some(8),
+            available_spare: Some(99),
+            power_on_hours: Some(1234),
+            ata_attrs: vec![
+                AtaAttr {
+                    id: 5,
+                    raw: "3".into(),
+                    ..AtaAttr::default()
+                },
+                AtaAttr {
+                    id: 197,
+                    raw: "1".into(),
+                    ..AtaAttr::default()
+                },
+            ],
+            ..SmartTick::default()
+        };
+        let smart = smart_facts(Some(&smart), Some(false)).unwrap();
+        assert!(smart.contains("SMART temp 37C"));
+        assert!(smart.contains("wear 8% · spare 99% · power-on 1234h"));
+        assert!(smart.contains("reallocated raw 3 · pending raw 1"));
+        assert!(!smart.contains("failing"));
+        assert_eq!(
+            smart_facts(None, Some(false)).as_deref(),
+            Some(" SMART reported failing")
+        );
+    }
+
+    #[test]
+    fn md_state_line_only_reports_exceptional_arrays() {
+        let normal = md_array();
+        assert_eq!(md_exception_summary(&[normal.clone()]), None);
+
+        let mut degraded = normal;
+        degraded.members_present = 1;
+        degraded.member_state = "U_".into();
+        degraded.members[1].flag = Some("(F)".into());
+        degraded.progress = Some(crate::collect::volumes::MdRaidProgress {
+            op: "resync".into(),
+            percent: 41.0,
+            eta: "10min".into(),
+            speed: "121 MiB/s".into(),
+        });
+        let summary = md_exception_summary(&[degraded]).unwrap();
+        assert!(summary.contains("md0 · 1/2 members"));
+        assert!(summary.contains("flags sde1(F)"));
+        assert!(summary.contains("resync 41% @ 121 MiB/s"));
+        assert!(summary.contains("affects sdd,sde"));
+    }
+
+    #[test]
+    fn md_state_ignores_nonfailure_flags_and_incomplete_zero_counts() {
+        for flag in ["(S)", "(W)"] {
+            let mut array = md_array();
+            array.members[0].flag = Some(flag.into());
+            assert_eq!(md_exception_summary(&[array]), None);
+        }
+
+        let mut incomplete = md_array();
+        incomplete.members_total = 0;
+        incomplete.members_present = 0;
+        incomplete.members.clear();
+        incomplete.member_state.clear();
+        assert_eq!(md_exception_summary(&[incomplete.clone()]), None);
+
+        incomplete.member_state = "U_".into();
+        let summary = md_exception_summary(&[incomplete]).unwrap();
+        assert!(summary.starts_with(" md0 · 0/0 members"));
+
+        let mut failed = md_array();
+        failed.members[0].flag = Some("(f)".into());
+        assert!(md_exception_summary(&[failed]).is_some());
+    }
+
+    #[test]
+    fn context_rows_preserve_directional_and_normal_vfs_bodies() {
+        assert_eq!(detail_context_row_count(28, 2), 2);
+        let (_, _, tall_vfs) = detail_areas(Rect::new(0, 0, 130, 25));
+        assert_eq!(tall_vfs.height, 11);
+
+        assert_eq!(detail_context_row_count(21, 2), 2);
+        let (_, _, compact_vfs) = detail_areas(Rect::new(0, 0, 110, 18));
+        assert_eq!(compact_vfs.height, 4);
+
+        assert_eq!(detail_context_row_count(14, 2), 0);
+        let (read, write, _) = detail_areas(Rect::new(0, 0, 60, 13));
+        assert_eq!((read.height, write.height), (13, 13));
     }
 
     #[test]
@@ -2121,8 +2803,8 @@ mod tests {
 
     #[test]
     fn compact_layout_reserves_exactly_one_separator_row() {
-        assert_eq!(master_detail_heights(28, 30), (8, 19));
-        assert_eq!(master_detail_heights(28, 8), (8, 19));
+        assert_eq!(master_detail_heights(28, 30), (6, 21));
+        assert_eq!(master_detail_heights(28, 8), (6, 21));
         assert_eq!(master_detail_heights(8, 8), (5, 2));
         assert_eq!(master_detail_heights(1, 8), (1, 0));
         let (overview, detail) = master_detail_heights(28, 8);
@@ -2298,13 +2980,13 @@ mod tests {
         let tall = Rect::new(0, 0, 130, 70);
         let (read, write, vfs) = detail_areas(tall);
         assert_eq!((read.height, write.height), (13, 13));
-        assert_eq!((vfs.y, vfs.height), (14, 11));
-        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(1)), 5);
+        assert_eq!((vfs.y, vfs.height), (14, 13));
+        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(1)), 6);
         assert_eq!(vfs.y + vfs.height, WIDE_DETAIL_BODY_HEIGHT);
 
         let (overview, detail) = master_detail_heights(68, 5);
         assert_eq!((overview, detail), (5, WIDE_DETAIL_HEIGHT));
-        assert_eq!(overview + 1 + detail, 32);
+        assert_eq!(overview + 1 + detail, 34);
 
         let narrow = Rect::new(0, 0, 72, 12);
         let (read, write, vfs) = detail_areas(narrow);

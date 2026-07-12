@@ -414,6 +414,11 @@ mod tests {
     }
 
     #[test]
+    fn renders_at_tall_size() {
+        render_all_tabs(130, 40);
+    }
+
+    #[test]
     fn renders_at_minimum_supported_size() {
         // README declares responsive ≥ 110×30.
         render_all_tabs(110, 30);
