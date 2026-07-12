@@ -185,6 +185,15 @@ fn parse_device(v: &serde_json::Value, kind: ControllerKind, protocol: &str) -> 
 /// `system_profiler` lists physical disks (disk0); sysinfo mounts live on
 /// volumes inside synthesized containers (disk3s5). This map closes the gap.
 pub fn container_to_physical_map() -> std::collections::HashMap<String, String> {
+    let map = diskutil_container_to_physical_map();
+    if map.is_empty() {
+        crate::collect::iokit::apfs_container_to_physical_map()
+    } else {
+        map
+    }
+}
+
+fn diskutil_container_to_physical_map() -> std::collections::HashMap<String, String> {
     let Ok(out) = Command::new("diskutil").args(["list", "-plist"]).output() else {
         return Default::default();
     };

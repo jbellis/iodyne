@@ -48,6 +48,20 @@ pub fn collect() -> HashMap<String, IokitDeviceStats> {
     parse_ioreg(&text)
 }
 
+pub fn apfs_container_to_physical_map() -> HashMap<String, String> {
+    let Ok(out) = Command::new("ioreg")
+        .args(["-c", "IOBlockStorageDriver", "-r", "-l", "-w", "0"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_apfs_container_to_physical_map(&text)
+}
+
 /// Pure parser, exposed for tests on any platform.
 pub(crate) fn parse_ioreg(text: &str) -> HashMap<String, IokitDeviceStats> {
     let mut out = HashMap::new();
@@ -101,6 +115,58 @@ pub(crate) fn parse_ioreg(text: &str) -> HashMap<String, IokitDeviceStats> {
     out
 }
 
+pub(crate) fn parse_apfs_container_to_physical_map(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut current_physical: Option<String> = None;
+
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line_is_node(line, "IOBlockStorageDriver") {
+            current_physical = None;
+            let _ = read_property_block(&mut lines);
+            continue;
+        }
+
+        if line_is_node(line, "IOMedia") {
+            let Some(props) = read_property_block(&mut lines) else {
+                continue;
+            };
+            if property_is_yes(&props, "Whole") {
+                current_physical = property_value(&props, "BSD Name").map(str::to_string);
+            }
+            continue;
+        }
+
+        if line_is_node(line, "AppleAPFSMedia") {
+            let Some(props) = read_property_block(&mut lines) else {
+                continue;
+            };
+            let Some(physical) = current_physical.as_deref() else {
+                continue;
+            };
+            if property_is_yes(&props, "Whole") {
+                if let Some(container) = property_value(&props, "BSD Name") {
+                    if container != physical {
+                        out.insert(container.to_string(), physical.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn property_value<'a>(props: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    props
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| strip_quotes(v))
+}
+
+fn property_is_yes(props: &[(String, String)], key: &str) -> bool {
+    property_value(props, key) == Some("Yes")
+}
+
 #[derive(Default, Clone, Copy)]
 struct Stats {
     bytes_read: u64,
@@ -112,8 +178,14 @@ struct Stats {
 }
 
 fn line_is_node(line: &str, class_name: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("+-o ") && trimmed.contains(&format!("<class {}", class_name))
+    let trimmed = trim_ioreg_tree_prefix(line);
+    trimmed.starts_with("+-o ")
+        && (trimmed.contains(&format!("<class {class_name},"))
+            || trimmed.contains(&format!("<class {class_name} ")))
+}
+
+fn trim_ioreg_tree_prefix(line: &str) -> &str {
+    line.trim_start_matches(|c: char| c.is_whitespace() || c == '|')
 }
 
 /// Reads a `{ ... }` property block that immediately follows a `+-o`
@@ -140,7 +212,7 @@ fn read_property_block<'a>(
 
     let mut out = Vec::new();
     for line in lines.by_ref() {
-        let trimmed = line.trim().trim_start_matches('|').trim();
+        let trimmed = trim_ioreg_tree_prefix(line).trim();
         if trimmed == "}" {
             break;
         }
@@ -242,5 +314,37 @@ mod tests {
 "#;
         let m = parse_ioreg(text);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn maps_apfs_whole_media_to_physical_ancestor() {
+        let text = r#"+-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x1, ...>
+  | {
+  |   "Statistics" = {"Bytes (Read)"=10}
+  | }
+  +-o APPLE SSD Media  <class IOMedia, id 0x2, ...>
+    | {
+    |   "Whole" = Yes
+    |   "BSD Name" = "disk0"
+    | }
+    +-o IOGUIDPartitionScheme  <class IOGUIDPartitionScheme, id 0x3, ...>
+      | {
+      | }
+      +-o Container@2  <class IOMedia, id 0x4, ...>
+        | {
+        |   "Whole" = No
+        |   "BSD Name" = "disk0s2"
+        | }
+        +-o AppleAPFSContainerScheme  <class AppleAPFSContainerScheme, id 0x5, ...>
+          | {
+          | }
+          | +-o AppleAPFSMedia  <class AppleAPFSMedia, id 0x6, ...>
+          |   | {
+          |   |   "Whole" = Yes
+          |   |   "BSD Name" = "disk3"
+          |   | }
+"#;
+        let m = parse_apfs_container_to_physical_map(text);
+        assert_eq!(m.get("disk3").map(String::as_str), Some("disk0"));
     }
 }

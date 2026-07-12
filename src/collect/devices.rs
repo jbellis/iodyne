@@ -13,6 +13,8 @@ use sysinfo::Disks;
 
 #[cfg(target_os = "macos")]
 use crate::collect::macos;
+#[cfg(target_os = "macos")]
+use crate::collect::mounts;
 
 #[cfg(target_os = "linux")]
 use crate::collect::linux;
@@ -355,7 +357,7 @@ fn sysfs_slaves(dev_path: &str) -> Option<Vec<String>> {
 fn sysinfo_mount_used() -> Vec<(String, u64)> {
     let disks = Disks::new_with_refreshed_list();
     #[cfg(target_os = "macos")]
-    let mount_table = macos_mount_table();
+    let mount_table = mounts::macos_mount_table();
 
     let mut by_disk: HashMap<String, u64> = HashMap::new();
     for d in disks.list() {
@@ -383,33 +385,6 @@ fn sysinfo_mount_used() -> Vec<(String, u64)> {
         }
     }
     by_disk.into_iter().collect()
-}
-
-#[cfg(target_os = "macos")]
-fn macos_mount_table() -> HashMap<String, String> {
-    use std::process::Command;
-    let Ok(out) = Command::new("/sbin/mount").output() else {
-        return HashMap::new();
-    };
-    if !out.status.success() {
-        return HashMap::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        // Each line: "<device> on <mount> (fs, opts...)"
-        let Some(on_idx) = line.find(" on ") else {
-            continue;
-        };
-        let device = line[..on_idx].trim().to_string();
-        let after = &line[on_idx + 4..];
-        let Some(paren) = after.rfind(" (") else {
-            continue;
-        };
-        let mount = after[..paren].trim().to_string();
-        map.insert(mount, device);
-    }
-    map
 }
 
 /// Fold a device path or partition name to its whole-disk name:

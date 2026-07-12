@@ -1,11 +1,15 @@
 //! Filesystem (mount) enumeration via `sysinfo::Disks`.
 //!
 //! One entry per mount point. sysinfo provides total / available bytes,
-//! file-system kind, mount path, device name. Inode usage and 7d growth
-//! aren't in sysinfo — inode % is `None` for now; growth is computed by
-//! the App from a snapshot ring.
+//! file-system kind, mount path, device name on Linux. On macOS sysinfo's
+//! disk name is the volume label, so we resolve mount point to BSD device via
+//! `/sbin/mount`. Inode usage and 7d growth aren't in sysinfo — inode % is
+//! `None` for now; growth is computed by the App from a snapshot ring.
 
 use sysinfo::Disks;
+
+#[cfg(target_os = "macos")]
+use crate::collect::mounts;
 
 #[derive(Debug, Clone)]
 pub struct FsTick {
@@ -22,12 +26,19 @@ pub struct FsTick {
 
 pub fn collect() -> Vec<FsTick> {
     let disks = Disks::new_with_refreshed_list();
+    #[cfg(target_os = "macos")]
+    let mount_table = mounts::macos_mount_table();
+
     let mut out: Vec<FsTick> = disks
         .list()
         .iter()
         .map(|d| {
             let mount = d.mount_point().to_string_lossy().to_string();
-            let device = d.name().to_string_lossy().to_string();
+            let mut device = d.name().to_string_lossy().to_string();
+            #[cfg(target_os = "macos")]
+            if let Some(source) = mount_table.get(&mount) {
+                device = source.clone();
+            }
             let fs_type = d.file_system().to_string_lossy().to_string();
             let total = d.total_space();
             let avail = d.available_space();

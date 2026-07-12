@@ -2552,6 +2552,20 @@ fn resolved_block_name(device: &str) -> String {
 }
 
 fn whole_disk_name(device: &str) -> &str {
+    if let Some(stripped) = device.strip_prefix("disk") {
+        let digits_len = stripped
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if digits_len > 0 {
+            let base_len = "disk".len() + digits_len;
+            if device.len() == base_len || device[base_len..].starts_with('s') {
+                return &device[..base_len];
+            }
+        }
+    }
+
     if let Some((base, part)) = device.rsplit_once('p') {
         if base.starts_with("nvme")
             || base.starts_with("mmcblk")
@@ -2572,16 +2586,6 @@ fn whole_disk_name(device: &str) -> &str {
             .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
     {
         return device;
-    }
-
-    if let Some(stripped) = device.strip_prefix("disk") {
-        if let Some(idx) = stripped.find('s') {
-            let base_len = "disk".len() + idx;
-            let (_, suffix) = stripped.split_at(idx + 1);
-            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                return &device[..base_len];
-            }
-        }
     }
 
     let split = device
@@ -2982,6 +2986,7 @@ mod tests {
         assert!(block_source_matches_io("dm-0", "dm-0"));
         assert_eq!(whole_disk_name("sda1"), "sda");
         assert_eq!(whole_disk_name("nvme0n1p1"), "nvme0n1");
+        assert_eq!(whole_disk_name("disk3s1s1"), "disk3");
         assert_eq!(whole_disk_name("md0"), "md0");
         assert_eq!(whole_disk_name("dm-0"), "dm-0");
         assert!(!md_array_contains_device(&md_array(), "md0"));

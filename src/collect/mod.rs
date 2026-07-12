@@ -1,6 +1,7 @@
 pub mod devices;
 pub mod filesystems;
 pub mod io;
+pub mod mounts;
 pub mod smart;
 pub mod volumes;
 
