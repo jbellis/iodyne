@@ -870,7 +870,7 @@ fn draw_direction_metric(
 }
 
 fn direction_metric_label(title: &str, value: &str) -> String {
-    format!(" {title:<12} {:>11}", value.trim())
+    format!(" {title:<12} {:>11} ", value.trim())
 }
 
 fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
@@ -1774,8 +1774,10 @@ mod tests {
             direction_metric_label("Throughput", "9.9 MiB/s"),
             direction_metric_label("Request size", "139K"),
             direction_metric_label("Merges/s", "3.6k"),
+            direction_metric_label("IOPS", "--"),
         ];
-        assert!(labels.iter().all(|label| label.chars().count() == 25));
+        assert!(labels.iter().all(|label| label.chars().count() == 26));
+        assert!(labels.iter().all(|label| label.ends_with(' ')));
     }
 
     #[test]
