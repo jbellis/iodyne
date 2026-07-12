@@ -559,6 +559,7 @@ struct VfsActivityTotal {
     pid: u32,
     comm: String,
     basename: String,
+    path: String,
 }
 
 #[derive(Debug)]
@@ -618,6 +619,7 @@ impl VfsActivityWindow {
                 pid: delta.pid,
                 comm: delta.comm.clone(),
                 basename: delta.basename.clone(),
+                path: delta.path.clone(),
             });
             total.counts.add(counts);
             // Keep presentation metadata current if a PID or filename is
@@ -625,6 +627,9 @@ impl VfsActivityWindow {
             total.pid = delta.pid;
             total.comm = delta.comm;
             total.basename = delta.basename;
+            if !delta.path.is_empty() {
+                total.path = delta.path;
+            }
         }
 
         self.frames.push_back(VfsActivityFrame {
@@ -670,7 +675,11 @@ impl VfsActivityWindow {
                 inode: key.inode,
                 pid: total.pid,
                 tgid: key.tgid,
-                path: fallback_file_path(&total.basename, key.inode),
+                path: if total.path.is_empty() {
+                    fallback_file_path(&total.basename, key.inode)
+                } else {
+                    total.path.clone()
+                },
                 comm: total.comm.clone(),
                 basename: total.basename.clone(),
                 read_bps: total.counts.read_bytes / elapsed,
@@ -731,6 +740,11 @@ fn resolve_hot_file_paths_at(activity: &mut [VfsFileActivity], proc_root: &std::
 
     let mut wanted: StdHashMap<u32, HashSet<(u32, u32, u32, u64)>> = StdHashMap::new();
     for item in activity.iter() {
+        // Event-time eBPF capture is authoritative. Only unresolved entries
+        // pay the bounded /proc descriptor scan cost.
+        if item.path != fallback_file_path(&item.basename, item.inode) {
+            continue;
+        }
         let identity = (
             item.tgid,
             item.fs_device.major,
@@ -1009,6 +1023,7 @@ mod tests {
             tgid: 100,
             comm: "writer".into(),
             basename: format!("file-{inode}"),
+            path: String::new(),
             read_bytes,
             write_bytes,
             read_ops: 2,
@@ -1027,6 +1042,17 @@ mod tests {
         assert_near(ranked[0].write_bps, 400.0);
         assert_near(ranked[0].read_ops, 4.0);
         assert_near(ranked[0].write_ops, 6.0);
+    }
+
+    #[test]
+    fn event_time_path_is_preferred_and_survives_empty_later_samples() {
+        let mut window = VfsActivityWindow::default();
+        let mut first = vfs_delta(1, 100, 0);
+        first.path = "/srv/archive/data.bin".into();
+        window.push(vec![first], 1.0);
+        window.push(vec![vfs_delta(1, 50, 0)], 1.0);
+
+        assert_eq!(window.ranked(1)[0].path, "/srv/archive/data.bin");
     }
 
     #[test]
@@ -1130,6 +1156,27 @@ mod tests {
         }];
         resolve_hot_file_paths(&mut activity);
         assert!(activity[0].path.ends_with("Cargo.toml"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_resolution_does_not_replace_event_time_path() {
+        let mut activity = vec![VfsFileActivity {
+            fs_device: BlockDeviceId { major: 8, minor: 1 },
+            inode: 42,
+            pid: std::process::id(),
+            tgid: std::process::id(),
+            comm: "test".into(),
+            basename: "data.log".into(),
+            path: "/captured/at/event/time/data.log".into(),
+            read_bps: 1.0,
+            write_bps: 0.0,
+            read_ops: 1.0,
+            write_ops: 0.0,
+        }];
+
+        resolve_hot_file_paths_at(&mut activity, std::path::Path::new("/does/not/exist"));
+        assert_eq!(activity[0].path, "/captured/at/event/time/data.log");
     }
 
     #[cfg(target_os = "linux")]

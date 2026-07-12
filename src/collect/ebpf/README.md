@@ -42,17 +42,31 @@ DiskWatch falls back to aggregate await statistics.
 
 Separate VFS objects contain optional `vfs_read` and `vfs_write` kprobes. Their
 map creation, load, and attach status is independent: a kernel without the LRU
-map type or either VFS symbol can still provide block latency. File activity is accumulated in an 8192-entry LRU
-map keyed by filesystem device, inode, and process TGID. Atomic counters keep
-updates safe when several threads in a process access the same file. Userspace
-polls the map once per display sample, ranks a bounded candidate set, and may
-resolve paths by scanning at most 256 descriptors for each candidate process.
-It never installs recursive watches or walks filesystem trees.
+map type or either VFS symbol can still provide block latency. File activity is
+accumulated in an 8192-entry LRU map keyed by filesystem device, inode, and
+process TGID. Atomic counters keep updates safe when several threads in a
+process access the same file.
+
+After both count kprobes attach, `security_file_permission` is attached
+independently as an fentry program and uses `bpf_d_path` to capture the first
+observed path while the kernel `struct path` is still valid. Paths are bounded
+to 256 bytes in a same-key LRU map. A kernel that rejects the fentry program or
+helper still retains VFS counters. The path map is in the same ELF object, so
+an earlier object or map-creation failure disables the complete VFS collector
+(but not the separately loaded block-latency collector).
+
+An empty map value records a failed or overlong-path attempt so the helper is
+not retried for every operation. Userspace prefers an event-time path, then
+scans at most 256 descriptors for each unresolved candidate process, then shows
+basename and inode. It only polls paths for active count keys plus one race
+retry; it never installs recursive watches or walks filesystem trees.
 
 VFS byte counts are the `count` requested at function entry, not bytes returned
 to the caller and not physical disk bytes. Page-cache hits are included;
 buffered writeback is attributed to the writing process at the original VFS
 call rather than to a later kernel worker. mmap I/O, direct paths that bypass
 `vfs_read`/`vfs_write` (including some io_uring operations), metadata I/O, and
-files closed before `/proc/<tgid>/fd` resolution may be absent. When resolution
-is not possible, DiskWatch retains the bounded basename and inode identity.
+files whose operations bypass these hooks may be absent. Overlong paths and
+kernels that reject event-time path capture use the `/proc` fallback; when that
+also cannot resolve a file, DiskWatch retains the bounded basename and inode
+identity.

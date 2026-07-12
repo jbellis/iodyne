@@ -56,6 +56,11 @@ fn run_diag() -> Result<()> {
         latency.vfs_source(),
         latency.vfs_status()
     )?;
+    writeln!(
+        out,
+        "  VFS event paths status={:?}",
+        latency.vfs_path_status()
+    )?;
 
     let devices = collect::devices::collect();
     writeln!(out, "\n=== Devices ({}) ===", devices.len())?;

@@ -103,6 +103,21 @@ struct VfsFileValue {
     basename: [u8; 64],
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct VfsFilePath {
+    path: [u8; 256],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VfsFileSample {
+    counts: VfsFileValue,
+    path: VfsFilePath,
+    /// Retry one subsequent sample when counters became visible immediately
+    /// before the permission hook captured its path.
+    path_pending: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VfsActivityDelta {
     pub device: BlockDeviceId,
@@ -111,6 +126,7 @@ pub(crate) struct VfsActivityDelta {
     pub tgid: u32,
     pub comm: String,
     pub basename: String,
+    pub path: String,
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub read_ops: u64,
@@ -126,11 +142,15 @@ unsafe impl aya::Pod for VfsFileKey {}
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 unsafe impl aya::Pod for VfsFileValue {}
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+unsafe impl aya::Pod for VfsFilePath {}
+
 pub struct EbpfLatencyCollector {
     status: EbpfStatus,
     vfs_status: EbpfStatus,
+    vfs_path_status: EbpfStatus,
     previous: HashMap<HistogramKey, u64>,
-    vfs_previous: HashMap<VfsFileKey, VfsFileValue>,
+    vfs_previous: HashMap<VfsFileKey, VfsFileSample>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     latency_bpf: Option<aya::Bpf>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -150,6 +170,7 @@ impl EbpfLatencyCollector {
         Self {
             status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_status: EbpfStatus::Unavailable("test fixture".into()),
+            vfs_path_status: EbpfStatus::Unavailable("test fixture".into()),
             previous: HashMap::new(),
             vfs_previous: HashMap::new(),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -174,6 +195,13 @@ impl EbpfLatencyCollector {
 
     pub fn vfs_status(&self) -> &EbpfStatus {
         &self.vfs_status
+    }
+
+    /// Event-time full-path capture is optional and independent of VFS
+    /// requested-byte accounting. Diagnostics expose this separately so a
+    /// host can distinguish kernel paths from the userspace fallback.
+    pub fn vfs_path_status(&self) -> &EbpfStatus {
+        &self.vfs_path_status
     }
 
     pub fn vfs_source(&self) -> VfsActivitySource {
@@ -255,13 +283,20 @@ impl EbpfLatencyCollector {
     fn load() -> Self {
         match load_linux() {
             Ok(latency_bpf) => {
-                let (vfs_bpf, vfs_status) = match load_vfs_linux() {
-                    Ok(bpf) => (Some(bpf), EbpfStatus::Active),
-                    Err(error) => (None, independent_vfs_status(Err(error))),
+                let (vfs_bpf, vfs_status, vfs_path_status) = match load_vfs_linux() {
+                    Ok((bpf, path_status)) => (Some(bpf), EbpfStatus::Active, path_status),
+                    Err(error) => (
+                        None,
+                        independent_vfs_status(Err(error.clone())),
+                        EbpfStatus::Unavailable(format!(
+                            "VFS activity initialization failed before path attach: {error}"
+                        )),
+                    ),
                 };
                 Self {
                     status: EbpfStatus::Active,
                     vfs_status,
+                    vfs_path_status,
                     previous: HashMap::new(),
                     vfs_previous: HashMap::new(),
                     latency_bpf: Some(latency_bpf),
@@ -272,6 +307,9 @@ impl EbpfLatencyCollector {
                 status: EbpfStatus::Unavailable(error.clone()),
                 vfs_status: EbpfStatus::Unavailable(format!(
                     "block probe initialization failed before VFS attach: {error}"
+                )),
+                vfs_path_status: EbpfStatus::Unavailable(format!(
+                    "block probe initialization failed before VFS path attach: {error}"
                 )),
                 previous: HashMap::new(),
                 vfs_previous: HashMap::new(),
@@ -286,6 +324,7 @@ impl EbpfLatencyCollector {
         Self {
             status: EbpfStatus::DisabledAtBuild,
             vfs_status: EbpfStatus::DisabledAtBuild,
+            vfs_path_status: EbpfStatus::DisabledAtBuild,
             previous: HashMap::new(),
             vfs_previous: HashMap::new(),
         }
@@ -296,6 +335,7 @@ impl EbpfLatencyCollector {
         Self {
             status: EbpfStatus::UnsupportedPlatform,
             vfs_status: EbpfStatus::UnsupportedPlatform,
+            vfs_path_status: EbpfStatus::UnsupportedPlatform,
             previous: HashMap::new(),
             vfs_previous: HashMap::new(),
         }
@@ -324,21 +364,46 @@ impl EbpfLatencyCollector {
     }
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    fn read_vfs_counts(&mut self) -> Result<HashMap<VfsFileKey, VfsFileValue>, String> {
+    fn read_vfs_counts(&mut self) -> Result<HashMap<VfsFileKey, VfsFileSample>, String> {
         use aya::maps::HashMap as AyaHashMap;
 
+        let path_capture_active = self.vfs_path_status.is_active();
         let bpf = self
             .vfs_bpf
             .as_mut()
             .ok_or_else(|| "eBPF collector is not loaded".to_string())?;
-        let map = bpf
+        let counts = bpf
             .map_mut("VFS_FILES")
             .ok_or_else(|| "eBPF VFS activity map is missing".to_string())?;
-        let map = AyaHashMap::<_, VfsFileKey, VfsFileValue>::try_from(map)
+        let counts = AyaHashMap::<_, VfsFileKey, VfsFileValue>::try_from(counts)
             .map_err(|error| format!("cannot access eBPF VFS activity map: {error}"))?;
-        map.iter()
+        let counts: HashMap<_, _> = counts
+            .iter()
             .map(|entry| entry.map_err(|error| format!("cannot read eBPF VFS activity: {error}")))
-            .collect()
+            .collect::<Result<_, _>>()?;
+
+        let mut samples: HashMap<_, _> = counts
+            .into_iter()
+            .map(|(key, counts)| {
+                let (sample, should_lookup, counts_changed) =
+                    prepare_vfs_sample(self.vfs_previous.get(&key), counts, path_capture_active);
+                (key, (sample, should_lookup, counts_changed))
+            })
+            .collect();
+
+        if path_capture_active {
+            if let Err(error) = read_active_vfs_paths(bpf, &mut samples) {
+                self.vfs_path_status = EbpfStatus::Unavailable(error);
+                for (sample, _, _) in samples.values_mut() {
+                    sample.path_pending = false;
+                }
+            }
+        }
+
+        Ok(samples
+            .into_iter()
+            .map(|(key, (sample, _, _))| (key, sample))
+            .collect())
     }
 
     #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
@@ -347,9 +412,35 @@ impl EbpfLatencyCollector {
     }
 
     #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
-    fn read_vfs_counts(&mut self) -> Result<HashMap<VfsFileKey, VfsFileValue>, String> {
+    fn read_vfs_counts(&mut self) -> Result<HashMap<VfsFileKey, VfsFileSample>, String> {
         Ok(HashMap::new())
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn read_active_vfs_paths(
+    bpf: &mut aya::Bpf,
+    samples: &mut HashMap<VfsFileKey, (VfsFileSample, bool, bool)>,
+) -> Result<(), String> {
+    use aya::maps::{HashMap as AyaHashMap, MapError};
+
+    let paths = bpf
+        .map_mut("VFS_PATHS")
+        .ok_or_else(|| "eBPF VFS path map is missing".to_string())?;
+    let paths = AyaHashMap::<_, VfsFileKey, VfsFilePath>::try_from(paths)
+        .map_err(|error| format!("cannot access eBPF VFS path map: {error}"))?;
+    for (key, (sample, should_lookup, counts_changed)) in samples {
+        if !*should_lookup {
+            continue;
+        }
+        let captured = match paths.get(key, 0) {
+            Ok(path) => Some(path),
+            Err(MapError::KeyNotFound) => None,
+            Err(error) => return Err(format!("cannot read eBPF VFS path: {error}")),
+        };
+        complete_vfs_path_lookup(sample, captured, *counts_changed);
+    }
+    Ok(())
 }
 
 impl Default for EbpfLatencyCollector {
@@ -396,7 +487,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn load_vfs_linux() -> Result<aya::Bpf, String> {
+fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
     use aya::programs::KProbe;
 
     #[cfg(target_arch = "x86_64")]
@@ -425,7 +516,32 @@ fn load_vfs_linux() -> Result<aya::Bpf, String> {
             .attach(function_name, 0)
             .map_err(|error| format!("cannot attach {program_name}: {error}"))?;
     }
-    Ok(bpf)
+    // Path capture is a separate, newer capability. Count probes remain
+    // attached when BTF lookup, verifier policy, or the helper allowlist
+    // rejects this program.
+    let path_status = attach_vfs_path_linux(&mut bpf);
+    Ok((bpf, independent_vfs_status(path_status)))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn attach_vfs_path_linux(bpf: &mut aya::Bpf) -> Result<(), String> {
+    use aya::programs::FEntry;
+    use aya::Btf;
+
+    let btf = Btf::from_sys_fs().map_err(|error| format!("cannot read kernel BTF: {error}"))?;
+    let program_name = "diskwatch_vfs_path";
+    let program: &mut FEntry = bpf
+        .program_mut(program_name)
+        .ok_or_else(|| format!("eBPF program {program_name} is missing"))?
+        .try_into()
+        .map_err(|error| format!("invalid eBPF program {program_name}: {error}"))?;
+    program
+        .load("security_file_permission", &btf)
+        .map_err(|error| format!("cannot load {program_name}: {error}"))?;
+    program
+        .attach()
+        .map_err(|error| format!("cannot attach {program_name}: {error}"))?;
+    Ok(())
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -488,18 +604,78 @@ fn bpf_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
+fn vfs_counters_changed(old: &VfsFileValue, current: &VfsFileValue) -> bool {
+    old.read_bytes != current.read_bytes
+        || old.write_bytes != current.write_bytes
+        || old.read_ops != current.read_ops
+        || old.write_ops != current.write_ops
+}
+
+fn vfs_counters_reset(old: &VfsFileValue, current: &VfsFileValue) -> bool {
+    current.read_bytes < old.read_bytes
+        || current.write_bytes < old.write_bytes
+        || current.read_ops < old.read_ops
+        || current.write_ops < old.write_ops
+}
+
+fn prepare_vfs_sample(
+    old: Option<&VfsFileSample>,
+    counts: VfsFileValue,
+    path_capture_active: bool,
+) -> (VfsFileSample, bool, bool) {
+    let counts_changed = old.map_or(true, |old| vfs_counters_changed(&old.counts, &counts));
+    let counts_reset = old.is_some_and(|old| vfs_counters_reset(&old.counts, &counts));
+    let path = if counts_reset {
+        VfsFilePath { path: [0; 256] }
+    } else {
+        old.map_or(VfsFilePath { path: [0; 256] }, |old| old.path)
+    };
+    let path_pending = old.is_some_and(|old| old.path_pending);
+    let should_lookup = path_capture_active
+        && (counts_changed || path_pending)
+        && (path.path[0] == 0 || path_pending);
+    (
+        VfsFileSample {
+            counts,
+            path,
+            path_pending: false,
+        },
+        should_lookup,
+        counts_changed,
+    )
+}
+
+fn complete_vfs_path_lookup(
+    sample: &mut VfsFileSample,
+    captured: Option<VfsFilePath>,
+    counts_changed: bool,
+) {
+    if let Some(captured) = captured.filter(|path| path.path[0] != 0) {
+        sample.path = captured;
+        sample.path_pending = false;
+    } else {
+        // Changed counters earn one follow-up lookup. If this was already the
+        // follow-up on an idle entry, stop polling it until activity resumes.
+        sample.path_pending = counts_changed && sample.path.path[0] == 0;
+    }
+}
+
 fn vfs_deltas(
-    previous: &HashMap<VfsFileKey, VfsFileValue>,
-    current: &HashMap<VfsFileKey, VfsFileValue>,
+    previous: &HashMap<VfsFileKey, VfsFileSample>,
+    current: &HashMap<VfsFileKey, VfsFileSample>,
 ) -> Vec<VfsActivityDelta> {
     let mut deltas = Vec::new();
-    for (key, value) in current {
+    for (key, sample) in current {
+        let value = &sample.counts;
         let old = previous.get(key);
-        let read_bytes = counter_delta(old.map_or(0, |v| v.read_bytes), value.read_bytes);
-        let write_bytes = counter_delta(old.map_or(0, |v| v.write_bytes), value.write_bytes);
-        let read_ops = counter_delta(old.map_or(0, |v| v.read_ops), value.read_ops);
-        let write_ops = counter_delta(old.map_or(0, |v| v.write_ops), value.write_ops);
-        if read_bytes == 0 && write_bytes == 0 && read_ops == 0 && write_ops == 0 {
+        let old_counts = old.map(|sample| &sample.counts);
+        let read_bytes = counter_delta(old_counts.map_or(0, |v| v.read_bytes), value.read_bytes);
+        let write_bytes = counter_delta(old_counts.map_or(0, |v| v.write_bytes), value.write_bytes);
+        let read_ops = counter_delta(old_counts.map_or(0, |v| v.read_ops), value.read_ops);
+        let write_ops = counter_delta(old_counts.map_or(0, |v| v.write_ops), value.write_ops);
+        let path_changed =
+            old.is_some_and(|old| old.path.path != sample.path.path && sample.path.path[0] != 0);
+        if read_bytes == 0 && write_bytes == 0 && read_ops == 0 && write_ops == 0 && !path_changed {
             continue;
         }
         deltas.push(VfsActivityDelta {
@@ -512,6 +688,7 @@ fn vfs_deltas(
             tgid: key.tgid,
             comm: bpf_string(&value.comm),
             basename: bpf_string(&value.basename),
+            path: bpf_string(&sample.path.path),
             read_bytes,
             write_bytes,
             read_ops,
@@ -631,6 +808,16 @@ mod tests {
         }
     }
 
+    fn vfs_sample(read_bytes: u64, write_bytes: u64, path: &str) -> VfsFileSample {
+        let mut captured = [0; 256];
+        captured[..path.len()].copy_from_slice(path.as_bytes());
+        VfsFileSample {
+            counts: vfs_value(read_bytes, write_bytes),
+            path: VfsFilePath { path: captured },
+            path_pending: false,
+        }
+    }
+
     #[test]
     fn bucket_bounds_are_logarithmic_and_overflow_is_open_ended() {
         assert_eq!(bucket_bounds(0), (0, Some(2)));
@@ -651,7 +838,7 @@ mod tests {
 
     #[test]
     fn vfs_key_and_strings_decode_into_delta_schema() {
-        let current = HashMap::from([(vfs_key(), vfs_value(120, 30))]);
+        let current = HashMap::from([(vfs_key(), vfs_sample(120, 30, "/srv/data.log"))]);
         let deltas = vfs_deltas(&HashMap::new(), &current);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].device, BlockDeviceId { major: 8, minor: 1 });
@@ -660,17 +847,70 @@ mod tests {
         assert_eq!(deltas[0].tgid, 1000);
         assert_eq!(deltas[0].comm, "test");
         assert_eq!(deltas[0].basename, "data.log");
+        assert_eq!(deltas[0].path, "/srv/data.log");
     }
 
     #[test]
     fn vfs_deltas_handle_growth_reset_and_idle_entries() {
-        let previous = HashMap::from([(vfs_key(), vfs_value(100, 50))]);
-        let current = HashMap::from([(vfs_key(), vfs_value(140, 2))]);
+        let previous = HashMap::from([(vfs_key(), vfs_sample(100, 50, ""))]);
+        let current = HashMap::from([(vfs_key(), vfs_sample(140, 2, ""))]);
         let deltas = vfs_deltas(&previous, &current);
         assert_eq!(deltas[0].read_bytes, 40);
         assert_eq!(deltas[0].write_bytes, 2);
 
         assert!(vfs_deltas(&current, &current).is_empty());
+    }
+
+    #[test]
+    fn vfs_path_arriving_after_count_sample_emits_metadata_delta() {
+        let previous = HashMap::from([(vfs_key(), vfs_sample(140, 2, ""))]);
+        let current = HashMap::from([(vfs_key(), vfs_sample(140, 2, "/srv/late-path.log"))]);
+
+        let deltas = vfs_deltas(&previous, &current);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].path, "/srv/late-path.log");
+        assert_eq!(deltas[0].read_bytes, 0);
+        assert_eq!(deltas[0].write_bytes, 0);
+    }
+
+    #[test]
+    fn vfs_path_lookup_gets_one_idle_retry_then_stops() {
+        let counts = vfs_value(100, 0);
+        let (mut first, should_lookup, changed) = prepare_vfs_sample(None, counts, true);
+        assert!(should_lookup);
+        complete_vfs_path_lookup(&mut first, None, changed);
+        assert!(first.path_pending);
+
+        let (mut retry, should_lookup, changed) = prepare_vfs_sample(Some(&first), counts, true);
+        assert!(should_lookup);
+        assert!(!changed);
+        complete_vfs_path_lookup(&mut retry, None, changed);
+        assert!(!retry.path_pending);
+
+        let (_, should_lookup, _) = prepare_vfs_sample(Some(&retry), counts, true);
+        assert!(!should_lookup);
+    }
+
+    #[test]
+    fn vfs_path_lookup_reuses_cache_and_skips_inactive_capture() {
+        let resolved = vfs_sample(100, 0, "/srv/data.log");
+        let (_, should_lookup, _) = prepare_vfs_sample(Some(&resolved), resolved.counts, true);
+        assert!(!should_lookup);
+
+        let changed = vfs_value(200, 0);
+        let (sample, should_lookup, counts_changed) =
+            prepare_vfs_sample(Some(&resolved), changed, true);
+        assert!(counts_changed);
+        assert!(!should_lookup);
+        assert_eq!(bpf_string(&sample.path.path), "/srv/data.log");
+
+        let (_, should_lookup, _) = prepare_vfs_sample(None, resolved.counts, false);
+        assert!(!should_lookup);
+
+        let reset = vfs_value(1, 0);
+        let (sample, should_lookup, _) = prepare_vfs_sample(Some(&resolved), reset, true);
+        assert!(should_lookup);
+        assert_eq!(sample.path.path[0], 0);
     }
 
     #[test]
