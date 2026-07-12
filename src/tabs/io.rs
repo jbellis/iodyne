@@ -1201,14 +1201,17 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
         },
     );
 
-    let path_width = area.width.saturating_sub(2) as usize;
+    let path_indent = (bar_width + 1).min(area.width as usize) as u16;
+    let path_width = area.width.saturating_sub(path_indent) as usize;
     f.render_widget(
         Paragraph::new(Span::styled(
-            format!("  {}", truncate_text(&path, path_width)),
+            truncate_text(&path, path_width),
             Style::default().fg(p::DIM),
         )),
         Rect {
+            x: area.x + path_indent,
             y: area.y + 1,
+            width: area.width.saturating_sub(path_indent),
             height: 1,
             ..area
         },
@@ -1329,12 +1332,18 @@ fn truncate_text(value: &str, width: usize) -> String {
 }
 
 fn vfs_display_path(item: &VfsFileActivity) -> String {
-    if !item.path.is_empty() {
-        item.path.clone()
-    } else if !item.basename.is_empty() {
-        item.basename.clone()
-    } else {
+    let fallback = if item.basename.is_empty() {
         format!("inode {}", item.inode)
+    } else {
+        format!("{} [inode {}]", item.basename, item.inode)
+    };
+    if !item.path.is_empty() && item.path != fallback {
+        return item.path.clone();
+    }
+    if !item.basename.is_empty() {
+        format!("[unresolved] {}", item.basename)
+    } else {
+        "[unresolved] inode".into()
     }
 }
 
@@ -1914,12 +1923,19 @@ mod tests {
     }
 
     #[test]
-    fn vfs_paths_fall_back_to_basename_then_inode() {
+    fn vfs_paths_distinguish_resolved_paths_from_collector_fallbacks() {
         let mut item = hot_file(8, 1, 1.0, 0.0);
+        assert_eq!(vfs_display_path(&item), "/srv/data.bin");
+
+        item.path = "data.bin [inode 42]".into();
+        assert_eq!(vfs_display_path(&item), "[unresolved] data.bin");
+
         item.path.clear();
-        assert_eq!(vfs_display_path(&item), "data.bin");
+        assert_eq!(vfs_display_path(&item), "[unresolved] data.bin");
+
         item.basename.clear();
-        assert_eq!(vfs_display_path(&item), "inode 42");
+        item.path = "inode 42".into();
+        assert_eq!(vfs_display_path(&item), "[unresolved] inode");
     }
 
     #[test]
@@ -2397,7 +2413,43 @@ mod tests {
                 .collect::<String>()
         };
         assert!(line(0).ends_with("inode 217317381"));
-        assert!(line(1).starts_with("  /mnt/data/a/deliberately-long-file-name.db"));
+        assert!(line(1).starts_with("    /mnt/data/a/deliberately-long-file-name.db"));
+    }
+
+    #[test]
+    fn vfs_path_starts_under_read_label_at_compact_and_wide_widths() {
+        for (width, expected_x) in [(80, 4), (100, 8)] {
+            let mut item = hot_file(8, 1, 75.0, 25.0);
+            item.path = "/resolved/path".into();
+            let backend = TestBackend::new(width, 2);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| draw_vfs_entry(frame, frame.area(), &item, 100.0))
+                .expect("draw VFS entry");
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer.cell((expected_x, 0)).unwrap().symbol(), "R");
+            assert_eq!(buffer.cell((expected_x, 1)).unwrap().symbol(), "/");
+            assert!((0..expected_x).all(|x| buffer.cell((x, 1)).unwrap().symbol() == " "));
+        }
+    }
+
+    #[test]
+    fn vfs_entry_renders_unresolved_fallback_without_duplicate_inode() {
+        let mut item = hot_file(8, 1, 75.0, 25.0);
+        item.path = "data.bin [inode 42]".into();
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_vfs_entry(frame, frame.area(), &item, 100.0))
+            .expect("draw VFS entry");
+        let buffer = terminal.backend().buffer();
+        let row = (0..80)
+            .map(|x| buffer.cell((x, 1)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(row.trim().starts_with("[unresolved] data.bin"));
+        assert!(!row.contains("inode 42"));
     }
 
     #[test]
