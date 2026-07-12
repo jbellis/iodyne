@@ -512,8 +512,8 @@ mod tests {
                 "stale {removed:?} at {width}x{height}"
             );
         }
-        assert!(text.lines().any(|line| line.starts_with('+')));
-        assert!(text.lines().any(|line| line.starts_with('|')));
+        assert!(text.lines().any(|line| line.starts_with('┌')));
+        assert!(text.lines().any(|line| line.starts_with('│')));
     }
 
     #[test]

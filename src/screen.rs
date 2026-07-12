@@ -13,7 +13,6 @@ use std::os::unix::fs::MetadataExt;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::border::Set as BorderSet;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -47,17 +46,6 @@ const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 2;
 const COMPACT_DETAIL_HEIGHT: u16 = 23;
 const DIRECTION_DETAIL_HEIGHT: u16 = 14;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
-const ASCII_BORDER: BorderSet = BorderSet {
-    top_left: "+",
-    top_right: "+",
-    bottom_left: "+",
-    bottom_right: "+",
-    vertical_left: "|",
-    vertical_right: "|",
-    horizontal_top: "-",
-    horizontal_bottom: "-",
-};
-
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
         draw_empty(f, area);
@@ -79,17 +67,16 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     draw_master_detail(f, rows[1], app);
 }
 
-fn ascii_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+fn pane_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(title)
         .style(Style::default().bg(p::BG))
 }
 
 fn draw_empty(f: &mut Frame, area: Rect) {
-    let block = ascii_block(Span::styled(
+    let block = pane_block(Span::styled(
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ));
@@ -155,7 +142,7 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
     let selected = app.selected_io.min(visible.len() - 1);
     let (throughput_scale, iops_scale) = overview_workload_scales(&visible, app);
-    let overview_block = ascii_block(overview_title(app));
+    let overview_block = pane_block(overview_title(app));
     let overview_inner = overview_block.inner(sections[0]);
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
@@ -224,7 +211,7 @@ pub(crate) fn visible_device_count(app: &App) -> usize {
 }
 
 fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
-    let block = ascii_block(Span::styled(
+    let block = pane_block(Span::styled(
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ));
@@ -683,7 +670,7 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
         return;
     }
     let header = detail_header(&tick.device, &app.filesystems, &app.volumes);
-    let block = ascii_block(Span::styled(
+    let block = pane_block(Span::styled(
         header,
         Style::default()
             .fg(p::BR_WHITE)
@@ -820,7 +807,7 @@ fn draw_direction_detail(
         IoLane::Write => ("WRITE", p::CYAN),
     };
     let total = histogram.iter().sum::<u64>();
-    let block = ascii_block(Line::from(vec![
+    let block = pane_block(Line::from(vec![
         Span::raw(" "),
         Span::styled(
             name,
@@ -1239,7 +1226,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let block = ascii_block(Line::from(vec![
+    let block = pane_block(Line::from(vec![
         Span::styled(
             " VFS ",
             Style::default()
@@ -3099,20 +3086,27 @@ mod tests {
     }
 
     #[test]
-    fn pane_borders_are_literal_ascii() {
+    fn pane_borders_match_the_original_overview_style() {
         let backend = TestBackend::new(24, 4);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| frame.render_widget(ascii_block(" pane "), frame.area()))
+            .draw(|frame| frame.render_widget(pane_block(" pane "), frame.area()))
             .expect("draw pane");
         let buffer = terminal.backend().buffer();
 
         for (x, y) in [(0, 0), (23, 0), (0, 3), (23, 3)] {
-            assert_eq!(buffer.cell((x, y)).unwrap().symbol(), "+");
+            let expected = match (x, y) {
+                (0, 0) => "┌",
+                (23, 0) => "┐",
+                (0, 3) => "└",
+                (23, 3) => "┘",
+                _ => unreachable!(),
+            };
+            assert_eq!(buffer.cell((x, y)).unwrap().symbol(), expected);
         }
-        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "|");
-        assert_eq!(buffer.cell((23, 1)).unwrap().symbol(), "|");
-        assert_eq!(buffer.cell((12, 3)).unwrap().symbol(), "-");
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((23, 1)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((12, 3)).unwrap().symbol(), "─");
     }
 
     #[test]
