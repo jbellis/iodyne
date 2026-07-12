@@ -10,12 +10,6 @@ homepage = "https://github.com/matthart1983/iodyne"
 readme = "README.md"
 keywords = ["disk", "storage", "tui", "diagnostics", "observability"]
 categories = ["command-line-utilities"]
-exclude = [
-    # Demo assets aren't needed by anyone consuming the crate.
-    "demo.gif",
-    "demo.tape",
-]
-
 [[bin]]
 name = "iodyne"
 path = "src/main.rs"
