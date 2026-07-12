@@ -14,7 +14,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   meta = {
-    description = "Single-host, read-only disk diagnostics TUI — sibling to netwatch and syswatch";
+    description = "Single-screen, read-only disk IO, latency, topology, and health TUI";
     homepage = "https://github.com/matthart1983/diskwatch";
     license = lib.licenses.mit;
     mainProgram = "diskwatch";

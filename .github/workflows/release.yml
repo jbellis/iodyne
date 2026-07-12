@@ -147,7 +147,7 @@ jobs:
         run: |
           cat > homebrew-tap/Formula/diskwatch.rb <<EOF
           class Diskwatch < Formula
-            desc "Single-host disk diagnostics TUI — sibling to netwatch and syswatch"
+            desc "Single-screen, read-only disk IO, latency, topology, and health TUI"
             homepage "https://github.com/matthart1983/diskwatch"
             version "${VERSION}"
             license "MIT"
@@ -191,7 +191,7 @@ jobs:
             end
 
             test do
-              assert_match "diskwatch", shell_output("#{bin}/diskwatch --help 2>&1", 1)
+              assert_match "diskwatch", shell_output("#{bin}/diskwatch --help 2>&1", 0)
             end
           end
           EOF

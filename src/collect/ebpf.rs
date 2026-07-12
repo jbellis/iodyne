@@ -145,6 +145,20 @@ impl EbpfLatencyCollector {
         Self::load()
     }
 
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test() -> Self {
+        Self {
+            status: EbpfStatus::Unavailable("test fixture".into()),
+            vfs_status: EbpfStatus::Unavailable("test fixture".into()),
+            previous: HashMap::new(),
+            vfs_previous: HashMap::new(),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            latency_bpf: None,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            vfs_bpf: None,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn status(&self) -> &EbpfStatus {
         &self.status

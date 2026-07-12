@@ -17,14 +17,9 @@ use sysinfo::System;
 
 use crate::collect;
 use crate::config::Settings;
-use crate::tabs::{self, TabId, ALL_TABS};
 use crate::ui::chrome;
 use crate::ui::format::{set_unit_mode, UnitMode};
 use crate::ui::palette as p;
-
-pub struct Options {
-    pub start_tab: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveState {
@@ -41,7 +36,6 @@ pub struct HostInfo {
 }
 
 pub struct App {
-    pub active_tab: TabId,
     pub live: LiveState,
     pub host: HostInfo,
     pub devices: Vec<collect::DeviceTick>,
@@ -52,9 +46,6 @@ pub struct App {
     pub settings: Settings,
     pub show_settings: bool,
     pub smart: collect::SmartCollector,
-    pub insights: Vec<crate::insights::Insight>,
-    pub selected_device: usize,
-    pub selected_fs: usize,
     pub selected_io: usize,
     /// Last full enumeration (slow path — system_profiler + diskutil).
     last_metadata_refresh: Instant,
@@ -64,7 +55,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(start: TabId) -> Self {
+    fn new() -> Self {
         let settings = Settings::load();
         set_unit_mode(settings.unit_mode);
         let devices = collect::devices::collect();
@@ -74,11 +65,8 @@ impl App {
         let mut smart = collect::SmartCollector::new();
         smart.refresh_if_due(&devices);
         Self {
-            active_tab: start,
             live: LiveState::Live,
             host: read_host(devices.len()),
-            selected_device: 0,
-            selected_fs: 0,
             selected_io: 0,
             devices,
             filesystems,
@@ -88,7 +76,6 @@ impl App {
             settings,
             show_settings: false,
             smart,
-            insights: Vec::new(),
             last_metadata_refresh: Instant::now(),
             last_usage_refresh: Instant::now(),
             should_quit: false,
@@ -120,7 +107,7 @@ impl App {
         // internally. The eBPF backend still accounts for every request in
         // kernel between these polls.
         self.io.sample();
-        let visible_io = crate::tabs::io::visible_device_count(self);
+        let visible_io = crate::screen::visible_device_count(self);
         self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
 
         // Slower path: sysinfo-only — used bytes + mounts list at 1Hz.
@@ -128,9 +115,6 @@ impl App {
         if usage_elapsed >= Duration::from_millis(1000) {
             collect::devices::refresh_usage(&mut self.devices);
             self.filesystems = collect::filesystems::collect();
-            if self.selected_fs >= self.filesystems.len() && !self.filesystems.is_empty() {
-                self.selected_fs = self.filesystems.len() - 1;
-            }
             self.host.uptime_secs = System::uptime();
             self.last_usage_refresh = Instant::now();
         }
@@ -139,33 +123,16 @@ impl App {
             self.devices = collect::devices::collect();
             self.volumes = collect::volumes::collect();
             self.host.device_count = self.devices.len();
-            if self.selected_device >= self.devices.len() && !self.devices.is_empty() {
-                self.selected_device = self.devices.len() - 1;
-            }
             self.last_metadata_refresh = Instant::now();
         }
         // SMART has its own 5-minute cadence handled inside the collector;
         // we just nudge it on each tick.
         self.smart.refresh_if_due(&self.devices);
-
-        // Recompute insights each tick — pure functions over current
-        // state, so this is cheap.
-        self.insights = crate::insights::evaluate(
-            &self.devices,
-            &self.filesystems,
-            &self.io.latest,
-            &self.smart,
-        );
     }
 }
 
-pub fn run(opts: Options) -> Result<()> {
-    let start = opts
-        .start_tab
-        .as_deref()
-        .and_then(TabId::from_str)
-        .unwrap_or(TabId::Overview);
-    let mut app = App::new(start);
+pub fn run() -> Result<()> {
+    let mut app = App::new();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -224,31 +191,13 @@ fn handle_key(app: &mut App, key: KeyCode) {
                 }
             };
         }
-        KeyCode::Char('u') if app.active_tab == TabId::Io => {
-            app.toggle_io_unmounted();
+        KeyCode::Char('u') => app.toggle_io_unmounted(),
+        KeyCode::Up | KeyCode::Char('k') if app.selected_io > 0 => app.selected_io -= 1,
+        KeyCode::Down | KeyCode::Char('j')
+            if app.selected_io + 1 < crate::screen::visible_device_count(app) =>
+        {
+            app.selected_io += 1
         }
-        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-            let idx = (c as u8 - b'1') as usize;
-            if let Some(t) = ALL_TABS.get(idx) {
-                app.active_tab = *t;
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') => match app.active_tab {
-            TabId::Devices if app.selected_device > 0 => app.selected_device -= 1,
-            TabId::Fs if app.selected_fs > 0 => app.selected_fs -= 1,
-            TabId::Io if app.selected_io > 0 => app.selected_io -= 1,
-            _ => {}
-        },
-        KeyCode::Down | KeyCode::Char('j') => match app.active_tab {
-            TabId::Devices if app.selected_device + 1 < app.devices.len() => {
-                app.selected_device += 1
-            }
-            TabId::Fs if app.selected_fs + 1 < app.filesystems.len() => app.selected_fs += 1,
-            TabId::Io if app.selected_io + 1 < crate::tabs::io::visible_device_count(app) => {
-                app.selected_io += 1
-            }
-            _ => {}
-        },
         _ => {}
     }
 }
@@ -263,25 +212,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
-            Constraint::Length(2), // tab bar (labels + underline)
             Constraint::Min(1),    // content
             Constraint::Length(2), // footer (divider + text)
         ])
         .split(full);
 
     chrome::draw_header(f, layout[0], &app.host, app.live);
-    chrome::draw_tab_bar(f, layout[1], app.active_tab, app.insights.len());
     let content = Rect {
-        x: layout[2].x,
-        y: layout[2].y,
-        width: layout[2].width,
-        height: layout[2].height,
+        x: layout[1].x,
+        y: layout[1].y,
+        width: layout[1].width,
+        height: layout[1].height,
     };
-    tabs::draw(f, content, app);
+    crate::screen::draw(f, content, app);
     if app.show_settings {
         draw_settings_overlay(f, full, app);
     }
-    chrome::draw_footer(f, layout[3], &[]);
+    chrome::draw_footer(f, layout[2]);
 }
 
 fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -333,7 +280,7 @@ fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 " u ",
                 Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("IO panels    ", Style::default().fg(p::DIM)),
+            Span::styled("device view  ", Style::default().fg(p::DIM)),
             Span::styled(io_mode, Style::default().fg(p::FG)),
         ]),
         Line::from(Span::styled(
@@ -375,7 +322,15 @@ fn read_host(device_count: usize) -> HostInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::devices::{DeviceKind, DeviceTick};
+    use crate::collect::io::{
+        AwaitSample, DeviceHistory, IoCollector, IoTick, LatencyPct, MergeRates,
+        TracedLatencySample, WorkloadSample,
+    };
+    use crate::collect::smart::{SmartCollector, SmartTick};
+    use crate::collect::{FsTick, VolumeTick};
     use ratatui::backend::TestBackend;
+    use std::collections::VecDeque;
 
     #[test]
     fn devices_collector_returns_something() {
@@ -398,36 +353,192 @@ mod tests {
         }
     }
 
-    fn render_all_tabs(width: u16, height: u16) {
+    fn fixture_app(populated: bool) -> App {
+        let mut io = IoCollector::new_for_test();
+        if populated {
+            let workload = WorkloadSample {
+                read_iops: 120.0,
+                write_iops: 45.0,
+                read_bps: 24.0 * 1024.0 * 1024.0,
+                write_bps: 8.0 * 1024.0 * 1024.0,
+                read_request_bytes: Some(128.0 * 1024.0),
+                write_request_bytes: Some(64.0 * 1024.0),
+                merge_rates: MergeRates::Available {
+                    read_per_sec: 3.0,
+                    write_per_sec: 2.0,
+                },
+            };
+            let await_sample = AwaitSample {
+                read_us: Some(850.0),
+                write_us: Some(4_200.0),
+            };
+            io.latest.push(IoTick {
+                device: "sda".into(),
+                bps: workload.read_bps + workload.write_bps,
+                split: Some((workload.read_bps, workload.write_bps)),
+                iops: workload.read_iops + workload.write_iops,
+                iops_split: Some((workload.read_iops, workload.write_iops)),
+                avg_request_bytes: Some(96.0 * 1024.0),
+                queue_depth: Some(1.5),
+                await_sample,
+                latency_avg: Some((850.0, 4_200.0)),
+                latency_pct: Some(LatencyPct {
+                    p50_r: 700.0,
+                    p99_r: 1_800.0,
+                    p999_r: 2_100.0,
+                    p50_w: 3_500.0,
+                    p99_w: 9_000.0,
+                    p999_w: 12_000.0,
+                }),
+            });
+            io.history.insert(
+                "sda".into(),
+                DeviceHistory {
+                    combined: VecDeque::from(vec![workload.read_bps + workload.write_bps; 24]),
+                    workload_samples: VecDeque::from(vec![workload; 24]),
+                    await_samples: VecDeque::from(vec![await_sample; 24]),
+                    read_us: VecDeque::from(vec![850.0; 24]),
+                    write_us: VecDeque::from(vec![4_200.0; 24]),
+                },
+            );
+            let mut traced = TracedLatencySample::default();
+            traced.read[8] = 120;
+            traced.write[14] = 45;
+            io.traced_history
+                .insert("sda".into(), VecDeque::from(vec![traced; 24]));
+        }
+
+        let devices = vec![DeviceTick {
+            name: "sda".into(),
+            kind: DeviceKind::Ssd,
+            model: "Fixture SSD".into(),
+            bus: "SATA".into(),
+            size_bytes: 1_000_000_000_000,
+            used_bytes: 400_000_000_000,
+            is_removable: false,
+            firmware: Some("1.0".into()),
+            serial: Some("fixture".into()),
+            smart_ok: Some(true),
+            idle: false,
+        }];
+        let filesystems = vec![FsTick {
+            mount: "/mnt/data".into(),
+            device: "/dev/sda1".into(),
+            fs_type: "ext4".into(),
+            size_bytes: 1_000_000_000_000,
+            used_bytes: 400_000_000_000,
+            avail_bytes: 600_000_000_000,
+            inode_pct: Some(12),
+            is_removable: false,
+            is_system: false,
+        }];
+        let mut smart = SmartCollector::new();
+        smart.by_device.insert(
+            "sda".into(),
+            SmartTick {
+                device: "sda".into(),
+                temperature_c: Some(34),
+                power_on_hours: Some(1_200),
+                percentage_used: Some(7),
+                available_spare: Some(100),
+                ..Default::default()
+            },
+        );
+
+        App {
+            live: LiveState::Live,
+            host: HostInfo {
+                hostname: "fixture".into(),
+                os: "TestOS x86_64".into(),
+                uptime_secs: 3_600,
+                device_count: 1,
+            },
+            devices,
+            filesystems,
+            volumes: VolumeTick::default(),
+            io,
+            io_show_unmounted: false,
+            settings: Settings::default(),
+            show_settings: false,
+            smart,
+            selected_io: 0,
+            last_metadata_refresh: Instant::now(),
+            last_usage_refresh: Instant::now(),
+            should_quit: false,
+        }
+    }
+
+    fn render_screen(app: &App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut term = Terminal::new(backend).expect("terminal");
-        let mut app = App::new(TabId::Overview);
-        for tab in ALL_TABS {
-            app.active_tab = *tab;
-            term.draw(|f| super::draw(f, &app)).expect("draw");
+        term.draw(|f| super::draw(f, app)).expect("draw");
+        let buffer = term.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_populated_screen(width: u16, height: u16) {
+        let text = render_screen(&fixture_app(true), width, height);
+        for expected in [
+            "Device",
+            "Free",
+            "Activity",
+            "sda detail",
+            "READ",
+            "WRITE",
+            "Await",
+            "VFS activity",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected:?} at {width}x{height}"
+            );
         }
     }
 
     #[test]
-    fn renders_at_design_size() {
-        render_all_tabs(130, 36);
+    fn populated_screen_renders_overview_and_detail_at_responsive_sizes() {
+        assert_populated_screen(130, 36);
+        assert_populated_screen(110, 30);
     }
 
     #[test]
-    fn renders_at_tall_size() {
-        render_all_tabs(130, 40);
+    fn empty_and_undersized_screens_render_without_panicking() {
+        let app = fixture_app(false);
+        assert!(render_screen(&app, 130, 40).contains("No IO data yet"));
+        let _ = render_screen(&app, 60, 20);
     }
 
     #[test]
-    fn renders_at_minimum_supported_size() {
-        // README declares responsive ≥ 110×30.
-        render_all_tabs(110, 30);
-    }
+    fn numeric_keys_have_no_navigation_behavior() {
+        let mut app = fixture_app(false);
+        let before = (
+            app.selected_io,
+            app.io_show_unmounted,
+            app.live,
+            app.show_settings,
+            app.should_quit,
+        );
 
-    #[test]
-    fn renders_at_undersized_terminal_without_panic() {
-        // We don't promise pretty output below the supported floor, only
-        // that we don't panic.
-        render_all_tabs(60, 20);
+        for key in '0'..='9' {
+            handle_key(&mut app, KeyCode::Char(key));
+        }
+
+        assert_eq!(
+            before,
+            (
+                app.selected_io,
+                app.io_show_unmounted,
+                app.live,
+                app.show_settings,
+                app.should_quit,
+            )
+        );
     }
 }

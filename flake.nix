@@ -1,5 +1,5 @@
 {
-  description = "diskwatch — single-host disk diagnostics TUI";
+  description = "diskwatch — live disk IO, latency, topology, and health TUI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

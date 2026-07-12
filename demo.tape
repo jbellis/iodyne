@@ -9,47 +9,29 @@ Set TypingSpeed 30ms
 Set Framerate 18
 Set Padding 10
 
-# Boot diskwatch — let the IO ring warm before recording starts.
+# Let histories warm before recording the single-screen workflow.
 Hide
 Type "./target/release/diskwatch"
 Enter
-Sleep 5s
+Sleep 8s
 Show
 
-# [1] Overview — KPI tiles, device summary, AGG IO sparkline,
-# insights strip, segmented capacity bar.
-Sleep 5s
-
-# [2] Devices — table with model / firmware / serial, used %, SMART.
-Type "2"
+# Move selected-device detail through the overview.
+Down@200ms 2
 Sleep 4s
-Down@200ms 1
+Up@200ms 1
+Sleep 3s
+
+# Show the persisted display settings.
+Type ","
+Sleep 3s
+Type ","
 Sleep 2s
 
-# [3] Volumes — APFS container tree (macOS) / mdraid arrays (Linux).
-Type "3"
-Sleep 4s
-
-# [4] Filesystems — mounts with inline usage bars + thresholds.
-Type "4"
-Sleep 4s
-Down@200ms 3
+# Demonstrate the live/paused state.
+Type "p"
 Sleep 2s
-
-# [5] IO — per-device throughput sparkline + p50/p99 latency.
-Type "5"
-Sleep 5s
-
-# [6] SMART — full attrs if smartctl on PATH; degraded banner otherwise.
-Type "6"
-Sleep 4s
-
-# [7] Insights — plain-English anomaly cards.
-Type "7"
-Sleep 4s
-
-# Back to overview to land the demo.
-Type "1"
+Type "p"
 Sleep 3s
 
 Type "q"

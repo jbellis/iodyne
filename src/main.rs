@@ -6,21 +6,16 @@ use clap::Parser;
 mod app;
 mod collect;
 mod config;
-mod insights;
-mod tabs;
+mod screen;
 mod ui;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "diskwatch",
     version,
-    about = "Single-host disk diagnostics TUI"
+    about = "Live per-device disk IO, latency, topology, and health TUI"
 )]
 struct Cli {
-    /// Start on a specific tab (overview, devices, volumes, fs, io, smart, insights).
-    #[arg(long)]
-    tab: Option<String>,
-
     /// Print collected state and exit without launching the TUI.
     /// Useful for diagnosing what each collector is seeing.
     #[arg(long)]
@@ -41,7 +36,7 @@ fn main() -> Result<()> {
             result => result,
         };
     }
-    app::run(app::Options { start_tab: cli.tab })
+    app::run()
 }
 
 fn run_diag() -> Result<()> {

@@ -1,11 +1,8 @@
-//! Formatting + small UI helpers shared across tabs.
+//! Formatting helpers shared by the screen and settings.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
-
-use crate::ui::palette as p;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -141,49 +138,5 @@ fn pretty_amount(v: f64) -> String {
         format!("{:.0}", v)
     } else {
         format!("{:.1}", v)
-    }
-}
-
-pub fn pad_right(s: &str, n: usize) -> String {
-    let len = s.chars().count();
-    if len >= n {
-        s.chars().take(n).collect()
-    } else {
-        let mut out = s.to_string();
-        out.push_str(&" ".repeat(n - len));
-        out
-    }
-}
-
-pub fn pad_left(s: &str, n: usize) -> String {
-    let len = s.chars().count();
-    if len >= n {
-        s.chars().take(n).collect()
-    } else {
-        let mut out = " ".repeat(n - len);
-        out.push_str(s);
-        out
-    }
-}
-
-/// `green < 80, yellow 80-89, red >= 90` — matches JSX usage-bar thresholds.
-pub fn usage_color(used_pct: u32) -> Color {
-    if used_pct >= 90 {
-        p::RED
-    } else if used_pct >= 80 {
-        p::YELLOW
-    } else {
-        p::FG
-    }
-}
-
-/// Same thresholds, but returns the bar fill color (green when ok).
-pub fn usage_bar_color(used_pct: u32) -> Color {
-    if used_pct >= 90 {
-        p::RED
-    } else if used_pct >= 80 {
-        p::YELLOW
-    } else {
-        p::GREEN
     }
 }

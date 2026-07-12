@@ -15,7 +15,7 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-pub use devices::{DeviceKind, DeviceTick};
+pub use devices::DeviceTick;
 pub use filesystems::FsTick;
 pub use io::{AwaitSample, IoCollector, IoTick, MergeRates, TracedLatencySample, WorkloadSample};
 pub use smart::SmartCollector;

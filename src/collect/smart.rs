@@ -57,10 +57,6 @@ impl SmartCollector {
         }
     }
 
-    pub fn smartctl_available(&self) -> bool {
-        matches!(self.have_smartctl, Some(true))
-    }
-
     /// Called periodically (every 5 minutes per the technical doc —
     /// polling more often shortens drive life on some models). Refreshes
     /// SMART data for every device in the list.

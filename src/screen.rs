@@ -2635,7 +2635,7 @@ mod tests {
     fn logical_devices_do_not_inherit_member_device_or_smart_facts() {
         let member = DeviceTick {
             name: "sda".into(),
-            kind: crate::collect::DeviceKind::Ssd,
+            kind: crate::collect::devices::DeviceKind::Ssd,
             model: "member model".into(),
             bus: "SATA".into(),
             size_bytes: 1,
@@ -2672,7 +2672,7 @@ mod tests {
     fn device_filesystem_and_smart_facts_only_emit_available_evidence() {
         let device = DeviceTick {
             name: "sda".into(),
-            kind: crate::collect::DeviceKind::Ssd,
+            kind: crate::collect::devices::DeviceKind::Ssd,
             model: "FastDisk".into(),
             bus: "SATA".into(),
             size_bytes: 1 << 40,

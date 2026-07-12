@@ -318,6 +318,20 @@ impl IoCollector {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self {
+            last_sample: Instant::now(),
+            prev_totals: HashMap::new(),
+            history: HashMap::new(),
+            traced_history: HashMap::new(),
+            latest: Vec::new(),
+            hot_files: Vec::new(),
+            vfs_activity_window: VfsActivityWindow::default(),
+            latency_probe: EbpfLatencyCollector::unavailable_for_test(),
+        }
+    }
+
     pub fn latency_source(&self) -> LatencySource {
         self.latency_probe.source()
     }
@@ -945,26 +959,6 @@ fn percentiles(samples: &VecDeque<f64>) -> (f64, f64, f64) {
         v[idx.min(v.len() - 1)]
     };
     (pct(50.0), pct(99.0), pct(99.9))
-}
-
-/// Sums device rates for the Overview "AGG IO" panel.
-pub fn aggregate(latest: &[IoTick]) -> (f64, f64) {
-    let combined: f64 = latest.iter().map(|t| t.bps).sum();
-    let write: f64 = latest.iter().filter_map(|t| t.split.map(|(_, w)| w)).sum();
-    (combined, write)
-}
-
-/// Worst p99 across all devices. Reads the max of read-p99 and
-/// write-p99 per device, then takes the max across devices.
-pub fn worst_p99_us(latest: &[IoTick]) -> Option<f64> {
-    let mut worst: Option<f64> = None;
-    for t in latest {
-        if let Some(pct) = t.latency_pct {
-            let candidate = pct.p99_r.max(pct.p99_w);
-            worst = Some(worst.map_or(candidate, |w| w.max(candidate)));
-        }
-    }
-    worst
 }
 
 #[cfg(test)]
