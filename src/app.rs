@@ -8,15 +8,18 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::widgets::Paragraph;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use sysinfo::System;
 
 use crate::collect;
+use crate::config::Settings;
 use crate::tabs::{self, TabId, ALL_TABS};
 use crate::ui::chrome;
+use crate::ui::format::{set_unit_mode, UnitMode};
 use crate::ui::palette as p;
 
 pub struct Options {
@@ -45,6 +48,9 @@ pub struct App {
     pub filesystems: Vec<collect::FsTick>,
     pub volumes: collect::VolumeTick,
     pub io: collect::IoCollector,
+    pub io_show_unmounted: bool,
+    pub settings: Settings,
+    pub show_settings: bool,
     pub smart: collect::SmartCollector,
     pub hot_files: collect::hot_files::HotFileWatcher,
     pub insights: Vec<crate::insights::Insight>,
@@ -59,6 +65,8 @@ pub struct App {
 
 impl App {
     fn new(start: TabId) -> Self {
+        let settings = Settings::load();
+        set_unit_mode(settings.unit_mode);
         let devices = collect::devices::collect();
         let filesystems = collect::filesystems::collect();
         let volumes = collect::volumes::collect();
@@ -78,6 +86,9 @@ impl App {
             filesystems,
             volumes,
             io,
+            io_show_unmounted: settings.io_show_unmounted,
+            settings,
+            show_settings: false,
             smart,
             hot_files,
             insights: Vec::new(),
@@ -85,6 +96,22 @@ impl App {
             last_usage_refresh: Instant::now(),
             should_quit: false,
         }
+    }
+
+    fn persist_settings(&mut self) {
+        self.settings.io_show_unmounted = self.io_show_unmounted;
+        set_unit_mode(self.settings.unit_mode);
+        self.settings.save();
+    }
+
+    fn toggle_unit_mode(&mut self) {
+        self.settings.unit_mode = self.settings.unit_mode.toggle();
+        self.persist_settings();
+    }
+
+    fn toggle_io_unmounted(&mut self) {
+        self.io_show_unmounted = !self.io_show_unmounted;
+        self.persist_settings();
     }
 
     fn tick(&mut self) {
@@ -178,13 +205,28 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
 }
 
 fn handle_key(app: &mut App, key: KeyCode) {
+    if app.show_settings {
+        match key {
+            KeyCode::Esc | KeyCode::Char(',') => app.show_settings = false,
+            KeyCode::Char('b') => app.toggle_unit_mode(),
+            KeyCode::Char('u') => app.toggle_io_unmounted(),
+            KeyCode::Char('q') => app.should_quit = true,
+            _ => {}
+        }
+        return;
+    }
+
     match key {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char(',') => app.show_settings = true,
         KeyCode::Char('p') => {
             app.live = match app.live {
                 LiveState::Live => LiveState::Paused,
                 LiveState::Paused => LiveState::Live,
             };
+        }
+        KeyCode::Char('u') if app.active_tab == TabId::Io => {
+            app.toggle_io_unmounted();
         }
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let idx = (c as u8 - b'1') as usize;
@@ -233,7 +275,80 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         height: layout[2].height,
     };
     tabs::draw(f, content, app);
+    if app.show_settings {
+        draw_settings_overlay(f, full, app);
+    }
     chrome::draw_footer(f, layout[3], &[]);
+}
+
+fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let w = area.width.min(64);
+    let h = 10.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p::CYAN).bg(p::BG))
+        .title(Span::styled(
+            " Settings ",
+            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(p::BG));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let io_mode = if app.io_show_unmounted {
+        "all devices"
+    } else {
+        "mounted only"
+    };
+    let unit_hint = match app.settings.unit_mode {
+        UnitMode::Binary => "b toggles to decimal KB/MB",
+        UnitMode::Decimal => "b toggles to binary KiB/MiB",
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " b ",
+                Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("units        ", Style::default().fg(p::DIM)),
+            Span::styled(app.settings.unit_mode.label(), Style::default().fg(p::FG)),
+        ]),
+        Line::from(Span::styled(
+            format!("   {unit_hint}"),
+            Style::default().fg(p::DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " u ",
+                Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("IO panels    ", Style::default().fg(p::DIM)),
+            Span::styled(io_mode, Style::default().fg(p::FG)),
+        ]),
+        Line::from(Span::styled(
+            "   persists to ~/.config/diskwatch/config.json",
+            Style::default().fg(p::DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Esc or , closes settings",
+            Style::default().fg(p::DIM),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(p::BG)),
+        inner,
+    );
 }
 
 fn read_host(device_count: usize) -> HostInfo {

@@ -182,7 +182,6 @@ pub fn draw_footer(f: &mut Frame, area: Rect, extra: &[(char, &str)]) {
             ('R', "Rec"),
         ],
         &[('/', "Filter"), ('q', "Quit"), ('1', "Tab")],
-        &[('?', "Help")],
     ];
     for (gi, g) in groups.iter().enumerate() {
         if gi > 0 {

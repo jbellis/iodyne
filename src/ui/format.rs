@@ -1,12 +1,88 @@
 //! Formatting + small UI helpers shared across tabs.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 
 use crate::ui::palette as p;
 
-/// Decimal-byte formatter (TB / GB / MB / KB / B).
-/// Matches `fmtBytes` in `grid.jsx` — drives use base-10, not base-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnitMode {
+    Binary,
+    Decimal,
+}
+
+impl Default for UnitMode {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl UnitMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitMode::Binary => "binary (KiB/MiB)",
+            UnitMode::Decimal => "decimal (KB/MB)",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            UnitMode::Binary => UnitMode::Decimal,
+            UnitMode::Decimal => UnitMode::Binary,
+        }
+    }
+}
+
+static UNIT_MODE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_unit_mode(mode: UnitMode) {
+    UNIT_MODE.store(
+        match mode {
+            UnitMode::Binary => 0,
+            UnitMode::Decimal => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn unit_mode() -> UnitMode {
+    match UNIT_MODE.load(Ordering::Relaxed) {
+        1 => UnitMode::Decimal,
+        _ => UnitMode::Binary,
+    }
+}
+
+/// Byte formatter. Defaults to binary units (TiB / GiB / MiB / KiB / B);
+/// decimal units are available through persisted settings.
 pub fn fmt_size(b: u64) -> String {
+    match unit_mode() {
+        UnitMode::Binary => fmt_size_binary(b),
+        UnitMode::Decimal => fmt_size_decimal(b),
+    }
+}
+
+fn fmt_size_binary(b: u64) -> String {
+    const TIB: u64 = 1 << 40;
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
+    if b >= TIB {
+        format!("{:.1} TiB", b as f64 / TIB as f64)
+    } else if b >= GIB {
+        format!("{:.0} GiB", b as f64 / GIB as f64)
+    } else if b >= MIB {
+        format!("{:.0} MiB", b as f64 / MIB as f64)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b as f64 / KIB as f64)
+    } else {
+        format!("{} B", b)
+    }
+}
+
+fn fmt_size_decimal(b: u64) -> String {
     const TB: u64 = 1_000_000_000_000;
     const GB: u64 = 1_000_000_000;
     const MB: u64 = 1_000_000;
@@ -26,6 +102,28 @@ pub fn fmt_size(b: u64) -> String {
 
 /// Bytes-per-second formatter for IO rates.
 pub fn fmt_rate(bps: f64) -> String {
+    match unit_mode() {
+        UnitMode::Binary => fmt_rate_binary(bps),
+        UnitMode::Decimal => fmt_rate_decimal(bps),
+    }
+}
+
+fn fmt_rate_binary(bps: f64) -> String {
+    const MIB: f64 = 1_048_576.0;
+    const KIB: f64 = 1024.0;
+    if bps < 1.0 {
+        return "   -- ".to_string();
+    }
+    if bps >= MIB {
+        format!("{:>5} MiB/s", pretty_amount(bps / MIB))
+    } else if bps >= KIB {
+        format!("{:>5} KiB/s", pretty_amount(bps / KIB))
+    } else {
+        format!("{:>5.0}  B/s", bps)
+    }
+}
+
+fn fmt_rate_decimal(bps: f64) -> String {
     if bps < 1.0 {
         return "   -- ".to_string();
     }
@@ -35,6 +133,14 @@ pub fn fmt_rate(bps: f64) -> String {
         format!("{:>5.1} KB/s", bps / 1_000.0)
     } else {
         format!("{:>5.0}  B/s", bps)
+    }
+}
+
+fn pretty_amount(v: f64) -> String {
+    if v >= 10.0 || (v.round() - v).abs() < 0.05 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.1}", v)
     }
 }
 

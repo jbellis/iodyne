@@ -65,6 +65,8 @@ fn draw_empty(f: &mut Frame, area: Rect) {
 fn draw_summary_line(f: &mut Frame, area: Rect, app: &App) {
     let (agg, write) = crate::collect::io::aggregate(&app.io.latest);
     let any_split = app.io.latest.iter().any(|t| t.split.is_some());
+    let visible = visible_io_ticks(app);
+    let panel_scale = io_panel_scale(app, &visible);
     let read = agg - write;
     let mut spans = vec![
         Span::raw(" "),
@@ -104,6 +106,25 @@ fn draw_summary_line(f: &mut Frame, area: Rect, app: &App) {
         ),
         Style::default().fg(p::DIM),
     ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled("view ", Style::default().fg(p::DIM)));
+    spans.push(Span::styled(
+        if app.io_show_unmounted {
+            "all"
+        } else {
+            "mounted"
+        },
+        Style::default()
+            .fg(p::BR_WHITE)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" (u toggles)", Style::default().fg(p::DIM)));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled("scale ", Style::default().fg(p::DIM)));
+    spans.push(Span::styled(
+        fmt_rate(panel_scale),
+        Style::default().fg(p::FG),
+    ));
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(p::BG)),
         Rect {
@@ -116,11 +137,84 @@ fn draw_summary_line(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_panel_grid(f: &mut Frame, area: Rect, app: &App) {
-    let panels = panel_areas(area, app.io.latest.len());
-    for (panel_area, tick) in panels.into_iter().zip(app.io.latest.iter()) {
-        let history = app.io.history.get(&tick.device);
-        draw_panel(f, panel_area, tick, history, &app.filesystems);
+    let visible = visible_io_ticks(app);
+    if visible.is_empty() {
+        draw_no_mounted_io(f, area);
+        return;
     }
+
+    let panel_scale = io_panel_scale(app, &visible);
+    let panels = panel_areas(area, visible.len());
+    for (panel_area, tick) in panels.into_iter().zip(visible.into_iter()) {
+        let history = app.io.history.get(&tick.device);
+        draw_panel(
+            f,
+            panel_area,
+            tick,
+            history,
+            &app.filesystems,
+            app.io_show_unmounted,
+            panel_scale,
+        );
+    }
+}
+
+fn visible_io_ticks<'a>(app: &'a App) -> Vec<&'a IoTick> {
+    app.io
+        .latest
+        .iter()
+        .filter(|tick| {
+            app.io_show_unmounted || io_device_is_mounted(&tick.device, &app.filesystems)
+        })
+        .collect()
+}
+
+fn io_panel_scale(app: &App, visible: &[&IoTick]) -> f64 {
+    let max = visible.iter().fold(0.0_f64, |max, tick| {
+        let latest = max.max(tick.bps);
+        let history_max = app
+            .io
+            .history
+            .get(&tick.device)
+            .map(|h| h.combined.iter().copied().fold(0.0_f64, f64::max))
+            .unwrap_or(0.0);
+        latest.max(history_max)
+    });
+
+    power_of_two_rate_ceiling(max)
+}
+
+fn power_of_two_rate_ceiling(rate: f64) -> f64 {
+    if !rate.is_finite() || rate <= 1.0 {
+        return 1.0;
+    }
+    2_f64.powi(rate.log2().ceil() as i32)
+}
+
+fn draw_no_mounted_io(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p::FAINT).bg(p::BG))
+        .title(Span::styled(
+            " IO ",
+            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(p::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  No mounted IO devices in the current sample. Press u to show unmounted devices.",
+            Style::default().fg(p::DIM),
+        )))
+        .style(Style::default().bg(p::BG)),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
 }
 
 fn panel_areas(area: Rect, n: usize) -> Vec<Rect> {
@@ -254,9 +348,12 @@ fn draw_panel(
     tick: &IoTick,
     history: Option<&DeviceHistory>,
     filesystems: &[FsTick],
+    show_unmounted: bool,
+    panel_scale: f64,
 ) {
     let title = match mounts_for_device(&tick.device, filesystems) {
         Some(mounts) => format!(" {}  {} ", tick.device, mounts),
+        None if show_unmounted => format!(" {}  [unmounted] ", tick.device),
         None => format!(" {} ", tick.device),
     };
     let block = Block::default()
@@ -324,7 +421,9 @@ fn draw_panel(
         let panel_inner_h = inner.height.saturating_sub(2);
         let data: Vec<f64> = h.combined.iter().copied().collect();
         f.render_widget(
-            BaselineSparkline::new(&data).style(Style::default().fg(p::CYAN).bg(p::BG)),
+            BaselineSparkline::new(&data)
+                .max(panel_scale)
+                .style(Style::default().fg(p::CYAN).bg(p::BG)),
             Rect {
                 x: inner.x + 1,
                 y: inner.y + 2,
@@ -336,10 +435,9 @@ fn draw_panel(
 }
 
 fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
-    let mut mounts: Vec<&str> = filesystems
+    let mut mounts: Vec<String> = filesystems
         .iter()
-        .filter(|fs| fs_belongs_to_device(&fs.device, device))
-        .map(|fs| fs.mount.as_str())
+        .filter_map(|fs| mount_label_for_device(fs, device))
         .collect();
     mounts.sort_unstable();
     mounts.dedup();
@@ -353,7 +451,7 @@ fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
     let mut label = mounts
         .iter()
         .take(MAX_MOUNTS)
-        .copied()
+        .map(|s| s.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     if extra > 0 {
@@ -362,11 +460,92 @@ fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
     Some(label)
 }
 
-fn fs_belongs_to_device(fs_device: &str, io_device: &str) -> bool {
-    let fs = disk_name(fs_device);
-    let io = disk_name(io_device);
+fn io_device_is_mounted(device: &str, filesystems: &[FsTick]) -> bool {
+    filesystems
+        .iter()
+        .any(|fs| mount_label_for_device(fs, device).is_some())
+}
 
-    fs == io || whole_disk_name(fs) == io
+fn mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
+    if let Some(label) = direct_mount_label_for_device(fs, io_device) {
+        return Some(label);
+    }
+
+    let fs_device = disk_name(&fs.device);
+    let stacked = stacked_members(fs_device)?;
+    mount_label_for_device_with_members(fs, io_device, &stacked)
+}
+
+fn direct_mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
+    let fs_device = disk_name(&fs.device);
+    let io = disk_name(io_device);
+    if fs_device == io || whole_disk_name(fs_device) == io {
+        return Some(fs.mount.clone());
+    }
+    None
+}
+
+fn mount_label_for_device_with_members(
+    fs: &FsTick,
+    io_device: &str,
+    members: &[String],
+) -> Option<String> {
+    if direct_mount_label_for_device(fs, io_device).is_some() {
+        return Some(fs.mount.clone());
+    }
+
+    let fs_device = disk_name(&fs.device);
+    let io = disk_name(io_device);
+    if members.iter().any(|member| member == io) {
+        return Some(format!("{} via {}", fs.mount, fs_device));
+    }
+    None
+}
+
+fn stacked_members(device: &str) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        sysfs_stacked_members(device)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_stacked_members(device: &str) -> Option<Vec<String>> {
+    fn expand(name: &str, depth: u8, out: &mut Vec<String>) {
+        let slaves_dir = format!("/sys/block/{}/slaves", name);
+        let entries: Vec<String> = std::fs::read_dir(&slaves_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if entries.is_empty() || depth == 0 {
+            out.push(whole_disk_name(name).to_string());
+            return;
+        }
+        for slave in entries {
+            expand(whole_disk_name(&slave), depth - 1, out);
+        }
+    }
+
+    let kernel_name = device.trim_start_matches("/dev/");
+    let slaves_dir = format!("/sys/block/{}/slaves", kernel_name);
+    if !std::path::Path::new(&slaves_dir).is_dir() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    expand(kernel_name, 4, &mut out);
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 fn disk_name(device: &str) -> &str {
@@ -430,6 +609,19 @@ mod tests {
         assert_eq!(
             mounts_for_device("sda", &filesystems),
             Some("/, /home".to_string())
+        );
+        assert!(io_device_is_mounted("sda", &filesystems));
+        assert!(!io_device_is_mounted("sdb", &filesystems));
+    }
+
+    #[test]
+    fn labels_stacked_mounts_via_container_device() {
+        let filesystems = vec![fs("/dev/md0", "/mnt/optane")];
+        let members = vec!["sdd".to_string(), "sde".to_string()];
+
+        assert_eq!(
+            mount_label_for_device_with_members(&filesystems[0], "sdd", &members),
+            Some("/mnt/optane via md0".to_string())
         );
     }
 
@@ -496,5 +688,14 @@ mod tests {
 
         assert_eq!(panels.len(), 4);
         assert!(panels.iter().all(|panel| panel.height >= MIN_PANEL_HEIGHT));
+    }
+
+    #[test]
+    fn scale_rounds_up_to_power_of_two_rates() {
+        assert_eq!(power_of_two_rate_ceiling(0.0), 1.0);
+        assert_eq!(power_of_two_rate_ceiling(1.0), 1.0);
+        assert_eq!(power_of_two_rate_ceiling(2.0), 2.0);
+        assert_eq!(power_of_two_rate_ceiling(3.0), 4.0);
+        assert_eq!(power_of_two_rate_ceiling(1025.0), 2048.0);
     }
 }

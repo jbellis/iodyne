@@ -340,6 +340,8 @@ fn draw_io_sparkline(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let (agg, _) = crate::collect::io::aggregate(&app.io.latest);
+    let buckets = aggregate_history(app);
+    let scale = power_of_two_rate_ceiling(buckets.iter().copied().fold(agg, f64::max));
     let summary = Line::from(vec![
         Span::raw(" "),
         Span::styled(
@@ -348,6 +350,9 @@ fn draw_io_sparkline(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled("all devices", Style::default().fg(p::DIM)),
+        Span::raw("   "),
+        Span::styled("scale ", Style::default().fg(p::DIM)),
+        Span::styled(fmt_rate(scale), Style::default().fg(p::FG)),
     ]);
     f.render_widget(
         Paragraph::new(summary).style(Style::default().bg(p::BG)),
@@ -362,9 +367,10 @@ fn draw_io_sparkline(f: &mut Frame, area: Rect, app: &App) {
     // Aggregate sparkline across all devices. One cell per sample,
     // with a `▁` baseline filling any leading cells that don't yet
     // have data (rather than upsampling or padding zeros).
-    let buckets = aggregate_history(app);
     f.render_widget(
-        BaselineSparkline::new(&buckets).style(Style::default().fg(p::CYAN).bg(p::BG)),
+        BaselineSparkline::new(&buckets)
+            .max(scale)
+            .style(Style::default().fg(p::CYAN).bg(p::BG)),
         Rect {
             x: inner.x + 1,
             y: inner.y + 1,
@@ -389,6 +395,13 @@ fn aggregate_history(app: &App) -> Vec<f64> {
         }
     }
     buckets
+}
+
+fn power_of_two_rate_ceiling(rate: f64) -> f64 {
+    if !rate.is_finite() || rate <= 1.0 {
+        return 1.0;
+    }
+    2_f64.powi(rate.log2().ceil() as i32)
 }
 
 // ---------- bottom strip: insights + hot files note ----------
