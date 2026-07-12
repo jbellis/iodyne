@@ -471,17 +471,27 @@ fn draw_insights_summary(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
+    let has_entry_room = area.height.saturating_sub(2) >= 2;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(Span::styled(
-            " VFS ACTIVITY  rolling 10s · requested rates · ops/s ",
+            if has_entry_room {
+                " VFS ACTIVITY  rolling 10s · requested rates · ops/s "
+            } else {
+                " VFS ACTIVITY · need 2 data rows "
+            },
             Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(p::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let capacity = crate::tabs::io::vfs_entry_capacity(inner.height);
+    if capacity == 0 {
+        draw_vfs_status(f, inner, "need 2 rows to show VFS activity");
         return;
     }
     if app.io.hot_files_source() != VfsActivitySource::EbpfRequestedBytes {
@@ -493,16 +503,16 @@ fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
         draw_vfs_status(f, inner, "no VFS activity in the last 10s");
         return;
     }
-    let visible: Vec<_> = entries.into_iter().take(inner.height as usize).collect();
+    let visible: Vec<_> = entries.into_iter().take(capacity).collect();
     let scale = crate::tabs::io::vfs_activity_scale(&visible);
     for (row, item) in visible.into_iter().enumerate() {
-        crate::tabs::io::draw_vfs_row(
+        crate::tabs::io::draw_vfs_entry(
             f,
             Rect {
                 x: inner.x,
-                y: inner.y + row as u16,
+                y: inner.y + row as u16 * 2,
                 width: inner.width,
-                height: 1,
+                height: 2,
             },
             item,
             scale,
