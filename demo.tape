@@ -44,12 +44,8 @@ Sleep 5s
 Type "6"
 Sleep 4s
 
-# [7] Hot Files — FSEvents-backed write watcher.
+# [7] Insights — plain-English anomaly cards.
 Type "7"
-Sleep 4s
-
-# [8] Insights — plain-English anomaly cards.
-Type "8"
 Sleep 4s
 
 # Back to overview to land the demo.

@@ -1,9 +1,10 @@
 pub mod devices;
 pub mod filesystems;
-pub mod hot_files;
 pub mod io;
 pub mod smart;
 pub mod volumes;
+
+pub mod ebpf;
 
 #[cfg(target_os = "macos")]
 pub mod iokit;
@@ -16,6 +17,6 @@ pub mod linux;
 
 pub use devices::{DeviceKind, DeviceTick};
 pub use filesystems::FsTick;
-pub use io::{DeviceHistory, IoCollector, IoTick};
+pub use io::{AwaitSample, IoCollector, IoTick, MergeRates, TracedLatencySample, WorkloadSample};
 pub use smart::SmartCollector;
 pub use volumes::VolumeTick;

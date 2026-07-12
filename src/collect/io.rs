@@ -1,38 +1,66 @@
-//! Per-device IO sampling at 5Hz.
+//! Per-device IO sampling in one-second display buckets.
 //!
 //! Both supported platforms expose cumulative split-direction byte +
-//! operation + service-time counters:
+//! operation + request-time counters:
 //! - **macOS**: `IOBlockStorageDriver` Statistics dict via
 //!   `collect::iokit` (`ioreg -c IOBlockStorageDriver -r -l -w 0`).
 //! - **Linux**: `/proc/diskstats` columns 5/9 (sectors) and 6/10
 //!   (milliseconds spent on IO).
 //!
-//! Each sample at 5Hz computes the avg per-op service time (Total Time
-//! Δ / Operations Δ) for the interval. We retain the last
-//! `WINDOW_SAMPLES` of those observations per device and surface
+//! Each sample computes interval-average await (Total Time Δ /
+//! Operations Δ). Await includes both queue and device service time;
+//! it is not device service time alone. We retain the last
+//! `LATENCY_WINDOW` of those active-tick observations per device and surface
 //! `p50 / p99 / p999` against that rolling window.
 //!
 //! **Honest scope:** these are *percentiles of per-tick averages*, not
 //! of individual operations. They catch sustained slow stretches; they
 //! cannot see a single 50ms outlier hiding inside an otherwise-fast
-//! 200ms-sample window. Real per-op p99 needs eBPF biolatency (Linux)
+//! display bucket. Real per-op p99 needs eBPF biolatency (Linux)
 //! or IOReport subscription (macOS), both deferred.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Minimum interval between `sample()` calls actually doing work.
-/// 200ms = 5Hz, matching the technical doc's per-device IO loop.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+pub use crate::collect::ebpf::VfsActivitySource;
+use crate::collect::ebpf::{
+    BlockDeviceId, EbpfLatencyCollector, EbpfStatus, IoDirection, LatencySource, VfsActivityDelta,
+    LATENCY_BUCKETS,
+};
 
-/// Sparkline ring length — 240 samples at 5Hz = 48s of throughput.
-/// Large enough that on a 130-wide terminal the visible window already
-/// has real samples once the ring is warm.
-const RING_LEN: usize = 240;
+/// One-second buckets keep the visual timelines calm while the optional eBPF
+/// program continues accounting for every request inside the kernel.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Latency observation window — 300 samples at 5Hz = 60s of percentile
-/// history per device per direction.
-const LATENCY_WINDOW: usize = 300;
+/// One minute of throughput history.
+const RING_LEN: usize = 60;
+
+/// One minute of aligned latency observations.
+const LATENCY_WINDOW: usize = 60;
+
+/// Maximum host-wide VFS entries retained for presentation. Kernel memory is
+/// separately bounded by the 8192-entry LRU map.
+const HOT_FILE_LIMIT: usize = 64;
+#[cfg(target_os = "linux")]
+const PROC_FD_SCAN_LIMIT: usize = 256;
+
+/// One interval of host-wide VFS activity attributed to a file and process.
+/// Byte rates are requested byte counts at VFS entry, not returned bytes or
+/// physical disk traffic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VfsFileActivity {
+    pub fs_device: BlockDeviceId,
+    pub inode: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub comm: String,
+    pub basename: String,
+    pub path: String,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub read_ops: f64,
+    pub write_ops: f64,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct IoTick {
@@ -41,25 +69,47 @@ pub struct IoTick {
     pub bps: f64,
     /// Per-direction byte rates.
     pub split: Option<(f64, f64)>,
-    /// Avg per-op service time for the most recent interval, in µs,
-    /// (read, write). `None` when no ops happened. Kept for callers
-    /// that want the most-recent observation rather than the windowed
-    /// percentile (e.g. drill-in views).
+    /// Combined read + write operations/sec.
+    pub iops: f64,
+    /// Per-direction operation rates: (read, write).
+    pub iops_split: Option<(f64, f64)>,
+    /// Mean bytes per completed operation in this interval.
+    pub avg_request_bytes: Option<f64>,
+    /// Average number of requests queued or in service during this
+    /// interval. Linux derives this from weighted I/O time; unavailable
+    /// on macOS.
+    pub queue_depth: Option<f64>,
+    /// Wall-clock-aligned interval-average await for this tick.
+    pub await_sample: AwaitSample,
+    /// Compatibility alias for interval-average await in µs, encoded as
+    /// `(read, write)` with a zero for an inactive direction. `None` when
+    /// no operations completed. Prefer `await_sample`.
     #[allow(dead_code)]
     pub latency_avg: Option<(f64, f64)>,
-    /// Percentiles of avg-per-op samples over the last `LATENCY_WINDOW`
-    /// observations. See module docs for what this measures.
+    /// Percentiles of active-tick interval-average await samples. These are
+    /// not percentiles of individual requests; see the module docs.
     pub latency_pct: Option<LatencyPct>,
+}
+
+/// Await observations from one collector tick. Missing means that direction
+/// completed no operations. Retaining the observation preserves idle gaps and
+/// keeps read and write timelines aligned to wall clock.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct AwaitSample {
+    pub read_us: Option<f64>,
+    pub write_us: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LatencyPct {
+    #[allow(dead_code)]
     pub p50_r: f64,
     pub p99_r: f64,
     /// p99.9 — surfaces with a 300-sample window what p99 can't catch
     /// with only 100. Not yet displayed; reserved for a drill-in view.
     #[allow(dead_code)]
     pub p999_r: f64,
+    #[allow(dead_code)]
     pub p50_w: f64,
     pub p99_w: f64,
     #[allow(dead_code)]
@@ -69,10 +119,61 @@ pub struct LatencyPct {
 #[derive(Debug, Default, Clone)]
 pub struct DeviceHistory {
     pub combined: VecDeque<f64>,
-    /// Per-tick avg read latency in µs.
+    /// One wall-clock-aligned workload observation per sample while the
+    /// device is present. Idle intervals are retained as zero-rate samples.
+    pub workload_samples: VecDeque<WorkloadSample>,
+    /// One entry per sample while the device is present. Fully idle ticks have
+    /// two `None` values.
+    pub await_samples: VecDeque<AwaitSample>,
+    /// Active-tick interval-average read await in µs. Compatibility-only
+    /// sparse history used by the temporary percentile view.
     pub read_us: VecDeque<f64>,
-    /// Per-tick avg write latency in µs.
+    /// Active-tick interval-average write await in µs. Compatibility-only
+    /// sparse history used by the temporary percentile view.
     pub write_us: VecDeque<f64>,
+}
+
+/// Work completed by one device during a collector interval, normalized to
+/// per-second rates. Request sizes are absent when that direction completed no
+/// operations during the interval.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct WorkloadSample {
+    pub read_iops: f64,
+    pub write_iops: f64,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub read_request_bytes: Option<f64>,
+    pub write_request_bytes: Option<f64>,
+    pub merge_rates: MergeRates,
+}
+
+/// Directional request merge rates. Linux diskstats reports these counters;
+/// macOS does not. `Available` values may legitimately both be zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum MergeRates {
+    Available {
+        read_per_sec: f64,
+        write_per_sec: f64,
+    },
+    #[default]
+    Unavailable,
+}
+
+/// Per-request latency counts captured during one collector tick. Counts are
+/// logarithmic microsecond buckets supplied by the Linux eBPF backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracedLatencySample {
+    pub read: [u64; LATENCY_BUCKETS],
+    pub write: [u64; LATENCY_BUCKETS],
+}
+
+impl Default for TracedLatencySample {
+    fn default() -> Self {
+        Self {
+            read: [0; LATENCY_BUCKETS],
+            write: [0; LATENCY_BUCKETS],
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -81,15 +182,120 @@ struct DeviceTotals {
     bytes_written: u64,
     ops_read: u64,
     ops_written: u64,
+    /// Cumulative request merges. Absent on platforms that do not expose
+    /// directional merge counters.
+    merges: Option<(u64, u64)>,
     total_time_read_ns: u64,
     total_time_write_ns: u64,
+    /// Weighted I/O time accumulates elapsed time multiplied by the number of
+    /// requests queued or in service. Present for Linux diskstats only.
+    weighted_io_time_ns: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IntervalMetrics {
+    read_bps: f64,
+    write_bps: f64,
+    read_iops: f64,
+    write_iops: f64,
+    avg_request_bytes: Option<f64>,
+    workload: WorkloadSample,
+    queue_depth: Option<f64>,
+    await_sample: AwaitSample,
+}
+
+fn interval_metrics(
+    current: DeviceTotals,
+    previous: DeviceTotals,
+    elapsed: f64,
+) -> IntervalMetrics {
+    let elapsed = elapsed.max(0.001);
+    let read_bytes = current.bytes_read.saturating_sub(previous.bytes_read) as f64;
+    let write_bytes = current.bytes_written.saturating_sub(previous.bytes_written) as f64;
+    let read_ops = current.ops_read.saturating_sub(previous.ops_read);
+    let write_ops = current.ops_written.saturating_sub(previous.ops_written);
+    let read_time = current
+        .total_time_read_ns
+        .saturating_sub(previous.total_time_read_ns);
+    let write_time = current
+        .total_time_write_ns
+        .saturating_sub(previous.total_time_write_ns);
+    let total_ops = read_ops.saturating_add(write_ops);
+
+    let read_request_bytes = if read_ops > 0 {
+        Some(read_bytes / read_ops as f64)
+    } else {
+        None
+    };
+    let write_request_bytes = if write_ops > 0 {
+        Some(write_bytes / write_ops as f64)
+    } else {
+        None
+    };
+    let merge_rates = match (current.merges, previous.merges) {
+        (Some((current_read, current_write)), Some((previous_read, previous_write))) => {
+            MergeRates::Available {
+                read_per_sec: current_read.saturating_sub(previous_read) as f64 / elapsed,
+                write_per_sec: current_write.saturating_sub(previous_write) as f64 / elapsed,
+            }
+        }
+        _ => MergeRates::Unavailable,
+    };
+
+    let queue_depth = match (current.weighted_io_time_ns, previous.weighted_io_time_ns) {
+        (Some(current), Some(previous)) => {
+            let weighted_seconds = current.saturating_sub(previous) as f64 / 1_000_000_000.0;
+            Some(weighted_seconds / elapsed)
+        }
+        _ => None,
+    };
+
+    IntervalMetrics {
+        read_bps: read_bytes / elapsed,
+        write_bps: write_bytes / elapsed,
+        read_iops: read_ops as f64 / elapsed,
+        write_iops: write_ops as f64 / elapsed,
+        avg_request_bytes: if total_ops > 0 {
+            Some((read_bytes + write_bytes) / total_ops as f64)
+        } else {
+            None
+        },
+        workload: WorkloadSample {
+            read_iops: read_ops as f64 / elapsed,
+            write_iops: write_ops as f64 / elapsed,
+            read_bps: read_bytes / elapsed,
+            write_bps: write_bytes / elapsed,
+            read_request_bytes,
+            write_request_bytes,
+            merge_rates,
+        },
+        queue_depth,
+        await_sample: AwaitSample {
+            read_us: if read_ops > 0 {
+                Some((read_time as f64 / read_ops as f64) / 1_000.0)
+            } else {
+                None
+            },
+            write_us: if write_ops > 0 {
+                Some((write_time as f64 / write_ops as f64) / 1_000.0)
+            } else {
+                None
+            },
+        },
+    }
 }
 
 pub struct IoCollector {
     last_sample: Instant,
     prev_totals: HashMap<String, DeviceTotals>,
     pub history: HashMap<String, DeviceHistory>,
+    /// Wall-clock-aligned per-request histogram deltas. Empty samples are
+    /// retained so each device's p99 timeline represents real time.
+    pub traced_history: HashMap<String, VecDeque<TracedLatencySample>>,
     pub latest: Vec<IoTick>,
+    /// Bounded, host-wide VFS requested-byte activity sorted hottest first.
+    pub hot_files: Vec<VfsFileActivity>,
+    latency_probe: EbpfLatencyCollector,
 }
 
 impl IoCollector {
@@ -99,11 +305,37 @@ impl IoCollector {
             last_sample: Instant::now() - SAMPLE_INTERVAL,
             prev_totals: HashMap::new(),
             history: HashMap::new(),
+            traced_history: HashMap::new(),
             latest: Vec::new(),
+            hot_files: Vec::new(),
+            latency_probe: EbpfLatencyCollector::new(),
         }
     }
 
-    /// Called from the main loop. Internally rate-limits to 5Hz, so
+    pub fn latency_source(&self) -> LatencySource {
+        self.latency_probe.source()
+    }
+
+    pub fn hot_files_source(&self) -> VfsActivitySource {
+        self.latency_probe.vfs_source()
+    }
+
+    pub fn hot_files_status(&self) -> &EbpfStatus {
+        self.latency_probe.vfs_status()
+    }
+
+    /// Establishes fresh cumulative-counter baselines after collection was
+    /// paused. The first post-resume display bucket therefore covers one
+    /// normal sample interval rather than the entire pause.
+    pub fn resume(&mut self) {
+        self.prev_totals = self.read_totals();
+        self.last_sample = Instant::now();
+        self.latency_probe.reset_baseline();
+        self.hot_files.clear();
+        clear_histories_after_pause(&mut self.history, &mut self.traced_history);
+    }
+
+    /// Called from the main loop. Internally rate-limits to 1Hz, so
     /// it's safe to call as often as the loop tick fires.
     pub fn sample(&mut self) {
         let now = Instant::now();
@@ -117,49 +349,27 @@ impl IoCollector {
         let totals = self.read_totals();
         let mut new_latest: Vec<IoTick> = Vec::new();
         for (device, t) in &totals {
-            let prev = self
-                .prev_totals
-                .get(device)
-                .copied()
-                .unwrap_or(DeviceTotals::default());
+            let Some(prev) = self.prev_totals.get(device).copied() else {
+                // Cumulative kernel counters need one baseline observation.
+                // Treating zero as the previous value would render all I/O
+                // since boot as a single startup burst.
+                continue;
+            };
 
-            let read_bytes_delta = t.bytes_read.saturating_sub(prev.bytes_read) as f64;
-            let write_bytes_delta = t.bytes_written.saturating_sub(prev.bytes_written) as f64;
-            let read_ops_delta = t.ops_read.saturating_sub(prev.ops_read);
-            let write_ops_delta = t.ops_written.saturating_sub(prev.ops_written);
-            let read_time_delta = t.total_time_read_ns.saturating_sub(prev.total_time_read_ns);
-            let write_time_delta = t
-                .total_time_write_ns
-                .saturating_sub(prev.total_time_write_ns);
-
-            let read_bps = read_bytes_delta / elapsed;
-            let write_bps = write_bytes_delta / elapsed;
+            let metrics = interval_metrics(*t, prev, elapsed);
+            let read_bps = metrics.read_bps;
+            let write_bps = metrics.write_bps;
             let bps = read_bps + write_bps;
-
-            let (latency_avg, sample_r_us, sample_w_us) = if read_ops_delta + write_ops_delta == 0 {
-                (None, None, None)
+            let sample_r_us = metrics.await_sample.read_us;
+            let sample_w_us = metrics.await_sample.write_us;
+            let latency_avg = if sample_r_us.is_some() || sample_w_us.is_some() {
+                Some((sample_r_us.unwrap_or(0.0), sample_w_us.unwrap_or(0.0)))
             } else {
-                let r_us = if read_ops_delta > 0 {
-                    Some((read_time_delta as f64 / read_ops_delta as f64) / 1_000.0)
-                } else {
-                    None
-                };
-                let w_us = if write_ops_delta > 0 {
-                    Some((write_time_delta as f64 / write_ops_delta as f64) / 1_000.0)
-                } else {
-                    None
-                };
-                (Some((r_us.unwrap_or(0.0), w_us.unwrap_or(0.0))), r_us, w_us)
+                None
             };
 
             let h = self.history.entry(device.clone()).or_default();
-            push_ring(&mut h.combined, bps, RING_LEN);
-            if let Some(v) = sample_r_us {
-                push_ring(&mut h.read_us, v, LATENCY_WINDOW);
-            }
-            if let Some(v) = sample_w_us {
-                push_ring(&mut h.write_us, v, LATENCY_WINDOW);
-            }
+            record_history(h, metrics.workload, metrics.await_sample);
 
             // Recompute percentiles from the windows. Sorts a copy each
             // time — cheap at this scale (≤300 samples).
@@ -182,6 +392,11 @@ impl IoCollector {
                 device: device.clone(),
                 bps,
                 split: Some((read_bps, write_bps)),
+                iops: metrics.read_iops + metrics.write_iops,
+                iops_split: Some((metrics.read_iops, metrics.write_iops)),
+                avg_request_bytes: metrics.avg_request_bytes,
+                queue_depth: metrics.queue_depth,
+                await_sample: metrics.await_sample,
                 latency_avg,
                 latency_pct,
             });
@@ -189,6 +404,60 @@ impl IoCollector {
         new_latest.sort_by(|a, b| a.device.cmp(&b.device));
         self.latest = new_latest;
         self.prev_totals = totals;
+        self.sample_traced_latency();
+        self.sample_hot_files(elapsed);
+    }
+
+    fn sample_hot_files(&mut self, elapsed: f64) {
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
+            self.hot_files.clear();
+            return;
+        }
+        let deltas = self.latency_probe.vfs_snapshot();
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
+            self.hot_files.clear();
+            return;
+        }
+        self.hot_files = rank_vfs_activity(deltas, elapsed, HOT_FILE_LIMIT);
+        resolve_hot_file_paths(&mut self.hot_files);
+    }
+
+    fn sample_traced_latency(&mut self) {
+        let source = self.latency_probe.source();
+        reconcile_traced_history(source, &mut self.traced_history);
+        if source != LatencySource::EbpfPerRequest {
+            return;
+        }
+
+        let snapshots = self.latency_probe.snapshot();
+        let source = self.latency_probe.source();
+        reconcile_traced_history(source, &mut self.traced_history);
+        if source != LatencySource::EbpfPerRequest {
+            return;
+        }
+
+        let mut samples: HashMap<String, TracedLatencySample> = HashMap::new();
+        for snapshot in snapshots {
+            let Some(device) = block_device_name(snapshot.device) else {
+                continue;
+            };
+            let sample = samples.entry(device).or_default();
+            let destination = match snapshot.direction {
+                IoDirection::Read => &mut sample.read,
+                IoDirection::Write => &mut sample.write,
+            };
+            for (index, bucket) in snapshot.buckets.into_iter().enumerate() {
+                if let Some(count) = destination.get_mut(index) {
+                    *count = bucket.count;
+                }
+            }
+        }
+
+        for tick in &self.latest {
+            let sample = samples.remove(&tick.device).unwrap_or_default();
+            let history = self.traced_history.entry(tick.device.clone()).or_default();
+            push_ring(history, sample, LATENCY_WINDOW);
+        }
     }
 
     fn read_totals(&self) -> HashMap<String, DeviceTotals> {
@@ -207,6 +476,148 @@ impl IoCollector {
     }
 }
 
+fn fallback_file_path(basename: &str, inode: u64) -> String {
+    if basename.is_empty() {
+        format!("inode {inode}")
+    } else {
+        format!("{basename} [inode {inode}]")
+    }
+}
+
+fn rank_vfs_activity(
+    deltas: Vec<VfsActivityDelta>,
+    elapsed: f64,
+    limit: usize,
+) -> Vec<VfsFileActivity> {
+    let elapsed = elapsed.max(0.001);
+    let mut activity: Vec<_> = deltas
+        .into_iter()
+        .map(|delta| VfsFileActivity {
+            fs_device: delta.device,
+            inode: delta.inode,
+            pid: delta.pid,
+            tgid: delta.tgid,
+            path: fallback_file_path(&delta.basename, delta.inode),
+            comm: delta.comm,
+            basename: delta.basename,
+            read_bps: delta.read_bytes as f64 / elapsed,
+            write_bps: delta.write_bytes as f64 / elapsed,
+            read_ops: delta.read_ops as f64 / elapsed,
+            write_ops: delta.write_ops as f64 / elapsed,
+        })
+        .collect();
+    activity.sort_by(|a, b| {
+        let a_total = a.read_bps + a.write_bps;
+        let b_total = b.read_bps + b.write_bps;
+        b_total
+            .partial_cmp(&a_total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.tgid.cmp(&b.tgid))
+            .then_with(|| a.inode.cmp(&b.inode))
+    });
+    activity.truncate(limit);
+    activity
+}
+
+/// Opportunistically resolves only already-ranked candidates. Each process's
+/// fd directory is scanned at most once and each scan is capped; no filesystem
+/// tree traversal occurs.
+#[cfg(target_os = "linux")]
+fn resolve_hot_file_paths(activity: &mut [VfsFileActivity]) {
+    use std::collections::{HashMap as StdHashMap, HashSet};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut wanted: StdHashMap<u32, HashSet<(u32, u32, u64)>> = StdHashMap::new();
+    for item in activity.iter() {
+        wanted.entry(item.tgid).or_default().insert((
+            item.fs_device.major,
+            item.fs_device.minor,
+            item.inode,
+        ));
+    }
+
+    let mut resolved: StdHashMap<(u32, u32, u32, u64), String> = StdHashMap::new();
+    for (tgid, keys) in wanted {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{tgid}/fd")) else {
+            continue;
+        };
+        for entry in entries.flatten().take(PROC_FD_SCAN_LIMIT) {
+            // `/proc/<pid>/fd/*` entries are symlinks; follow them to compare
+            // the open file's identity rather than the procfs symlink inode.
+            let Ok(metadata) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            let dev = metadata.dev();
+            let key = (linux_dev_major(dev), linux_dev_minor(dev), metadata.ino());
+            if !keys.contains(&key) {
+                continue;
+            }
+            if let Ok(path) = std::fs::read_link(entry.path()) {
+                resolved.insert(
+                    (tgid, key.0, key.1, key.2),
+                    path.to_string_lossy().into_owned(),
+                );
+            }
+        }
+    }
+
+    for item in activity {
+        if let Some(path) = resolved.get(&(
+            item.tgid,
+            item.fs_device.major,
+            item.fs_device.minor,
+            item.inode,
+        )) {
+            item.path.clone_from(path);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_hot_file_paths(_activity: &mut [VfsFileActivity]) {}
+
+/// Decode glibc's userspace dev_t representation (the inverse of makedev).
+#[cfg(target_os = "linux")]
+fn linux_dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000)) as u32
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & 0xffff_ff00)) as u32
+}
+
+fn reconcile_traced_history(
+    source: LatencySource,
+    history: &mut HashMap<String, VecDeque<TracedLatencySample>>,
+) {
+    if source != LatencySource::EbpfPerRequest {
+        history.clear();
+    }
+}
+
+fn clear_histories_after_pause(
+    history: &mut HashMap<String, DeviceHistory>,
+    traced_history: &mut HashMap<String, VecDeque<TracedLatencySample>>,
+) {
+    history.clear();
+    traced_history.clear();
+}
+
+#[cfg(target_os = "linux")]
+fn block_device_name(device: BlockDeviceId) -> Option<String> {
+    let path = format!("/sys/dev/block/{}:{}", device.major, device.minor);
+    std::fs::canonicalize(path)
+        .ok()?
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn block_device_name(_device: BlockDeviceId) -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn totals_macos() -> HashMap<String, DeviceTotals> {
     let raw = crate::collect::iokit::collect();
@@ -219,8 +630,10 @@ fn totals_macos() -> HashMap<String, DeviceTotals> {
                     bytes_written: s.bytes_written,
                     ops_read: s.ops_read,
                     ops_written: s.ops_written,
+                    merges: None,
                     total_time_read_ns: s.total_time_read_ns,
                     total_time_write_ns: s.total_time_write_ns,
+                    weighted_io_time_ns: None,
                 },
             )
         })
@@ -229,11 +642,16 @@ fn totals_macos() -> HashMap<String, DeviceTotals> {
 
 #[cfg(target_os = "linux")]
 fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
-    const SECTOR_BYTES: u64 = 512;
-    const MS_TO_NS: u64 = 1_000_000;
     let Ok(text) = std::fs::read_to_string("/proc/diskstats") else {
         return HashMap::new();
     };
+    parse_diskstats_linux(&text)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_diskstats_linux(text: &str) -> HashMap<String, DeviceTotals> {
+    const SECTOR_BYTES: u64 = 512;
+    const MS_TO_NS: u64 = 1_000_000;
     let mut out = HashMap::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -250,6 +668,9 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
         let Ok(reads) = fields[3].parse::<u64>() else {
             continue;
         };
+        let Ok(reads_merged) = fields[4].parse::<u64>() else {
+            continue;
+        };
         let Ok(sectors_read) = fields[5].parse::<u64>() else {
             continue;
         };
@@ -259,12 +680,16 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
         let Ok(writes) = fields[7].parse::<u64>() else {
             continue;
         };
+        let Ok(writes_merged) = fields[8].parse::<u64>() else {
+            continue;
+        };
         let Ok(sectors_written) = fields[9].parse::<u64>() else {
             continue;
         };
         let Ok(ms_writing) = fields[10].parse::<u64>() else {
             continue;
         };
+        let weighted_ms = fields.get(13).and_then(|value| value.parse::<u64>().ok());
         out.insert(
             name.to_string(),
             DeviceTotals {
@@ -272,8 +697,10 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
                 bytes_written: sectors_written.saturating_mul(SECTOR_BYTES),
                 ops_read: reads,
                 ops_written: writes,
+                merges: Some((reads_merged, writes_merged)),
                 total_time_read_ns: ms_reading.saturating_mul(MS_TO_NS),
                 total_time_write_ns: ms_writing.saturating_mul(MS_TO_NS),
+                weighted_io_time_ns: weighted_ms.map(|ms| ms.saturating_mul(MS_TO_NS)),
             },
         );
     }
@@ -297,11 +724,28 @@ fn is_partition_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn push_ring(q: &mut VecDeque<f64>, v: f64, cap: usize) {
+fn push_ring<T>(q: &mut VecDeque<T>, v: T, cap: usize) {
     if q.len() == cap {
         q.pop_front();
     }
     q.push_back(v);
+}
+
+fn record_history(
+    history: &mut DeviceHistory,
+    workload: WorkloadSample,
+    await_sample: AwaitSample,
+) {
+    let bps = workload.read_bps + workload.write_bps;
+    push_ring(&mut history.combined, bps, RING_LEN);
+    push_ring(&mut history.workload_samples, workload, RING_LEN);
+    push_ring(&mut history.await_samples, await_sample, LATENCY_WINDOW);
+    if let Some(value) = await_sample.read_us {
+        push_ring(&mut history.read_us, value, LATENCY_WINDOW);
+    }
+    if let Some(value) = await_sample.write_us {
+        push_ring(&mut history.write_us, value, LATENCY_WINDOW);
+    }
 }
 
 /// Returns (p50, p99, p999) of the values in `samples`. Empty input
@@ -344,6 +788,106 @@ pub fn worst_p99_us(latest: &[IoTick]) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn totals(
+        bytes_read: u64,
+        bytes_written: u64,
+        ops_read: u64,
+        ops_written: u64,
+        read_time_ns: u64,
+        write_time_ns: u64,
+        weighted_io_time_ns: Option<u64>,
+    ) -> DeviceTotals {
+        DeviceTotals {
+            bytes_read,
+            bytes_written,
+            ops_read,
+            ops_written,
+            merges: None,
+            total_time_read_ns: read_time_ns,
+            total_time_write_ns: write_time_ns,
+            weighted_io_time_ns,
+        }
+    }
+
+    fn assert_near(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn vfs_delta(inode: u64, read_bytes: u64, write_bytes: u64) -> VfsActivityDelta {
+        VfsActivityDelta {
+            device: BlockDeviceId { major: 8, minor: 1 },
+            inode,
+            pid: 101,
+            tgid: 100,
+            comm: "writer".into(),
+            basename: format!("file-{inode}"),
+            read_bytes,
+            write_bytes,
+            read_ops: 2,
+            write_ops: 3,
+        }
+    }
+
+    #[test]
+    fn hot_file_ranking_uses_total_requested_rate_and_limit() {
+        let ranked = rank_vfs_activity(vec![vfs_delta(1, 100, 0), vfs_delta(2, 50, 200)], 0.5, 1);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].inode, 2);
+        assert_near(ranked[0].read_bps, 100.0);
+        assert_near(ranked[0].write_bps, 400.0);
+        assert_near(ranked[0].read_ops, 4.0);
+        assert_near(ranked[0].write_ops, 6.0);
+    }
+
+    #[test]
+    fn unresolved_hot_file_path_is_explicit_inode_fallback() {
+        assert_eq!(fallback_file_path("data.log", 42), "data.log [inode 42]");
+        assert_eq!(fallback_file_path("", 42), "inode 42");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userspace_dev_t_decodes_major_and_minor() {
+        // glibc makedev(259, 65537)
+        let dev = ((259_u64 & 0xffff_f000) << 32)
+            | ((259_u64 & 0xfff) << 8)
+            | ((65537_u64 & 0xffff_ff00) << 12)
+            | (65537_u64 & 0xff);
+        assert_eq!(linux_dev_major(dev), 259);
+        assert_eq!(linux_dev_minor(dev), 65537);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_proc_fd_resolution_matches_device_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        let metadata = file.metadata().unwrap();
+        let pid = std::process::id();
+        let mut activity = vec![VfsFileActivity {
+            fs_device: BlockDeviceId {
+                major: linux_dev_major(metadata.dev()),
+                minor: linux_dev_minor(metadata.dev()),
+            },
+            inode: metadata.ino(),
+            pid,
+            tgid: pid,
+            comm: "test".into(),
+            basename: "Cargo.toml".into(),
+            path: fallback_file_path("Cargo.toml", metadata.ino()),
+            read_bps: 1.0,
+            write_bps: 0.0,
+            read_ops: 1.0,
+            write_ops: 0.0,
+        }];
+        resolve_hot_file_paths(&mut activity);
+        assert!(activity[0].path.ends_with("Cargo.toml"));
+    }
+
     #[test]
     fn sata_disks_and_partitions() {
         assert!(!is_partition_name("sda"));
@@ -369,6 +913,228 @@ mod tests {
     fn device_mapper_is_whole() {
         assert!(!is_partition_name("dm-0"));
         assert!(!is_partition_name("dm-12"));
+    }
+
+    #[test]
+    fn interval_rates_request_size_await_and_queue() {
+        let previous = totals(
+            1_000,
+            2_000,
+            100,
+            50,
+            1_000_000_000,
+            2_000_000_000,
+            Some(3_000_000_000),
+        );
+        let current = totals(
+            51_000,
+            27_000,
+            120,
+            55,
+            1_040_000_000,
+            2_050_000_000,
+            Some(3_750_000_000),
+        );
+
+        let metrics = interval_metrics(current, previous, 0.5);
+        assert_near(metrics.read_bps, 100_000.0);
+        assert_near(metrics.write_bps, 50_000.0);
+        assert_near(metrics.read_iops, 40.0);
+        assert_near(metrics.write_iops, 10.0);
+        assert_near(metrics.avg_request_bytes.unwrap(), 3_000.0);
+        assert_near(metrics.workload.read_request_bytes.unwrap(), 2_500.0);
+        assert_near(metrics.workload.write_request_bytes.unwrap(), 5_000.0);
+        assert_eq!(metrics.workload.merge_rates, MergeRates::Unavailable);
+        assert_near(metrics.queue_depth.unwrap(), 1.5);
+        assert_near(metrics.await_sample.read_us.unwrap(), 2_000.0);
+        assert_near(metrics.await_sample.write_us.unwrap(), 10_000.0);
+    }
+
+    #[test]
+    fn interval_without_operations_has_no_request_size_or_await() {
+        let previous = totals(1_000, 2_000, 100, 50, 1_000, 2_000, None);
+        let metrics = interval_metrics(previous, previous, 0.2);
+
+        assert_eq!(metrics.avg_request_bytes, None);
+        assert_eq!(metrics.queue_depth, None);
+        assert_eq!(metrics.await_sample, AwaitSample::default());
+        assert_eq!(metrics.read_iops, 0.0);
+        assert_eq!(metrics.write_iops, 0.0);
+        assert_eq!(metrics.workload.read_request_bytes, None);
+        assert_eq!(metrics.workload.write_request_bytes, None);
+        assert_eq!(metrics.workload.merge_rates, MergeRates::Unavailable);
+    }
+
+    #[test]
+    fn aligned_histories_preserve_idle_ticks() {
+        let mut history = DeviceHistory::default();
+        let first = AwaitSample {
+            read_us: Some(500.0),
+            write_us: None,
+        };
+        let idle = AwaitSample::default();
+        let third = AwaitSample {
+            read_us: None,
+            write_us: Some(2_000.0),
+        };
+
+        let workloads = [
+            WorkloadSample {
+                read_iops: 1.0,
+                read_bps: 1_000.0,
+                ..WorkloadSample::default()
+            },
+            WorkloadSample::default(),
+            WorkloadSample {
+                write_iops: 1.0,
+                write_bps: 2_000.0,
+                ..WorkloadSample::default()
+            },
+        ];
+
+        record_history(&mut history, workloads[0], first);
+        record_history(&mut history, workloads[1], idle);
+        record_history(&mut history, workloads[2], third);
+
+        assert_eq!(
+            history.workload_samples.iter().copied().collect::<Vec<_>>(),
+            workloads
+        );
+        assert_eq!(
+            history.combined.iter().copied().collect::<Vec<_>>(),
+            vec![1_000.0, 0.0, 2_000.0]
+        );
+        assert_eq!(
+            history.await_samples.iter().copied().collect::<Vec<_>>(),
+            vec![first, idle, third]
+        );
+        assert_eq!(
+            history.read_us.iter().copied().collect::<Vec<_>>(),
+            vec![500.0]
+        );
+        assert_eq!(
+            history.write_us.iter().copied().collect::<Vec<_>>(),
+            vec![2_000.0]
+        );
+    }
+
+    #[test]
+    fn directional_merge_rates_preserve_available_zero() {
+        let previous = DeviceTotals {
+            merges: Some((10, 20)),
+            ..DeviceTotals::default()
+        };
+        let current = DeviceTotals {
+            merges: Some((13, 20)),
+            ..DeviceTotals::default()
+        };
+
+        assert_eq!(
+            interval_metrics(current, previous, 0.5)
+                .workload
+                .merge_rates,
+            MergeRates::Available {
+                read_per_sec: 6.0,
+                write_per_sec: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_rates_are_unavailable_when_platform_has_no_counters() {
+        let previous = DeviceTotals::default();
+        let current = DeviceTotals {
+            bytes_read: 4_096,
+            ops_read: 1,
+            ..DeviceTotals::default()
+        };
+
+        assert_eq!(
+            interval_metrics(current, previous, 1.0)
+                .workload
+                .merge_rates,
+            MergeRates::Unavailable
+        );
+    }
+
+    #[test]
+    fn workload_history_is_capped_without_losing_alignment() {
+        let mut history = DeviceHistory::default();
+        for second in 0..=RING_LEN {
+            record_history(
+                &mut history,
+                WorkloadSample {
+                    read_iops: second as f64,
+                    ..WorkloadSample::default()
+                },
+                AwaitSample::default(),
+            );
+        }
+
+        assert_eq!(history.workload_samples.len(), RING_LEN);
+        assert_eq!(history.await_samples.len(), RING_LEN);
+        assert_eq!(history.combined.len(), RING_LEN);
+        assert_eq!(history.workload_samples.front().unwrap().read_iops, 1.0);
+        assert_eq!(
+            history.workload_samples.back().unwrap().read_iops,
+            RING_LEN as f64
+        );
+    }
+
+    #[test]
+    fn aggregate_fallback_clears_traced_history() {
+        let mut history = HashMap::from([(
+            "sda".to_string(),
+            VecDeque::from([TracedLatencySample::default()]),
+        )]);
+
+        reconcile_traced_history(LatencySource::EbpfPerRequest, &mut history);
+        assert_eq!(history.len(), 1);
+
+        reconcile_traced_history(LatencySource::AggregateAwait, &mut history);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn resume_history_reset_removes_pre_pause_samples() {
+        let mut history = HashMap::from([(
+            "sda".to_string(),
+            DeviceHistory {
+                combined: VecDeque::from([1_000.0]),
+                ..DeviceHistory::default()
+            },
+        )]);
+        let mut traced_history = HashMap::from([(
+            "sda".to_string(),
+            VecDeque::from([TracedLatencySample::default()]),
+        )]);
+
+        clear_histories_after_pause(&mut history, &mut traced_history);
+
+        assert!(history.is_empty());
+        assert!(traced_history.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_diskstats_counters_including_weighted_io_time() {
+        let input = concat!(
+            "   8 0 sda 100 2 200 300 50 4 600 700 1 800 900 0 0 0 0\n",
+            "   8 1 sda1 10 0 20 30 5 0 60 70 0 80 90 0 0 0 0\n",
+            "   7 0 loop0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+        );
+
+        let parsed = parse_diskstats_linux(input);
+        assert_eq!(parsed.len(), 1);
+        let disk = parsed.get("sda").unwrap();
+        assert_eq!(disk.bytes_read, 200 * 512);
+        assert_eq!(disk.bytes_written, 600 * 512);
+        assert_eq!(disk.ops_read, 100);
+        assert_eq!(disk.ops_written, 50);
+        assert_eq!(disk.merges, Some((2, 4)));
+        assert_eq!(disk.total_time_read_ns, 300_000_000);
+        assert_eq!(disk.total_time_write_ns, 700_000_000);
+        assert_eq!(disk.weighted_io_time_ns, Some(900_000_000));
     }
 
     #[test]

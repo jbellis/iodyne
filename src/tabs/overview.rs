@@ -12,6 +12,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::collect::ebpf::EbpfStatus;
+use crate::collect::io::{VfsActivitySource, VfsFileActivity};
 use crate::insights::Severity;
 use crate::ui::format::{fmt_rate, fmt_size, pad_left, pad_right};
 use crate::ui::palette as p;
@@ -404,7 +406,7 @@ fn power_of_two_rate_ceiling(rate: f64) -> f64 {
     2_f64.powi(rate.log2().ceil() as i32)
 }
 
-// ---------- bottom strip: insights + hot files note ----------
+// ---------- bottom strip: insights + host-wide VFS activity ----------
 
 fn draw_bottom_strip(f: &mut Frame, area: Rect, app: &App) {
     let split = Layout::default()
@@ -412,7 +414,7 @@ fn draw_bottom_strip(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     draw_insights_summary(f, split[0], app);
-    draw_hot_files_note(f, split[1]);
+    draw_host_vfs_activity(f, split[1], app);
 }
 
 fn draw_insights_summary(f: &mut Frame, area: Rect, app: &App) {
@@ -468,32 +470,71 @@ fn draw_insights_summary(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_hot_files_note(f: &mut Frame, area: Rect) {
+fn draw_host_vfs_activity(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::FAINT).bg(p::BG))
         .title(Span::styled(
-            " HOT FILES ",
-            Style::default().fg(p::DIM).add_modifier(Modifier::BOLD),
+            " VFS ACTIVITY  requested rates · ops/s ",
+            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(p::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    if app.io.hot_files_source() != VfsActivitySource::EbpfRequestedBytes {
+        draw_vfs_status(f, inner, vfs_unavailable_message(app.io.hot_files_status()));
+        return;
+    }
+    let entries = host_hot_files(&app.io.hot_files);
+    if entries.is_empty() {
+        draw_vfs_status(f, inner, "no VFS activity this interval");
+        return;
+    }
+    for (row, item) in entries.into_iter().take(inner.height as usize).enumerate() {
+        crate::tabs::io::draw_vfs_row(
+            f,
+            Rect {
+                x: inner.x,
+                y: inner.y + row as u16,
+                width: inner.width,
+                height: 1,
+            },
+            item,
+        );
+    }
+}
+
+fn draw_vfs_status(f: &mut Frame, area: Rect, message: &str) {
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  per-process write rate deferred",
-                Style::default().fg(p::DIM),
-            )),
-            Line::from(Span::styled(
-                "  see [7] for what's needed",
-                Style::default().fg(p::DIM),
-            )),
-        ])
+        Paragraph::new(Span::styled(
+            format!(" {message}"),
+            Style::default().fg(p::DIM),
+        ))
         .style(Style::default().bg(p::BG)),
-        inner,
+        Rect { height: 1, ..area },
     );
+}
+
+fn vfs_unavailable_message(status: &EbpfStatus) -> &'static str {
+    match status {
+        EbpfStatus::DisabledAtBuild => "unavailable in this build",
+        EbpfStatus::UnsupportedPlatform => "unavailable on this platform",
+        EbpfStatus::Unavailable(_) => "VFS eBPF tracing unavailable",
+        EbpfStatus::Active => "VFS activity unavailable",
+    }
+}
+
+fn host_hot_files(entries: &[VfsFileActivity]) -> Vec<&VfsFileActivity> {
+    let mut entries: Vec<_> = entries.iter().collect();
+    entries.sort_by(|a, b| {
+        (b.read_bps + b.write_bps)
+            .total_cmp(&(a.read_bps + a.write_bps))
+            .then_with(|| b.write_ops.total_cmp(&a.write_ops))
+    });
+    entries
 }
 
 // ---------- bottom capacity bar ----------
@@ -590,6 +631,54 @@ fn draw_capacity_bar(f: &mut Frame, area: Rect, app: &App) {
                 width: inner.width,
                 height: 1,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collect::ebpf::BlockDeviceId;
+
+    fn hot_file(path: &str, read_bps: f64, write_bps: f64) -> VfsFileActivity {
+        VfsFileActivity {
+            fs_device: BlockDeviceId { major: 8, minor: 1 },
+            inode: 1,
+            pid: 10,
+            tgid: 10,
+            comm: "worker".into(),
+            basename: path.into(),
+            path: path.into(),
+            read_bps,
+            write_bps,
+            read_ops: 1.0,
+            write_ops: 1.0,
+        }
+    }
+
+    #[test]
+    fn host_vfs_activity_sorts_by_combined_requested_rate() {
+        let entries = vec![
+            hot_file("/slow", 10.0, 0.0),
+            hot_file("/hot", 5.0, 1_000.0),
+            hot_file("/middle", 500.0, 0.0),
+        ];
+        let sorted = host_hot_files(&entries);
+        assert_eq!(sorted[0].path, "/hot");
+        assert_eq!(sorted[1].path, "/middle");
+        assert_eq!(sorted[2].path, "/slow");
+    }
+
+    #[test]
+    fn host_vfs_empty_and_unavailable_states_are_explicit() {
+        assert!(host_hot_files(&[]).is_empty());
+        assert_eq!(
+            vfs_unavailable_message(&EbpfStatus::DisabledAtBuild),
+            "unavailable in this build"
+        );
+        assert_eq!(
+            vfs_unavailable_message(&EbpfStatus::Unavailable("denied".into())),
+            "VFS eBPF tracing unavailable"
         );
     }
 }

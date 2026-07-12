@@ -52,10 +52,10 @@ pub struct App {
     pub settings: Settings,
     pub show_settings: bool,
     pub smart: collect::SmartCollector,
-    pub hot_files: collect::hot_files::HotFileWatcher,
     pub insights: Vec<crate::insights::Insight>,
     pub selected_device: usize,
     pub selected_fs: usize,
+    pub selected_io: usize,
     /// Last full enumeration (slow path — system_profiler + diskutil).
     last_metadata_refresh: Instant,
     /// Last usage refresh (fast path — sysinfo only).
@@ -73,15 +73,13 @@ impl App {
         let io = collect::IoCollector::new();
         let mut smart = collect::SmartCollector::new();
         smart.refresh_if_due(&devices);
-        let roots = collect::hot_files::default_roots();
-        let root_refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
-        let hot_files = collect::hot_files::HotFileWatcher::start(&root_refs);
         Self {
             active_tab: start,
             live: LiveState::Live,
             host: read_host(devices.len()),
             selected_device: 0,
             selected_fs: 0,
+            selected_io: 0,
             devices,
             filesystems,
             volumes,
@@ -90,7 +88,6 @@ impl App {
             settings,
             show_settings: false,
             smart,
-            hot_files,
             insights: Vec::new(),
             last_metadata_refresh: Instant::now(),
             last_usage_refresh: Instant::now(),
@@ -111,6 +108,7 @@ impl App {
 
     fn toggle_io_unmounted(&mut self) {
         self.io_show_unmounted = !self.io_show_unmounted;
+        self.selected_io = 0;
         self.persist_settings();
     }
 
@@ -118,10 +116,12 @@ impl App {
         if matches!(self.live, LiveState::Paused) {
             return;
         }
-        // IO is hot enough to warrant 5Hz sampling for its own latency
-        // percentile window. The collector rate-limits internally, so
-        // calling every frame is fine.
+        // The collector forms calm one-second display buckets and rate-limits
+        // internally. The eBPF backend still accounts for every request in
+        // kernel between these polls.
         self.io.sample();
+        let visible_io = crate::tabs::io::visible_device_count(self);
+        self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
 
         // Slower path: sysinfo-only — used bytes + mounts list at 1Hz.
         let usage_elapsed = self.last_usage_refresh.elapsed();
@@ -131,10 +131,6 @@ impl App {
             if self.selected_fs >= self.filesystems.len() && !self.filesystems.is_empty() {
                 self.selected_fs = self.filesystems.len() - 1;
             }
-            // Decay per-file EWMA rates and prune idle / overflowed
-            // entries. The watcher thread keeps writing into the same
-            // map between calls; we just shape it back down.
-            self.hot_files.decay(usage_elapsed);
             self.host.uptime_secs = System::uptime();
             self.last_usage_refresh = Instant::now();
         }
@@ -159,7 +155,6 @@ impl App {
             &self.filesystems,
             &self.io.latest,
             &self.smart,
-            &self.hot_files,
         );
     }
 }
@@ -187,7 +182,8 @@ pub fn run(opts: Options) -> Result<()> {
 }
 
 fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    let frame_budget = Duration::from_millis(50);
+    // Input wakes the poll immediately; this only caps idle redraws at 10 FPS.
+    let frame_budget = Duration::from_millis(100);
     loop {
         terminal.draw(|f| draw(f, app))?;
         if event::poll(frame_budget)? {
@@ -222,7 +218,10 @@ fn handle_key(app: &mut App, key: KeyCode) {
         KeyCode::Char('p') => {
             app.live = match app.live {
                 LiveState::Live => LiveState::Paused,
-                LiveState::Paused => LiveState::Live,
+                LiveState::Paused => {
+                    app.io.resume();
+                    LiveState::Live
+                }
             };
         }
         KeyCode::Char('u') if app.active_tab == TabId::Io => {
@@ -237,6 +236,7 @@ fn handle_key(app: &mut App, key: KeyCode) {
         KeyCode::Up | KeyCode::Char('k') => match app.active_tab {
             TabId::Devices if app.selected_device > 0 => app.selected_device -= 1,
             TabId::Fs if app.selected_fs > 0 => app.selected_fs -= 1,
+            TabId::Io if app.selected_io > 0 => app.selected_io -= 1,
             _ => {}
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_tab {
@@ -244,6 +244,9 @@ fn handle_key(app: &mut App, key: KeyCode) {
                 app.selected_device += 1
             }
             TabId::Fs if app.selected_fs + 1 < app.filesystems.len() => app.selected_fs += 1,
+            TabId::Io if app.selected_io + 1 < crate::tabs::io::visible_device_count(app) => {
+                app.selected_io += 1
+            }
             _ => {}
         },
         _ => {}

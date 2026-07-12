@@ -11,11 +11,11 @@
 </p>
 
 <p align="center">
-  <em>Sibling to <a href="https://github.com/matthart1983/netwatch">NetWatch</a> and <a href="https://github.com/matthart1983/syswatch">SysWatch</a>. Same chrome. Same palette. Eight tabs covering every disk on one box.</em>
+  <em>Sibling to <a href="https://github.com/matthart1983/netwatch">NetWatch</a> and <a href="https://github.com/matthart1983/syswatch">SysWatch</a>. Same chrome. Same palette. Seven tabs covering every disk on one box.</em>
 </p>
 
 <p align="center">
-  <img src="demo.gif" alt="DiskWatch — Overview, Devices, Volumes, FS, IO, SMART, Hot Files, Insights" width="800">
+  <img src="demo.gif" alt="DiskWatch — Overview, Devices, Volumes, FS, IO, SMART, Insights" width="800">
 </p>
 
 ---
@@ -24,16 +24,15 @@
 
 | # | Tab | Replaces |
 |---|---|---|
-| 1 | Overview | one screen across capacity, IO, health, hot files |
+| 1 | Overview | one screen across capacity, IO, health, and VFS activity |
 | 2 | Devices | `lsblk`, `nvme list`, `diskutil list`, `hdparm -I` |
 | 3 | Volumes | `lvs` + `vgs`, `mdadm --detail`, `diskutil apfs list` |
 | 4 | FS | `df -h`, `df -i`, `mount`, `findmnt` |
 | 5 | IO | `iostat -x 1`, biolatency-style averages |
 | 6 | SMART | `smartctl -A`, `nvme smart-log` |
-| 7 | Hot Files | `fanotify`/`fseventsd` watcher (paths, not bytes) |
-| 8 | Insights | plain-English anomaly summaries |
+| 7 | Insights | plain-English anomaly summaries |
 
-Where `lsblk` shows you *which disks exist*, DiskWatch shows you *what's happening on them* — capacity trending, IO throughput, p99 latency, SMART health, and the files being written *right now* — and tells you why in plain English when something's anomalous.
+Where `lsblk` shows you *which disks exist*, DiskWatch shows you *what's happening on them* — capacity trending, IO throughput, p99 latency, SMART health, and, with privileged Linux tracing, the files with current VFS activity — and tells you why in plain English when something's anomalous.
 
 ## Install
 
@@ -71,19 +70,21 @@ cargo build --release
 
 **Prerequisites:** Rust 1.75+ (only if building from source). No system dependencies on Linux. macOS calls the standard `ioreg`, `diskutil`, and `system_profiler` binaries — all preinstalled. Optional: `smartmontools` (`brew install smartmontools` / `apt install smartmontools`) for full SMART attribute tables — without it, the SMART tab falls back to the basic verified/failing flag from `diskutil`.
 
+On Linux, `diskwatch` uses unprivileged aggregate await statistics. On Linux 5.11 or newer, running `sudo diskwatch` additionally attempts the embedded eBPF probe for per-request latency distributions and bounded VFS file activity; kernel policy may still deny tracing, in which case DiskWatch falls back automatically. No recursive filesystem watches are created. `diskwatch --diag` reports the active tracing source and load status.
+
 ## Keys
 
 | Key | Action |
 |---|---|
-| `1`–`8` | Switch tabs |
-| `↑` / `↓` / `j` / `k` | Move selection (Devices, FS) |
+| `1`–`7` | Switch tabs |
+| `↑` / `↓` / `j` / `k` | Move selection (Devices, FS, IO) |
 | `p` | Pause / resume sampling |
 | `q` / `Esc` | Quit |
 | `--diag` | Print collected state and exit (no TUI) |
 
 ## Tabs in detail
 
-**[1] Overview** — 5 KPI tiles (capacity, IO, p99 latency, health, insights), per-device summary, aggregate IO sparkline, top insights, segmented capacity bar.
+**[1] Overview** — 5 KPI tiles (capacity, IO, p99 latency, health, insights), per-device summary, aggregate IO sparkline, top VFS file activity when tracing is available, top insights, segmented capacity bar.
 
 **[2] Devices** — block-device table with model, firmware, serial, used %, SMART status. Detail panel for the selected device.
 
@@ -91,13 +92,11 @@ cargo build --release
 
 **[4] FS** — mounted filesystems with inline usage bars, threshold colors, system/user/removable classification.
 
-**[5] IO** — per-device read / write throughput, 48s sparkline, p50 + p99 latency (read and write) over a 60s rolling window.
+**[5] IO** — full-width per-device visual bands with IOPS, throughput, request size, and a shared logarithmic latency scale. Standard mode shows one-second read/write await timelines; privileged Linux mode uses eBPF for per-request distributions, a 60s p99 timeline, and selected-device VFS file activity.
 
 **[6] SMART** — full NVMe / ATA attribute tables when `smartctl` is on PATH; degraded banner with install instructions when not. Always shows the basic verified/failing flag.
 
-**[7] Hot Files** — paths by event rate via FSEvents (macOS) / inotify (Linux). Honest footer: this tab can't show bytes/sec or process attribution without root (`fs_usage`) / Endpoint Security entitlement / eBPF biosnoop.
-
-**[8] Insights** — anomaly cards over the collected state: capacity warnings, SMART failures, NVMe wear, drive temperature, p99 latency outliers, IO-dominant devices, hot-file runaway, removable drives.
+**[7] Insights** — anomaly cards over the collected state: capacity warnings, SMART failures, NVMe wear, drive temperature, p99 latency outliers, IO-dominant devices, and removable drives.
 
 ## What's real, what's deferred
 
@@ -106,15 +105,16 @@ cargo build --release
 | Device model / serial / firmware | ✅ `system_profiler` + IOKit | ✅ `/sys/block/*/device/{model,serial,firmware_rev}` |
 | Per-device used bytes | ✅ via APFS container map | ✅ summed from `sysinfo` mounts |
 | Read/write byte rates (split) | ✅ IOKit `Statistics` | ✅ `/proc/diskstats` cols 5/9 |
-| Avg per-op latency | ✅ `Total Time / Operations` | ✅ `/proc/diskstats` cols 6/10 |
-| p50 / p99 latency | ✅ tick-averaged over 60s | ✅ tick-averaged over 60s |
-| True per-op p99 (histogram) | ❌ needs IOReport entitlement | ❌ needs eBPF biolatency (CAP_BPF) |
+| Interval-average await | ✅ `Total Time / Operations` | ✅ `/proc/diskstats` cols 6/10 |
+| Await timeline | ✅ one-second buckets over 60s | ✅ one-second buckets over 60s |
+| True per-request histogram / p99 | ❌ needs IOReport entitlement | ✅ eBPF when privileged; aggregate fallback otherwise |
 | SMART attributes | ✅ `smartctl` if installed | ✅ `smartctl` if installed |
 | Volumes — APFS | ✅ `diskutil apfs list` | n/a |
 | Volumes — mdraid | n/a | ✅ `/proc/mdstat` |
 | Volumes — ZFS, LVM | ⏳ deferred | ⏳ deferred |
-| Hot files (paths) | ✅ FSEvents | ✅ inotify |
-| Hot files — bytes / pid | ❌ needs root `fs_usage` / entitlement | ❌ needs eBPF biosnoop |
+| VFS file activity — bytes / pid | ❌ unavailable | ✅ eBPF when privileged; unavailable otherwise |
+
+VFS activity measures application reads and writes at the VFS layer. It is not physical disk traffic: reads may be served from cache and buffered writes may reach the device later under a different process.
 
 ## Design
 

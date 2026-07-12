@@ -5,7 +5,6 @@ use crate::app::App;
 
 pub mod devices;
 pub mod fs;
-pub mod hot;
 pub mod insights;
 pub mod io;
 pub mod overview;
@@ -20,7 +19,6 @@ pub enum TabId {
     Fs,
     Io,
     Smart,
-    Hot,
     Insights,
 }
 
@@ -31,7 +29,6 @@ pub const ALL_TABS: &[TabId] = &[
     TabId::Fs,
     TabId::Io,
     TabId::Smart,
-    TabId::Hot,
     TabId::Insights,
 ];
 
@@ -44,7 +41,6 @@ impl TabId {
             TabId::Fs => "FS",
             TabId::Io => "IO",
             TabId::Smart => "SMART",
-            TabId::Hot => "Hot Files",
             TabId::Insights => "Insights",
         }
     }
@@ -61,7 +57,6 @@ impl TabId {
             "fs" | "filesystems" => Some(TabId::Fs),
             "io" => Some(TabId::Io),
             "smart" => Some(TabId::Smart),
-            "hot" | "hotfiles" => Some(TabId::Hot),
             "insights" => Some(TabId::Insights),
             _ => None,
         }
@@ -76,7 +71,24 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         TabId::Fs => fs::draw(f, area, app),
         TabId::Io => io::draw(f, area, app),
         TabId::Smart => smart::draw(f, area, app),
-        TabId::Hot => hot::draw(f, area, app),
         TabId::Insights => insights::draw(f, area, app),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabId, ALL_TABS};
+
+    #[test]
+    fn exposes_seven_numbered_tabs() {
+        assert_eq!(ALL_TABS.len(), 7);
+        assert_eq!(TabId::Insights.number(), 7);
+    }
+
+    #[test]
+    fn removed_hot_files_tab_does_not_parse() {
+        assert_eq!(TabId::from_str("hot"), None);
+        assert_eq!(TabId::from_str("hotfiles"), None);
+        assert_eq!(TabId::from_str("insights"), Some(TabId::Insights));
     }
 }

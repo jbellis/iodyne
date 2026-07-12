@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -15,7 +17,7 @@ mod ui;
     about = "Single-host disk diagnostics TUI"
 )]
 struct Cli {
-    /// Start on a specific tab (overview, devices, volumes, fs, io, smart, hot, insights).
+    /// Start on a specific tab (overview, devices, volumes, fs, io, smart, insights).
     #[arg(long)]
     tab: Option<String>,
 
@@ -28,19 +30,46 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.diag {
-        return run_diag();
+        return match run_diag() {
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe) =>
+            {
+                Ok(())
+            }
+            result => result,
+        };
     }
     app::run(app::Options { start_tab: cli.tab })
 }
 
 fn run_diag() -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let latency = collect::ebpf::EbpfLatencyCollector::new();
+    writeln!(out, "=== Latency tracing ===")?;
+    writeln!(
+        out,
+        "  latency source={:?}  status={:?}",
+        latency.source(),
+        latency.status()
+    )?;
+    writeln!(
+        out,
+        "  VFS activity source={:?}  status={:?}",
+        latency.vfs_source(),
+        latency.vfs_status()
+    )?;
+
     let devices = collect::devices::collect();
-    println!("=== Devices ({}) ===", devices.len());
+    writeln!(out, "\n=== Devices ({}) ===", devices.len())?;
     for d in &devices {
-        println!(
+        writeln!(
+            out,
             "  {}  kind={:?}  size={}  used={}  model={:?}  smart={:?}",
             d.name, d.kind, d.size_bytes, d.used_bytes, d.model, d.smart_ok
-        );
+        )?;
     }
     let total: u64 = devices.iter().map(|d| d.size_bytes).sum();
     let used: u64 = devices.iter().map(|d| d.used_bytes).sum();
@@ -49,29 +78,31 @@ fn run_diag() -> Result<()> {
     } else {
         0
     };
-    println!("  TOTAL: size={}  used={}  pct={}%", total, used, pct);
+    writeln!(out, "  TOTAL: size={}  used={}  pct={}%", total, used, pct)?;
 
     #[cfg(target_os = "macos")]
     {
-        println!("\n=== container_to_physical map ===");
+        writeln!(out, "\n=== container_to_physical map ===")?;
         let cmap = collect::macos::container_to_physical_map();
         if cmap.is_empty() {
-            println!("  (empty)");
+            writeln!(out, "  (empty)")?;
         }
         for (synth, phys) in &cmap {
-            println!("  {} -> {}", synth, phys);
+            writeln!(out, "  {} -> {}", synth, phys)?;
         }
     }
 
-    println!(
+    writeln!(
+        out,
         "\n=== Filesystems ({}) ===",
         collect::filesystems::collect().len()
-    );
+    )?;
     for m in collect::filesystems::collect() {
-        println!(
+        writeln!(
+            out,
             "  {} -> {}  ({})  size={}  used={}",
             m.device, m.mount, m.fs_type, m.size_bytes, m.used_bytes
-        );
+        )?;
     }
 
     Ok(())

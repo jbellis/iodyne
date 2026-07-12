@@ -4,7 +4,6 @@
 //! Severity choices follow the BRIEF: CRIT for imminent failure, WARN
 //! for trending toward bad, INFO for noteworthy state.
 
-use crate::collect::hot_files::HotFileWatcher;
 use crate::collect::{DeviceTick, FsTick, IoTick, SmartCollector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +36,6 @@ pub fn evaluate(
     filesystems: &[FsTick],
     io: &[IoTick],
     smart: &SmartCollector,
-    hot_files: &HotFileWatcher,
 ) -> Vec<Insight> {
     let mut out = Vec::new();
     if let Some(i) = capacity_critical(filesystems) {
@@ -62,9 +60,6 @@ pub fn evaluate(
         out.push(i);
     }
     if let Some(i) = io_latency_outlier(io) {
-        out.push(i);
-    }
-    if let Some(i) = hot_file_runaway(hot_files) {
         out.push(i);
     }
     if let Some(i) = removable_present(devices) {
@@ -297,33 +292,6 @@ fn io_latency_outlier(io: &[IoTick]) -> Option<Insight> {
         title: "Disk p99 latency elevated".into(),
         body,
         suggested_tab: "io",
-    })
-}
-
-fn hot_file_runaway(watcher: &HotFileWatcher) -> Option<Insight> {
-    let top = watcher.top(3);
-    let runaway: Vec<_> = top.iter().filter(|f| f.events_per_sec >= 20.0).collect();
-    if runaway.is_empty() {
-        return None;
-    }
-    let mut body = vec![format!(
-        "{} path{} exceeding 20 events/sec.",
-        runaway.len(),
-        if runaway.len() == 1 { "" } else { "s" }
-    )];
-    for f in runaway.iter().take(3) {
-        body.push(format!(
-            "  {} — {:.1} ev/s  ({} total)",
-            f.path.display(),
-            f.events_per_sec,
-            f.total_events
-        ));
-    }
-    Some(Insight {
-        sev: Severity::Info,
-        title: "File-modification rate spike".into(),
-        body,
-        suggested_tab: "hot",
     })
 }
 
