@@ -1572,7 +1572,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         return;
     }
 
-    if app.io.hot_files_source() != VfsActivitySource::EbpfRequestedBytes {
+    if app.io.hot_files_source() != VfsActivitySource::EbpfCompletedBytes {
         draw_vfs_status(f, inner, vfs_unavailable_message(app.io.hot_files_status()));
         return;
     }
@@ -1674,7 +1674,16 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
     let processes = item
         .display_processes
         .iter()
-        .map(|(comm, pid)| format!("{comm} [{pid}]"))
+        .map(|(comm, pid)| {
+            let workload = item
+                .display_workloads
+                .iter()
+                .find_map(|(workload_pid, label)| (workload_pid == pid).then_some(label));
+            workload.map_or_else(
+                || format!("{comm} [{pid}]"),
+                |label| format!("{comm} [{pid}] · {label}"),
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     spans.push(Span::styled(
@@ -2713,6 +2722,7 @@ mod tests {
             comm: "writer".into(),
             processes: vec![("writer".into(), 7, 7)],
             display_processes: vec![("writer".into(), 7)],
+            display_workloads: Vec::new(),
             basename: "data.bin".into(),
             path: "/srv/data.bin".into(),
             read_bps,

@@ -49,8 +49,8 @@ const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
 const PROC_FD_SCAN_LIMIT: usize = 256;
 
 /// Rolling host-wide VFS activity attributed to a file and process. Rates are
-/// averaged over up to the most recent ten seconds. Byte rates are requested
-/// byte counts at VFS entry, not returned bytes or physical disk traffic.
+/// averaged over up to the most recent ten seconds. Byte rates are completed
+/// VFS byte counts, not physical disk traffic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VfsFileActivity {
     pub fs_device: BlockDeviceId,
@@ -62,6 +62,8 @@ pub struct VfsFileActivity {
     pub processes: Vec<(String, u32, u32)>,
     /// Presentation identities, collapsed to immediate parents when available.
     pub display_processes: Vec<(String, u32)>,
+    /// Container/workload labels keyed by displayed host PID.
+    pub display_workloads: Vec<(u32, String)>,
     pub basename: String,
     pub path: String,
     pub read_bps: f64,
@@ -301,7 +303,7 @@ pub struct IoCollector {
     /// retained so each device's p99 timeline represents real time.
     pub traced_history: HashMap<String, VecDeque<TracedLatencySample>>,
     pub latest: Vec<IoTick>,
-    /// Bounded, host-wide VFS requested-byte activity sorted hottest first.
+    /// Bounded, host-wide VFS completed-byte activity sorted hottest first.
     pub hot_files: Vec<VfsFileActivity>,
     vfs_activity_window: VfsActivityWindow,
     latency_probe: EbpfLatencyCollector,
@@ -422,13 +424,13 @@ impl IoCollector {
     }
 
     fn sample_hot_files(&mut self, elapsed: f64) {
-        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
             self.vfs_activity_window.clear();
             return;
         }
         let deltas = self.latency_probe.vfs_snapshot();
-        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfRequestedBytes {
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
             self.vfs_activity_window.clear();
             return;
@@ -437,6 +439,7 @@ impl IoCollector {
         self.hot_files = self.vfs_activity_window.ranked(HOT_FILE_LIMIT);
         resolve_hot_file_paths(&mut self.hot_files);
         collapse_hot_file_processes(&mut self.hot_files);
+        annotate_workload_processes(&mut self.hot_files);
     }
 
     fn sample_traced_latency(&mut self) {
@@ -551,6 +554,7 @@ struct VfsActivityTotal {
     counts: VfsActivityCounts,
     pid: u32,
     comm: String,
+    container_owned: bool,
     basename: String,
     path: String,
 }
@@ -611,6 +615,7 @@ impl VfsActivityWindow {
                 counts: VfsActivityCounts::default(),
                 pid: delta.pid,
                 comm: delta.comm.clone(),
+                container_owned: delta.container_owned,
                 basename: delta.basename.clone(),
                 path: delta.path.clone(),
             });
@@ -619,6 +624,7 @@ impl VfsActivityWindow {
             // refreshed while the same filesystem identity remains hot.
             total.pid = delta.pid;
             total.comm = delta.comm;
+            total.container_owned |= delta.container_owned;
             total.basename = delta.basename;
             if !delta.path.is_empty() {
                 total.path = delta.path;
@@ -676,6 +682,11 @@ impl VfsActivityWindow {
                 comm: total.comm.clone(),
                 processes: vec![(total.comm.clone(), total.pid, key.tgid)],
                 display_processes: vec![(total.comm.clone(), key.tgid)],
+                display_workloads: total
+                    .container_owned
+                    .then(|| (key.tgid, "container".to_string()))
+                    .into_iter()
+                    .collect(),
                 basename: total.basename.clone(),
                 read_bps: total.counts.read_bytes / elapsed,
                 write_bps: total.counts.write_bytes / elapsed,
@@ -699,6 +710,7 @@ fn merge_vfs_processes(activity: &mut Vec<VfsFileActivity>) {
             existing.read_ops += item.read_ops;
             existing.write_ops += item.write_ops;
             existing.processes.extend(item.processes);
+            existing.display_workloads.extend(item.display_workloads);
             if existing.path.starts_with(&existing.basename)
                 && !item.path.starts_with(&item.basename)
             {
@@ -719,6 +731,8 @@ fn merge_vfs_processes(activity: &mut Vec<VfsFileActivity>) {
             .collect();
         item.display_processes.sort();
         item.display_processes.dedup();
+        item.display_workloads.sort();
+        item.display_workloads.dedup();
     }
     activity.extend(merged.into_values());
 }
@@ -888,6 +902,78 @@ fn parent_process_at(pid: u32, proc_root: &std::path::Path) -> Option<(String, u
 
 #[cfg(not(target_os = "linux"))]
 fn collapse_hot_file_processes(_activity: &mut [VfsFileActivity]) {}
+
+#[cfg(target_os = "linux")]
+fn annotate_workload_processes(activity: &mut [VfsFileActivity]) {
+    annotate_workload_processes_at(activity, std::path::Path::new("/proc"));
+}
+
+#[cfg(target_os = "linux")]
+fn annotate_workload_processes_at(activity: &mut [VfsFileActivity], proc_root: &std::path::Path) {
+    let mut cache = HashMap::<u32, Option<String>>::new();
+    for item in activity {
+        for (_, pid) in &item.display_processes {
+            let exact = cache
+                .entry(*pid)
+                .or_insert_with(|| workload_label_at(*pid, proc_root))
+                .clone();
+            if let Some(label) = exact {
+                if let Some(existing) = item
+                    .display_workloads
+                    .iter_mut()
+                    .find(|(workload_pid, _)| workload_pid == pid)
+                {
+                    existing.1 = label;
+                } else {
+                    item.display_workloads.push((*pid, label));
+                }
+            }
+        }
+        item.display_workloads.sort();
+        item.display_workloads.dedup();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn annotate_workload_processes(_activity: &mut [VfsFileActivity]) {}
+
+#[cfg(target_os = "linux")]
+fn workload_label_at(pid: u32, proc_root: &std::path::Path) -> Option<String> {
+    let cgroups = std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+    container_workload_label(&cgroups)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn container_workload_label(cgroups: &str) -> Option<String> {
+    for line in cgroups.lines() {
+        let path = line.splitn(3, ':').nth(2)?;
+        let components: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+        for (index, component) in components.iter().enumerate() {
+            let scope = component.strip_suffix(".scope").unwrap_or(component);
+            for (prefix, runtime) in [
+                ("docker-", "docker"),
+                ("libpod-", "podman"),
+                ("cri-containerd-", "containerd"),
+                ("crio-", "cri-o"),
+            ] {
+                if let Some(id) = scope.strip_prefix(prefix).filter(|id| container_id(id)) {
+                    return Some(format!("{runtime} {}", &id[..id.len().min(12)]));
+                }
+            }
+            if *component == "docker" {
+                if let Some(id) = components.get(index + 1).filter(|id| container_id(id)) {
+                    return Some(format!("docker {}", &id[..id.len().min(12)]));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn container_id(value: &str) -> bool {
+    value.len() >= 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 /// Decode glibc's userspace dev_t representation (the inverse of makedev).
 #[cfg(target_os = "linux")]
@@ -1108,6 +1194,7 @@ mod tests {
             pid: 101,
             tgid: 100,
             comm: "writer".into(),
+            container_owned: false,
             basename: format!("file-{inode}"),
             path: String::new(),
             read_bytes,
@@ -1118,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_file_ranking_uses_total_requested_rate_and_limit() {
+    fn hot_file_ranking_uses_total_completed_rate_and_limit() {
         let mut window = VfsActivityWindow::default();
         window.push(vec![vfs_delta(1, 100, 0), vfs_delta(2, 50, 200)], 0.5);
         let ranked = window.ranked(1);
@@ -1193,6 +1280,72 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_workloads_are_parsed_from_common_cgroup_layouts() {
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            container_workload_label(&format!("0::/system.slice/docker-{id}.scope\n")),
+            Some("docker 0123456789ab".into())
+        );
+        assert_eq!(
+            container_workload_label(&format!("8:cpu:/docker/{id}\n")),
+            Some("docker 0123456789ab".into())
+        );
+        assert_eq!(
+            container_workload_label(&format!("0::/user.slice/libpod-{id}.scope\n")),
+            Some("podman 0123456789ab".into())
+        );
+        assert_eq!(
+            container_workload_label(&format!("0::/kubepods.slice/cri-containerd-{id}.scope\n")),
+            Some("containerd 0123456789ab".into())
+        );
+        assert_eq!(container_workload_label("0::/user.slice/app.scope\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn displayed_processes_receive_workload_labels() {
+        let root =
+            std::env::temp_dir().join(format!("iodyne-cgroup-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("100")).unwrap();
+        std::fs::write(
+            root.join("100/cgroup"),
+            "0::/system.slice/docker-0123456789abcdef.scope\n",
+        )
+        .unwrap();
+        let mut window = VfsActivityWindow::default();
+        let mut delta = vfs_delta(42, 1, 0);
+        delta.container_owned = true;
+        window.push(vec![delta], 1.0);
+        let mut activity = window.ranked(64);
+
+        annotate_workload_processes_at(&mut activity, &root);
+
+        assert_eq!(
+            activity[0].display_workloads,
+            vec![(100, "docker 0123456789ab".into())]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_overlay_container_marker_survives_requester_exit() {
+        let mut delta = vfs_delta(42, 1, 0);
+        delta.container_owned = true;
+        let mut window = VfsActivityWindow::default();
+        window.push(vec![delta], 1.0);
+        let mut activity = window.ranked(64);
+
+        annotate_workload_processes_at(&mut activity, std::path::Path::new("/does/not/exist"));
+
+        assert_eq!(
+            activity[0].display_workloads,
+            vec![(100, "container".into())]
+        );
+    }
+
     #[test]
     fn event_time_path_is_preferred_and_survives_empty_later_samples() {
         let mut window = VfsActivityWindow::default();
@@ -1235,7 +1388,7 @@ mod tests {
         window.push(vec![vfs_delta(1, 800, 0)], 8.0);
 
         // Four of the first sample's six seconds expired, leaving 200 + 800
-        // requested bytes in the ten-second window.
+        // completed bytes in the ten-second window.
         assert_near(window.ranked(64)[0].read_bps, 100.0);
         assert_near(window.elapsed, 10.0);
     }
@@ -1298,6 +1451,7 @@ mod tests {
             comm: "test".into(),
             processes: vec![("test".into(), pid, pid)],
             display_processes: vec![("test".into(), pid)],
+            display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),
             path: fallback_file_path("Cargo.toml", metadata.ino()),
             read_bps: 1.0,
@@ -1320,6 +1474,7 @@ mod tests {
             comm: "test".into(),
             processes: vec![("test".into(), std::process::id(), std::process::id())],
             display_processes: vec![("test".into(), std::process::id())],
+            display_workloads: Vec::new(),
             basename: "data.log".into(),
             path: "/captured/at/event/time/data.log".into(),
             read_bps: 1.0,
@@ -1365,6 +1520,7 @@ mod tests {
             comm: "worker".into(),
             processes: vec![("worker".into(), task_pid, leader_pid)],
             display_processes: vec![("worker".into(), leader_pid)],
+            display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),
             path: fallback_file_path("Cargo.toml", metadata.ino()),
             read_bps: 1.0,

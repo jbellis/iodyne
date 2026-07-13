@@ -43,10 +43,33 @@ iodyne falls back to aggregate await statistics.
 Separate VFS objects contain optional `vfs_read` and `vfs_write` kprobes. Their
 map creation, load, and attach status is independent: a kernel without the ring
 buffer map type or either VFS symbol can still provide block latency. Each
-operation emits a compact record to a 1 MiB ring buffer; userspace drains and
-groups a bounded number of received records once per display interval. A full
-ring drops VFS attribution rather than delaying the filesystem operation, and
-sustained producers cannot monopolize the UI thread.
+successful operation emits its completed byte count as a compact record to a
+1 MiB ring buffer; userspace drains and groups a bounded number of received
+records once per display interval. A full ring drops VFS attribution rather
+than delaying the filesystem operation, and sustained producers cannot
+monopolize the UI thread.
+
+Classic `/dev/fuse` requests are correlated across the userspace-filesystem
+boundary. When the kernel exposes `fuse_copy_args`, a probe reads the requester
+PID directly from the selected in-kernel `fuse_req`; a `/dev/fuse` read-return
+probe provides a compatibility fallback. Regular-file operations performed by
+that daemon worker before its FUSE reply are attributed to the requester, whose
+thread ID is resolved to a host process in userspace. The maps and event field
+are named for delegated I/O so other proxy mechanisms can be added without
+changing the presentation model. This currently covers the synchronous worker
+model used by libfuse, including fuse-overlayfs; FUSE-over-io_uring,
+passthrough, requests whose protocol PID is zero, and daemons that hand a
+request to a different worker thread are not yet correlated. `--diag` reports
+the direct kernel-request hook separately as FUSE requester attribution.
+
+Kernel OverlayFS is handled without a delegation lookup because the original
+container task remains current. Entry/return probes on `ovl_read_iter` and
+`ovl_write_iter` scope the nested `vfs_iter_read` and `vfs_iter_write` calls;
+those nested calls expose the real upper/lower regular file and its physical
+filesystem device. A nesting counter prevents stacked overlays from leaking
+state, and direct iter I/O outside OverlayFS is ignored. These hooks attach
+independently, so a kernel without OverlayFS symbols retains base VFS and FUSE
+collection. `--diag` reports their attach status.
 
 The probe admits only regular files on filesystems with a nonzero block-device
 major. Device nodes, PTYs, pipes, sockets, and anonymous pseudo-filesystems are
@@ -67,12 +90,18 @@ basename and inode. It only polls paths for keys received from the ring during
 the current interval; it never installs recursive watches or walks filesystem
 trees.
 
-VFS byte counts are the `count` requested at function entry, not bytes returned
-to the caller and not physical disk bytes. Page-cache hits are included;
-buffered writeback is attributed to the writing process at the original VFS
-call rather than to a later kernel worker. mmap I/O, direct paths that bypass
+VFS byte counts are successful return values from the probed VFS calls, not
+caller buffer capacities and not physical disk bytes. Page-cache hits are
+included; buffered writeback is attributed to the writing process at the
+original VFS call rather than to a later kernel worker. mmap I/O, direct paths that bypass
 `vfs_read`/`vfs_write` (including some io_uring operations), metadata I/O, and
 files whose operations bypass these hooks may be absent. Overlong paths and
 kernels that reject event-time path capture use the `/proc` fallback; when that
 also cannot resolve a file, iodyne retains the bounded basename and inode
 identity.
+
+For displayed host processes, userspace also reads the bounded
+`/proc/<pid>/cgroup` record and recognizes Docker, Podman/libpod, containerd,
+and CRI-O scope conventions. It adds a runtime plus shortened container ID to
+the process label without connecting to a runtime socket or requiring runtime
+metadata files.

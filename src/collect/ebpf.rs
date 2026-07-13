@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 pub const LATENCY_BUCKETS: usize = 32;
+const FUSE_ORIGIN_UNKNOWN: u32 = u32::MAX;
 /// One ringful at the current event size. Bounding each synchronous drain
 /// guarantees that sustained producers cannot monopolize the UI thread.
 const MAX_VFS_EVENTS_PER_DRAIN: usize = 8192;
@@ -33,9 +34,9 @@ pub enum LatencySource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsActivitySource {
     Unavailable,
-    /// Counts the byte count requested at `vfs_read`/`vfs_write` entry.
-    /// This is not the syscall return value or physical-device traffic.
-    EbpfRequestedBytes,
+    /// Counts bytes completed by VFS read/write calls. This is filesystem
+    /// traffic rather than physical-device traffic and can include cache hits.
+    EbpfCompletedBytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,8 +101,12 @@ struct VfsEvent {
     bytes: u64,
     pid: u32,
     direction: u32,
+    origin_pid: u32,
+    origin_tgid: u32,
     comm: [u8; 16],
+    origin_comm: [u8; 16],
     basename: [u8; 64],
+    cgroup_id: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +122,9 @@ pub(crate) struct VfsActivityDelta {
     pub pid: u32,
     pub tgid: u32,
     pub comm: String,
+    /// The operation was delegated through fuse-overlayfs. This survives a
+    /// short-lived requester exiting before userspace can read its cgroup.
+    pub container_owned: bool,
     pub basename: String,
     pub path: String,
     pub read_bytes: u64,
@@ -141,6 +149,9 @@ pub struct EbpfLatencyCollector {
     status: EbpfStatus,
     vfs_status: EbpfStatus,
     vfs_path_status: EbpfStatus,
+    vfs_fuse_status: EbpfStatus,
+    vfs_overlay_status: EbpfStatus,
+    cgroup_container_cache: HashMap<u64, bool>,
     previous: HashMap<HistogramKey, u64>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     latency_bpf: Option<aya::Bpf>,
@@ -162,6 +173,9 @@ impl EbpfLatencyCollector {
             status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_path_status: EbpfStatus::Unavailable("test fixture".into()),
+            vfs_fuse_status: EbpfStatus::Unavailable("test fixture".into()),
+            vfs_overlay_status: EbpfStatus::Unavailable("test fixture".into()),
+            cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             latency_bpf: None,
@@ -188,15 +202,23 @@ impl EbpfLatencyCollector {
     }
 
     /// Event-time full-path capture is optional and independent of VFS
-    /// requested-byte accounting. Diagnostics expose this separately so a
+    /// completed-byte accounting. Diagnostics expose this separately so a
     /// host can distinguish kernel paths from the userspace fallback.
     pub fn vfs_path_status(&self) -> &EbpfStatus {
         &self.vfs_path_status
     }
 
+    pub fn vfs_fuse_status(&self) -> &EbpfStatus {
+        &self.vfs_fuse_status
+    }
+
+    pub fn vfs_overlay_status(&self) -> &EbpfStatus {
+        &self.vfs_overlay_status
+    }
+
     pub fn vfs_source(&self) -> VfsActivitySource {
         if self.vfs_status.is_active() {
-            VfsActivitySource::EbpfRequestedBytes
+            VfsActivitySource::EbpfCompletedBytes
         } else {
             VfsActivitySource::Unavailable
         }
@@ -218,7 +240,7 @@ impl EbpfLatencyCollector {
         snapshots_from_counts(delta)
     }
 
-    /// Returns bounded per-file VFS requested-byte deltas since the previous
+    /// Returns bounded per-file VFS completed-byte deltas since the previous
     /// sample. A VFS map failure disables only this capability.
     pub(crate) fn vfs_snapshot(&mut self) -> Vec<VfsActivityDelta> {
         if !self.vfs_status.is_active() {
@@ -238,20 +260,42 @@ impl EbpfLatencyCollector {
     fn load() -> Self {
         match load_linux() {
             Ok(latency_bpf) => {
-                let (vfs_bpf, vfs_status, vfs_path_status) = match load_vfs_linux() {
-                    Ok((bpf, path_status)) => (Some(bpf), EbpfStatus::Active, path_status),
-                    Err(error) => (
-                        None,
-                        independent_vfs_status(Err(error.clone())),
-                        EbpfStatus::Unavailable(format!(
-                            "VFS activity initialization failed before path attach: {error}"
-                        )),
-                    ),
-                };
+                let (
+                    vfs_bpf,
+                    vfs_status,
+                    vfs_path_status,
+                    vfs_fuse_status,
+                    vfs_overlay_status,
+                ) =
+                    match load_vfs_linux() {
+                        Ok((bpf, path_status, fuse_status, overlay_status)) => (
+                            Some(bpf),
+                            EbpfStatus::Active,
+                            path_status,
+                            fuse_status,
+                            overlay_status,
+                        ),
+                        Err(error) => (
+                            None,
+                            independent_vfs_status(Err(error.clone())),
+                            EbpfStatus::Unavailable(format!(
+                                "VFS activity initialization failed before path attach: {error}"
+                            )),
+                            EbpfStatus::Unavailable(format!(
+                                "VFS activity initialization failed before FUSE attach: {error}"
+                            )),
+                            EbpfStatus::Unavailable(format!(
+                                "VFS activity initialization failed before OverlayFS attach: {error}"
+                            )),
+                        ),
+                    };
                 Self {
                     status: EbpfStatus::Active,
                     vfs_status,
                     vfs_path_status,
+                    vfs_fuse_status,
+                    vfs_overlay_status,
+                    cgroup_container_cache: HashMap::new(),
                     previous: HashMap::new(),
                     latency_bpf: Some(latency_bpf),
                     vfs_bpf,
@@ -265,6 +309,13 @@ impl EbpfLatencyCollector {
                 vfs_path_status: EbpfStatus::Unavailable(format!(
                     "block probe initialization failed before VFS path attach: {error}"
                 )),
+                vfs_fuse_status: EbpfStatus::Unavailable(format!(
+                    "block probe initialization failed before FUSE attach: {error}"
+                )),
+                vfs_overlay_status: EbpfStatus::Unavailable(format!(
+                    "block probe initialization failed before OverlayFS attach: {error}"
+                )),
+                cgroup_container_cache: HashMap::new(),
                 previous: HashMap::new(),
                 latency_bpf: None,
                 vfs_bpf: None,
@@ -278,6 +329,9 @@ impl EbpfLatencyCollector {
             status: EbpfStatus::DisabledAtBuild,
             vfs_status: EbpfStatus::DisabledAtBuild,
             vfs_path_status: EbpfStatus::DisabledAtBuild,
+            vfs_fuse_status: EbpfStatus::DisabledAtBuild,
+            vfs_overlay_status: EbpfStatus::DisabledAtBuild,
+            cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
         }
     }
@@ -288,6 +342,9 @@ impl EbpfLatencyCollector {
             status: EbpfStatus::UnsupportedPlatform,
             vfs_status: EbpfStatus::UnsupportedPlatform,
             vfs_path_status: EbpfStatus::UnsupportedPlatform,
+            vfs_fuse_status: EbpfStatus::UnsupportedPlatform,
+            vfs_overlay_status: EbpfStatus::UnsupportedPlatform,
+            cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
         }
     }
@@ -318,11 +375,14 @@ impl EbpfLatencyCollector {
     fn read_vfs_counts(&mut self) -> Result<Vec<VfsActivityDelta>, String> {
         use aya::maps::{HashMap as AyaHashMap, MapError, RingBuf};
 
+        let cgroup_container_cache = &mut self.cgroup_container_cache;
         let bpf = self
             .vfs_bpf
             .as_mut()
             .ok_or_else(|| "eBPF collector is not loaded".to_string())?;
         let mut deltas = HashMap::<VfsFileKey, VfsActivityDelta>::new();
+        let mut path_keys = HashMap::<VfsFileKey, VfsFileKey>::new();
+        let mut delegated_processes = HashMap::<u32, Option<(u32, String)>>::new();
         {
             let events = bpf
                 .map_mut("VFS_EVENTS")
@@ -336,23 +396,64 @@ impl EbpfLatencyCollector {
                 let Some(event) = decode_vfs_event(&item) else {
                     continue;
                 };
-                let delta = deltas.entry(event.key).or_insert_with(|| VfsActivityDelta {
-                    device: BlockDeviceId {
-                        major: event.key.major,
-                        minor: event.key.minor,
-                    },
-                    inode: event.key.inode,
-                    pid: event.pid,
-                    tgid: event.key.tgid,
-                    comm: bpf_string(&event.comm),
-                    basename: bpf_string(&event.basename),
-                    path: String::new(),
-                    read_bytes: 0,
-                    write_bytes: 0,
-                    read_ops: 0,
-                    write_ops: 0,
-                });
-                delta.pid = event.pid;
+                let mut effective_key = event.key;
+                let cgroup_is_container = event.cgroup_id != 0
+                    && *cgroup_container_cache
+                        .entry(event.cgroup_id)
+                        .or_insert_with(|| cgroup_id_is_container(event.cgroup_id));
+                let delegated_by_fuse_overlay =
+                    event.origin_pid != 0 && bpf_string(&event.comm) == "fuse-overlayfs";
+                let (pid, comm) = if event.origin_pid == FUSE_ORIGIN_UNKNOWN {
+                    (event.pid, "fuse-overlayfs (async)".to_string())
+                } else if event.origin_pid != 0 {
+                    let identity = delegated_processes
+                        .entry(event.origin_pid)
+                        .or_insert_with(|| delegated_process_identity(event.origin_pid));
+                    if let Some((tgid, comm)) = identity {
+                        effective_key.tgid = *tgid;
+                        (event.origin_pid, comm.clone())
+                    } else {
+                        effective_key.tgid = if event.origin_tgid != 0 {
+                            event.origin_tgid
+                        } else {
+                            event.origin_pid
+                        };
+                        let cached_comm = bpf_string(&event.origin_comm);
+                        let comm = if cached_comm.is_empty() {
+                            "process (exited)".to_string()
+                        } else {
+                            cached_comm
+                        };
+                        (event.origin_pid, comm)
+                    }
+                } else {
+                    (event.pid, bpf_string(&event.comm))
+                };
+                if effective_key.tgid == std::process::id() {
+                    continue;
+                }
+                path_keys.entry(effective_key).or_insert(event.key);
+                let delta = deltas
+                    .entry(effective_key)
+                    .or_insert_with(|| VfsActivityDelta {
+                        device: BlockDeviceId {
+                            major: effective_key.major,
+                            minor: effective_key.minor,
+                        },
+                        inode: effective_key.inode,
+                        pid,
+                        tgid: effective_key.tgid,
+                        comm,
+                        container_owned: delegated_by_fuse_overlay || cgroup_is_container,
+                        basename: bpf_string(&event.basename),
+                        path: String::new(),
+                        read_bytes: 0,
+                        write_bytes: 0,
+                        read_ops: 0,
+                        write_ops: 0,
+                    });
+                delta.pid = pid;
+                delta.container_owned |= delegated_by_fuse_overlay || cgroup_is_container;
                 if event.direction == 0 {
                     delta.read_bytes = delta.read_bytes.saturating_add(event.bytes);
                     delta.read_ops = delta.read_ops.saturating_add(1);
@@ -371,7 +472,8 @@ impl EbpfLatencyCollector {
                 let paths = AyaHashMap::<_, VfsFileKey, VfsFilePath>::try_from(paths)
                     .map_err(|error| format!("cannot access eBPF VFS path map: {error}"))?;
                 for (key, delta) in &mut deltas {
-                    match paths.get(key, 0) {
+                    let path_key = path_keys.get(key).unwrap_or(key);
+                    match paths.get(path_key, 0) {
                         Ok(path) => delta.path = bpf_string(&path.path),
                         Err(MapError::KeyNotFound) => {}
                         Err(error) => {
@@ -444,7 +546,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
+fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus), String> {
     use aya::maps::Array;
     use aya::programs::KProbe;
 
@@ -469,6 +571,8 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
     for (program_name, function_name) in [
         ("iodyne_vfs_read", "vfs_read"),
         ("iodyne_vfs_write", "vfs_write"),
+        ("iodyne_fuse_read_complete", "vfs_read"),
+        ("iodyne_vfs_write_complete", "vfs_write"),
     ] {
         let program: &mut KProbe = bpf
             .program_mut(program_name)
@@ -482,11 +586,77 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
             .attach(function_name, 0)
             .map_err(|error| format!("cannot attach {program_name}: {error}"))?;
     }
+    // This cleanup hook is opportunistic because kernels built without FUSE
+    // do not expose fuse_dev_write. A worker's next /dev/fuse read also clears
+    // stale attribution, so base VFS collection remains useful either way.
+    let _ = attach_optional_kprobe(&mut bpf, "iodyne_fuse_reply", "fuse_dev_write");
+    // Newer kernels expose the in-kernel request at this stable FUSE copy
+    // boundary. Keep the userspace-buffer decoder above as a fallback when
+    // this internal symbol is unavailable.
+    let fuse_status = attach_optional_kprobe(&mut bpf, "iodyne_fuse_request", "fuse_copy_args")
+        .and_then(|_| {
+            attach_optional_kprobe(
+                &mut bpf,
+                "iodyne_fuse_requester_identity",
+                "request_wait_answer",
+            )
+        });
+
+    // OverlayFS is commonly a module, so these symbols may be absent even on
+    // kernels that support it. Attach exits and physical backing hooks first;
+    // an entry hook is enabled only when its cleanup and recorder are live.
+    let overlay_status = (|| -> Result<(), String> {
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_read_exit", "ovl_read_iter")?;
+        attach_optional_kprobe(
+            &mut bpf,
+            "iodyne_overlay_backing_read_complete",
+            "vfs_iter_read",
+        )?;
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_backing_read", "vfs_iter_read")?;
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_read_enter", "ovl_read_iter")?;
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_write_exit", "ovl_write_iter")?;
+        attach_optional_kprobe(
+            &mut bpf,
+            "iodyne_overlay_backing_write_complete",
+            "vfs_iter_write",
+        )?;
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_backing_write", "vfs_iter_write")?;
+        attach_optional_kprobe(&mut bpf, "iodyne_overlay_write_enter", "ovl_write_iter")?;
+        Ok(())
+    })();
     // Path capture is a separate, newer capability. Count probes remain
     // attached when BTF lookup, verifier policy, or the helper allowlist
     // rejects this program.
     let path_status = attach_vfs_path_linux(&mut bpf);
-    Ok((bpf, independent_vfs_status(path_status)))
+    Ok((
+        bpf,
+        independent_vfs_status(path_status),
+        independent_vfs_status(fuse_status),
+        independent_vfs_status(overlay_status),
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn attach_optional_kprobe(
+    bpf: &mut aya::Bpf,
+    program_name: &str,
+    function_name: &str,
+) -> Result<(), String> {
+    use aya::programs::KProbe;
+
+    let Some(program) = bpf.program_mut(program_name) else {
+        return Err(format!("eBPF program {program_name} is missing"));
+    };
+    let Ok(program): Result<&mut KProbe, _> = program.try_into() else {
+        return Err(format!("invalid eBPF program {program_name}"));
+    };
+    program
+        .load()
+        .map_err(|error| format!("cannot load {program_name}: {error}"))?;
+    program
+        .attach(function_name, 0)
+        .map_err(|error| format!("cannot attach {program_name} to {function_name}: {error}"))?;
+    Ok(())
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -560,6 +730,65 @@ fn bpf_string(bytes: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn delegated_process_identity(pid: u32) -> Option<(u32, String)> {
+    delegated_process_identity_at(pid, std::path::Path::new("/proc"))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn delegated_process_identity_at(pid: u32, proc_root: &std::path::Path) -> Option<(u32, String)> {
+    let status = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;
+    let tgid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let comm = std::fs::read_to_string(proc_root.join(tgid.to_string()).join("comm"))
+        .ok()?
+        .trim()
+        .to_string();
+    (!comm.is_empty()).then_some((tgid, comm))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn cgroup_id_is_container(cgroup_id: u64) -> bool {
+    cgroup_id_is_container_at(cgroup_id, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn cgroup_id_is_container_at(cgroup_id: u64, root: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_CGROUP_DIRS: usize = 16_384;
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0;
+    while let Some(path) = pending.pop() {
+        visited += 1;
+        if visited > MAX_CGROUP_DIRS {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.ino() == cgroup_id {
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+            return super::io::container_workload_label(&format!("0::/{relative}\n")).is_some();
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            continue;
+        };
+        pending.extend(entries.filter_map(Result::ok).filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        }));
+    }
+    false
 }
 
 fn decode_vfs_event(bytes: &[u8]) -> Option<VfsEvent> {
@@ -668,8 +897,12 @@ mod tests {
             bytes,
             pid: 1001,
             direction,
+            origin_pid: 0,
+            origin_tgid: 0,
             comm,
+            origin_comm: [0; 16],
             basename,
+            cgroup_id: 0,
         }
     }
 
@@ -707,6 +940,42 @@ mod tests {
         assert_eq!(bpf_string(&decoded.comm), "test");
         assert_eq!(bpf_string(&decoded.basename), "data.log");
         assert!(decode_vfs_event(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[test]
+    fn delegated_process_identity_collapses_a_thread_to_its_process() {
+        let root = std::env::temp_dir().join(format!("iodyne-fuse-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("101")).unwrap();
+        std::fs::create_dir_all(root.join("100")).unwrap();
+        std::fs::write(root.join("101/status"), "Name:\tworker\nTgid:\t100\n").unwrap();
+        std::fs::write(root.join("100/comm"), "container-app\n").unwrap();
+
+        assert_eq!(
+            delegated_process_identity_at(101, &root),
+            Some((100, "container-app".into()))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[test]
+    fn resolves_exited_container_ownership_from_cgroup_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let root =
+            std::env::temp_dir().join(format!("iodyne-cgroup-id-fixture-{}", std::process::id()));
+        let container = root
+            .join("user.slice")
+            .join(format!("libpod-{id}.scope"))
+            .join("container");
+        std::fs::create_dir_all(&container).unwrap();
+        let cgroup_id = std::fs::metadata(&container).unwrap().ino();
+
+        assert!(cgroup_id_is_container_at(cgroup_id, &root));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -80,6 +80,16 @@ fn run_diag() -> Result<()> {
         "  VFS event paths status={:?}",
         latency.vfs_path_status()
     )?;
+    writeln!(
+        out,
+        "  FUSE requester attribution status={:?}",
+        latency.vfs_fuse_status()
+    )?;
+    writeln!(
+        out,
+        "  OverlayFS backing attribution status={:?}",
+        latency.vfs_overlay_status()
+    )?;
 
     let devices = collect::devices::collect();
     writeln!(out, "\n=== Devices ({}) ===", devices.len())?;

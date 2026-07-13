@@ -53,19 +53,26 @@ Privileged Linux additionally attempts two independent eBPF collectors:
 - **Block latency** measures each block request from issue to final completion,
   including time queued and in service. Bounded in-kernel histograms are read
   once per display interval; individual events are not streamed to userspace.
-- **VFS activity** attributes requested bytes and operations to filesystem
+- **VFS activity** attributes completed bytes and operations to filesystem
   device, inode, and process. Compact operation records flow through a bounded
   kernel ring buffer and are aggregated into display intervals in userspace.
+  For classic FUSE daemons, backing-file operations are attributed to the
+  requester PID carried by the FUSE protocol instead of the daemon process.
+  Kernel OverlayFS operations are mapped to their real upper/lower backing
+  file while retaining the originating container process. Recognized cgroup
+  scopes add a Docker, Podman, containerd, or CRI-O workload ID to that process.
+  A short-lived fuse-overlayfs requester retains a generic `container` marker
+  when it exits before its exact cgroup can be resolved.
   A `security_file_permission` fentry probe calls
   `bpf_d_path()` while the file path is valid, so short-lived files normally
   retain their path. Paths are bounded to 256 bytes; `/proc/<pid>/fd` remains a
   fallback when event-time capture is unavailable.
 
 These are deliberately different accounting layers. The block view describes
-physical requests reaching a device. The VFS view describes bytes requested by
-applications at `vfs_read`/`vfs_write` entry: reads satisfied by page cache are
-included, and buffered writes are charged when requested rather than when
-writeback later reaches storage. Requested bytes can exceed returned bytes.
+physical requests reaching a device. The VFS view describes bytes completed by
+`vfs_read`/`vfs_write`: reads satisfied by page cache are included, and buffered
+writes are charged when accepted by the VFS rather than when writeback later
+reaches storage.
 
 Use diagnostics to see which probes and collectors actually loaded:
 
