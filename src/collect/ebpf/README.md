@@ -54,13 +54,17 @@ boundary. When the kernel exposes `fuse_copy_args`, a probe reads the requester
 PID directly from the selected in-kernel `fuse_req`; a `/dev/fuse` read-return
 probe provides a compatibility fallback. Regular-file operations performed by
 that daemon worker before its FUSE reply are attributed to the requester, whose
-thread ID is resolved to a host process in userspace. The maps and event field
-are named for delegated I/O so other proxy mechanisms can be added without
-changing the presentation model. This currently covers the synchronous worker
-model used by libfuse, including fuse-overlayfs; FUSE-over-io_uring,
-passthrough, requests whose protocol PID is zero, and daemons that hand a
-request to a different worker thread are not yet correlated. `--diag` reports
-the direct kernel-request hook separately as FUSE requester attribution.
+thread ID is resolved to a host process in userspace.
+
+Writeback-cache requests can carry protocol PID zero because the task that
+dirtied the page is no longer current when FUSE submits the write. A probe on
+`fuse_file_write_iter` remembers the logical writer by FUSE mount and node ID;
+the later request uses that identity only when it is at most 60 seconds old and
+unambiguous. A different process writing the same node suppresses attribution
+for 60 seconds rather than guessing. FUSE-over-io_uring, passthrough, and
+requests that cannot be joined to a recent logical writer remain attributed to
+the FUSE daemon. `--diag` reports the direct requester hook and PID-zero
+writeback hook separately.
 
 Kernel OverlayFS is handled without a delegation lookup because the original
 container task remains current. Entry/return probes on `ovl_read_iter` and

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
+use sysinfo::System;
 
 use crate::collect;
 use crate::config::Settings;
@@ -23,6 +25,7 @@ use crate::ui::palette as p;
 const SAMPLE_INTERVAL_STEP: Duration = Duration::from_millis(100);
 const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const CPU_HISTORY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveState {
@@ -42,6 +45,9 @@ pub struct App {
     pub smart: collect::SmartCollector,
     pub selected_io: usize,
     pub sample_interval: Duration,
+    pub cpu_usage: f64,
+    pub cpu_history: VecDeque<f64>,
+    cpu_system: System,
     /// Last full enumeration (slow path — system_profiler + diskutil).
     last_metadata_refresh: Instant,
     /// Last usage refresh (fast path — sysinfo only).
@@ -57,11 +63,16 @@ impl App {
         let filesystems = collect::filesystems::collect();
         let volumes = collect::volumes::collect();
         let io = collect::IoCollector::new();
+        let mut cpu_system = System::new();
+        cpu_system.refresh_cpu_usage();
         let mut smart = collect::SmartCollector::new();
         smart.refresh_if_due(&devices);
         Self {
             live: LiveState::Live,
             sample_interval: collect::io::DEFAULT_SAMPLE_INTERVAL,
+            cpu_usage: 0.0,
+            cpu_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
+            cpu_system,
             selected_io: 0,
             devices,
             filesystems,
@@ -109,7 +120,17 @@ impl App {
     fn tick(&mut self) {
         // The collector forms calm display buckets at the selected cadence.
         // The eBPF backend still accounts for every request between polls.
-        self.io.sample(self.sample_interval);
+        if self.io.sample(self.sample_interval) {
+            self.cpu_system.refresh_cpu_usage();
+            let usage = self.cpu_system.global_cpu_usage() as f64;
+            if usage.is_finite() {
+                self.cpu_usage = usage.clamp(0.0, 100.0);
+                self.cpu_history.push_back(self.cpu_usage);
+                if self.cpu_history.len() > CPU_HISTORY_LEN {
+                    self.cpu_history.pop_front();
+                }
+            }
+        }
         let visible_io = crate::screen::visible_device_count(self);
         self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
 
@@ -435,6 +456,9 @@ mod tests {
         App {
             live: LiveState::Live,
             sample_interval: collect::io::DEFAULT_SAMPLE_INTERVAL,
+            cpu_usage: 37.0,
+            cpu_history: VecDeque::from([8.0, 14.0, 31.0, 22.0, 37.0]),
+            cpu_system: System::new(),
             devices,
             filesystems,
             volumes: VolumeTick::default(),
@@ -473,8 +497,8 @@ mod tests {
             "B/s",
             "IOPS",
             "1 device",
-            "LIVE",
             "2000ms",
+            "CPU 37%",
             "READ",
             "WRITE",
             "Await",
@@ -514,9 +538,20 @@ mod tests {
         let app = fixture_app(false);
         let empty = render_screen(&app, 130, 40);
         assert!(empty.contains("No IO data yet"));
-        assert!(empty.contains("LIVE"));
         assert!(empty.contains("2000ms"));
+        assert!(empty.contains("CPU 37%"));
         let _ = render_screen(&app, 60, 20);
+    }
+
+    #[test]
+    fn paused_header_replaces_sampling_control() {
+        let mut app = fixture_app(false);
+        handle_key(&mut app, KeyCode::Char('p'));
+        let screen = render_screen(&app, 130, 20);
+
+        assert!(screen.contains("PAUSED"));
+        assert!(!screen.contains("2000ms"));
+        assert!(screen.contains("CPU 37%"));
     }
 
     #[test]

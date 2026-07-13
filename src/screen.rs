@@ -29,7 +29,7 @@ use crate::collect::{
 };
 use crate::ui::format::{fmt_rate, fmt_size, unit_mode, UnitMode};
 use crate::ui::palette as p;
-use crate::ui::sparkline::BaselineSparkline;
+use crate::ui::sparkline::{sparkline_symbols, BaselineSparkline};
 
 const LATENCY_MIN_US: f64 = 50.0;
 const LATENCY_MAX_US: f64 = 1_000_000.0;
@@ -83,8 +83,8 @@ fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ))
-    .title(live_title(app))
-    .title(sample_interval_title(app));
+    .title(center_status_title(app))
+    .title(cpu_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -133,33 +133,53 @@ fn overview_title(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn live_title(app: &App) -> Line<'static> {
-    let (label, color) = match app.live {
-        LiveState::Live => ("LIVE", p::GREEN),
-        LiveState::Paused => ("PAUSE", p::YELLOW),
-    };
-    Line::from(vec![Span::styled(
-        format!(" ● {label}  {} ", Local::now().format("%H:%M:%S")),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )])
+fn center_status_title(app: &App) -> Line<'static> {
+    let clock = Local::now().format("%H:%M:%S");
+    match app.live {
+        LiveState::Live => Line::from(vec![
+            Span::styled(
+                " - ",
+                Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}ms", app.sample_interval.as_millis()),
+                Style::default()
+                    .fg(p::BR_WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" +  {clock} "),
+                Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        LiveState::Paused => Line::from(vec![
+            Span::styled(
+                " PAUSED ",
+                Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {clock} "), Style::default().fg(p::DIM)),
+        ]),
+    }
     .centered()
 }
 
-fn sample_interval_title(app: &App) -> Line<'static> {
+fn cpu_title(app: &App) -> Line<'static> {
+    let color = if app.cpu_usage >= 90.0 {
+        p::RED
+    } else if app.cpu_usage >= 70.0 {
+        p::YELLOW
+    } else {
+        p::GREEN
+    };
+    let samples: Vec<_> = app.cpu_history.iter().copied().collect();
     Line::from(vec![
         Span::styled(
-            " - ",
-            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+            format!(" {} ", sparkline_symbols(&samples, 8, 100.0)),
+            Style::default().fg(color),
         ),
         Span::styled(
-            format!("{}ms", app.sample_interval.as_millis()),
-            Style::default()
-                .fg(p::BR_WHITE)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " + ",
-            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+            format!(" CPU {:.0}% ", app.cpu_usage),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ])
     .right_aligned()
@@ -187,8 +207,8 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
     let (throughput_scale, iops_scale) =
         overview_workload_scales(&visible, Some(&aggregate.history), app);
     let overview_block = pane_block(overview_title(app))
-        .title(live_title(app))
-        .title(sample_interval_title(app));
+        .title(center_status_title(app))
+        .title(cpu_title(app));
     let overview_inner = overview_block.inner(sections[0]);
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
@@ -407,8 +427,8 @@ fn draw_no_mounted_io(f: &mut Frame, area: Rect, app: &App) {
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ))
-    .title(live_title(app))
-    .title(sample_interval_title(app));
+    .title(center_status_title(app))
+    .title(cpu_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(

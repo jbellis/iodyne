@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 pub const LATENCY_BUCKETS: usize = 32;
 const FUSE_ORIGIN_UNKNOWN: u32 = u32::MAX;
+const FUSE_ORIGIN_PROTOCOL: u32 = 1;
+const FUSE_ORIGIN_WRITEBACK: u32 = 2;
+const FUSE_ORIGIN_PID_ZERO: u32 = 3;
 /// One ringful at the current event size. Bounding each synchronous drain
 /// guarantees that sustained producers cannot monopolize the UI thread.
 const MAX_VFS_EVENTS_PER_DRAIN: usize = 8192;
@@ -111,6 +114,9 @@ struct VfsEvent {
     origin_parent_tgid: u32,
     parent_comm: [u8; 16],
     origin_parent_comm: [u8; 16],
+    origin_kind: u32,
+    _origin_padding: u32,
+    origin_cgroup_id: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,6 +163,7 @@ pub struct EbpfLatencyCollector {
     vfs_status: EbpfStatus,
     vfs_path_status: EbpfStatus,
     vfs_fuse_status: EbpfStatus,
+    vfs_fuse_writeback_status: EbpfStatus,
     vfs_overlay_status: EbpfStatus,
     cgroup_container_cache: HashMap<u64, bool>,
     previous: HashMap<HistogramKey, u64>,
@@ -181,6 +188,7 @@ impl EbpfLatencyCollector {
             vfs_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_path_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_fuse_status: EbpfStatus::Unavailable("test fixture".into()),
+            vfs_fuse_writeback_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_overlay_status: EbpfStatus::Unavailable("test fixture".into()),
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
@@ -217,6 +225,10 @@ impl EbpfLatencyCollector {
 
     pub fn vfs_fuse_status(&self) -> &EbpfStatus {
         &self.vfs_fuse_status
+    }
+
+    pub fn vfs_fuse_writeback_status(&self) -> &EbpfStatus {
+        &self.vfs_fuse_writeback_status
     }
 
     pub fn vfs_overlay_status(&self) -> &EbpfStatus {
@@ -272,14 +284,22 @@ impl EbpfLatencyCollector {
                     vfs_status,
                     vfs_path_status,
                     vfs_fuse_status,
+                    vfs_fuse_writeback_status,
                     vfs_overlay_status,
                 ) =
                     match load_vfs_linux() {
-                        Ok((bpf, path_status, fuse_status, overlay_status)) => (
+                        Ok((
+                            bpf,
+                            path_status,
+                            fuse_status,
+                            fuse_writeback_status,
+                            overlay_status,
+                        )) => (
                             Some(bpf),
                             EbpfStatus::Active,
                             path_status,
                             fuse_status,
+                            fuse_writeback_status,
                             overlay_status,
                         ),
                         Err(error) => (
@@ -292,6 +312,9 @@ impl EbpfLatencyCollector {
                                 "VFS activity initialization failed before FUSE attach: {error}"
                             )),
                             EbpfStatus::Unavailable(format!(
+                                "VFS activity initialization failed before FUSE writeback attach: {error}"
+                            )),
+                            EbpfStatus::Unavailable(format!(
                                 "VFS activity initialization failed before OverlayFS attach: {error}"
                             )),
                         ),
@@ -301,6 +324,7 @@ impl EbpfLatencyCollector {
                     vfs_status,
                     vfs_path_status,
                     vfs_fuse_status,
+                    vfs_fuse_writeback_status,
                     vfs_overlay_status,
                     cgroup_container_cache: HashMap::new(),
                     previous: HashMap::new(),
@@ -318,6 +342,9 @@ impl EbpfLatencyCollector {
                 )),
                 vfs_fuse_status: EbpfStatus::Unavailable(format!(
                     "block probe initialization failed before FUSE attach: {error}"
+                )),
+                vfs_fuse_writeback_status: EbpfStatus::Unavailable(format!(
+                    "block probe initialization failed before FUSE writeback attach: {error}"
                 )),
                 vfs_overlay_status: EbpfStatus::Unavailable(format!(
                     "block probe initialization failed before OverlayFS attach: {error}"
@@ -337,6 +364,7 @@ impl EbpfLatencyCollector {
             vfs_status: EbpfStatus::DisabledAtBuild,
             vfs_path_status: EbpfStatus::DisabledAtBuild,
             vfs_fuse_status: EbpfStatus::DisabledAtBuild,
+            vfs_fuse_writeback_status: EbpfStatus::DisabledAtBuild,
             vfs_overlay_status: EbpfStatus::DisabledAtBuild,
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
@@ -350,6 +378,7 @@ impl EbpfLatencyCollector {
             vfs_status: EbpfStatus::UnsupportedPlatform,
             vfs_path_status: EbpfStatus::UnsupportedPlatform,
             vfs_fuse_status: EbpfStatus::UnsupportedPlatform,
+            vfs_fuse_writeback_status: EbpfStatus::UnsupportedPlatform,
             vfs_overlay_status: EbpfStatus::UnsupportedPlatform,
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
@@ -404,44 +433,60 @@ impl EbpfLatencyCollector {
                     continue;
                 };
                 let mut effective_key = event.key;
-                let cgroup_is_container = event.cgroup_id != 0
+                let effective_cgroup_id = if event.origin_cgroup_id != 0 {
+                    event.origin_cgroup_id
+                } else {
+                    event.cgroup_id
+                };
+                let cgroup_is_container = effective_cgroup_id != 0
                     && *cgroup_container_cache
-                        .entry(event.cgroup_id)
-                        .or_insert_with(|| cgroup_id_is_container(event.cgroup_id));
-                let delegated_by_fuse_overlay =
-                    event.origin_pid != 0 && bpf_string(&event.comm) == "fuse-overlayfs";
+                        .entry(effective_cgroup_id)
+                        .or_insert_with(|| cgroup_id_is_container(effective_cgroup_id));
+                let delegated_by_fuse_overlay = matches!(
+                    event.origin_kind,
+                    FUSE_ORIGIN_PROTOCOL | FUSE_ORIGIN_WRITEBACK | FUSE_ORIGIN_PID_ZERO
+                ) && bpf_string(&event.comm) == "fuse-overlayfs";
                 let (pid, comm, parent_tgid, parent_comm) =
                     if event.origin_pid == FUSE_ORIGIN_UNKNOWN {
                         (event.pid, "fuse-overlayfs".to_string(), 0, String::new())
                     } else if event.origin_pid != 0 {
-                        let identity = delegated_processes
-                            .entry(event.origin_pid)
-                            .or_insert_with(|| delegated_process_identity(event.origin_pid));
-                        if let Some((tgid, comm)) = identity {
-                            effective_key.tgid = *tgid;
-                            (
-                                event.origin_pid,
-                                comm.clone(),
-                                event.origin_parent_tgid,
-                                bpf_string(&event.origin_parent_comm),
-                            )
+                        // A protocol header PID is relative to the requester's
+                        // PID namespace. Only consult host /proc after a BPF
+                        // hook has supplied the corresponding host identity.
+                        if event.origin_tgid != 0 {
+                            let identity = delegated_processes
+                                .entry(event.origin_pid)
+                                .or_insert_with(|| delegated_process_identity(event.origin_pid));
+                            if let Some((tgid, comm)) = identity {
+                                effective_key.tgid = *tgid;
+                                (
+                                    event.origin_pid,
+                                    comm.clone(),
+                                    event.origin_parent_tgid,
+                                    bpf_string(&event.origin_parent_comm),
+                                )
+                            } else {
+                                effective_key.tgid = event.origin_tgid;
+                                let cached_comm = bpf_string(&event.origin_comm);
+                                let comm = if cached_comm.is_empty() {
+                                    "process (exited)".to_string()
+                                } else {
+                                    cached_comm
+                                };
+                                (
+                                    event.origin_pid,
+                                    comm,
+                                    event.origin_parent_tgid,
+                                    bpf_string(&event.origin_parent_comm),
+                                )
+                            }
                         } else {
-                            effective_key.tgid = if event.origin_tgid != 0 {
-                                event.origin_tgid
-                            } else {
-                                event.origin_pid
-                            };
-                            let cached_comm = bpf_string(&event.origin_comm);
-                            let comm = if cached_comm.is_empty() {
-                                "process (exited)".to_string()
-                            } else {
-                                cached_comm
-                            };
+                            effective_key.tgid = event.origin_pid;
                             (
                                 event.origin_pid,
-                                comm,
-                                event.origin_parent_tgid,
-                                bpf_string(&event.origin_parent_comm),
+                                format!("pid {} (unresolved)", event.origin_pid),
+                                0,
+                                String::new(),
                             )
                         }
                     } else {
@@ -575,7 +620,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus), String> {
+fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, EbpfStatus), String> {
     use aya::maps::Array;
     use aya::programs::KProbe;
 
@@ -622,14 +667,26 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus), St
     // Newer kernels expose the in-kernel request at this stable FUSE copy
     // boundary. Keep the userspace-buffer decoder above as a fallback when
     // this internal symbol is unavailable.
-    let fuse_status = attach_optional_kprobe(&mut bpf, "iodyne_fuse_request", "fuse_copy_args")
-        .and_then(|_| {
-            attach_optional_kprobe(
-                &mut bpf,
-                "iodyne_fuse_requester_identity",
-                "request_wait_answer",
-            )
-        });
+    let fuse_request_status =
+        attach_optional_kprobe(&mut bpf, "iodyne_fuse_request", "fuse_copy_args");
+    let fuse_status = match &fuse_request_status {
+        Ok(()) => attach_optional_kprobe(
+            &mut bpf,
+            "iodyne_fuse_requester_identity",
+            "request_wait_answer",
+        ),
+        Err(error) => Err(error.clone()),
+    };
+    let fuse_writeback_status = match &fuse_request_status {
+        Ok(()) => attach_optional_kprobe(
+            &mut bpf,
+            "iodyne_fuse_logical_writer",
+            "fuse_file_write_iter",
+        ),
+        Err(error) => Err(format!(
+            "FUSE PID-0 writeback attribution requires requester correlation: {error}"
+        )),
+    };
 
     // OverlayFS is commonly a module, so these symbols may be absent even on
     // kernels that support it. Attach exits and physical backing hooks first;
@@ -661,6 +718,7 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus), St
         bpf,
         independent_vfs_status(path_status),
         independent_vfs_status(fuse_status),
+        independent_vfs_status(fuse_writeback_status),
         independent_vfs_status(overlay_status),
     ))
 }
@@ -936,6 +994,9 @@ mod tests {
             origin_parent_tgid: 0,
             parent_comm: [0; 16],
             origin_parent_comm: [0; 16],
+            origin_kind: 0,
+            _origin_padding: 0,
+            origin_cgroup_id: 0,
         }
     }
 
@@ -960,6 +1021,7 @@ mod tests {
     #[test]
     fn vfs_ring_record_decodes_without_alignment_assumptions() {
         let event = vfs_event(120, 0);
+        assert_eq!(std::mem::size_of::<VfsEvent>(), 208);
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 (&event as *const VfsEvent).cast::<u8>(),

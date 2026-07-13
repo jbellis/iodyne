@@ -21,6 +21,11 @@
 #define FUSE_DEVICE_MAJOR 10
 #define FUSE_DEVICE_MINOR 229
 #define FUSE_ORIGIN_UNKNOWN 0xffffffffU
+#define FUSE_ORIGIN_PROTOCOL 1
+#define FUSE_ORIGIN_WRITEBACK 2
+#define FUSE_ORIGIN_PID_ZERO 3
+#define FUSE_WRITE 16
+#define FUSE_WRITER_MAX_AGE_NS (60ULL * 1000 * 1000 * 1000)
 
 typedef unsigned short __u16;
 typedef unsigned int __u32;
@@ -28,6 +33,7 @@ typedef unsigned long long __u64;
 
 struct super_block {
     __u32 s_dev;
+    void *s_fs_info;
 } __attribute__((preserve_access_index));
 struct inode {
     struct super_block *i_sb;
@@ -47,6 +53,9 @@ struct path {
 struct file {
     struct path f_path;
     struct inode *f_inode;
+} __attribute__((preserve_access_index));
+struct kiocb {
+    struct file *ki_filp;
 } __attribute__((preserve_access_index));
 struct task_struct {
     int tgid;
@@ -92,6 +101,9 @@ struct vfs_event {
     __u32 origin_parent_tgid;
     char parent_comm[TASK_COMM_LEN];
     char origin_parent_comm[TASK_COMM_LEN];
+    __u32 origin_kind;
+    __u32 _origin_padding;
+    __u64 origin_cgroup_id;
 };
 struct fuse_in_header {
     __u32 len;
@@ -107,6 +119,11 @@ struct fuse_req {
     struct {
         struct fuse_in_header h;
     } in;
+    void *fm;
+} __attribute__((preserve_access_index));
+struct fuse_inode {
+    struct inode inode;
+    __u64 nodeid;
 } __attribute__((preserve_access_index));
 struct fuse_copy_state {
     int write;
@@ -121,10 +138,27 @@ struct pending_vfs_io {
     __u32 _padding;
 };
 struct requester_identity {
+    __u32 pid;
     __u32 tgid;
     __u32 parent_tgid;
+    __u32 _padding;
+    __u64 cgroup_id;
     char comm[TASK_COMM_LEN];
     char parent_comm[TASK_COMM_LEN];
+};
+struct active_fuse_request {
+    __u32 origin_pid;
+    __u32 kind;
+    struct requester_identity identity;
+};
+struct fuse_writer_key {
+    __u64 mount;
+    __u64 nodeid;
+};
+struct fuse_writer {
+    struct requester_identity identity;
+    __u64 last_seen_ns;
+    __u64 ambiguous_until_ns;
 };
 
 struct {
@@ -155,8 +189,19 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, __u64);
-    __type(value, __u32);
+    __type(value, struct active_fuse_request);
 } ACTIVE_FUSE_REQUESTS SEC(".maps");
+
+// Writeback-cache requests carry protocol PID zero. Remember the process that
+// dirtied each logical FUSE node while it is still current, scoped by mount so
+// independent containers cannot collide. Conflicting writers stay ambiguous
+// for one bounded writeback window rather than receiving invented attribution.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct fuse_writer_key);
+    __type(value, struct fuse_writer);
+} FUSE_LOGICAL_WRITERS SEC(".maps");
 
 // FUSE supplies only a PID with the later daemon request. Cache the name and
 // process group while the requester is current so short-lived commands remain
@@ -211,6 +256,7 @@ static long (*bpf_map_update_elem)(void *map, const void *key,
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
+static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static void *(*bpf_get_current_task)(void) = (void *)35;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 static long (*bpf_get_current_comm)(void *buf, __u32 size) = (void *)16;
@@ -378,11 +424,105 @@ static __inline __attribute__((always_inline)) void remember_fuse_identity(
     if (!key)
         return;
     struct requester_identity identity = {
+        .pid = (__u32)pid_tgid,
         .tgid = (__u32)(pid_tgid >> 32),
+        .cgroup_id = bpf_get_current_cgroup_id(),
     };
     bpf_get_current_comm(identity.comm, sizeof(identity.comm));
     current_parent_identity(&identity.parent_tgid, identity.parent_comm);
     bpf_map_update_elem(&FUSE_REQUESTER_IDENTITIES, &key, &identity, 0);
+}
+
+static __inline __attribute__((always_inline)) void current_identity(
+    __u64 pid_tgid, struct requester_identity *identity) {
+    identity->pid = (__u32)pid_tgid;
+    identity->tgid = (__u32)(pid_tgid >> 32);
+    identity->cgroup_id = bpf_get_current_cgroup_id();
+    bpf_get_current_comm(identity->comm, sizeof(identity->comm));
+    current_parent_identity(&identity->parent_tgid, identity->parent_comm);
+}
+
+static __inline __attribute__((always_inline)) int fuse_writer_key_for_file(
+    struct file *file, struct fuse_writer_key *key) {
+    struct inode *inode = 0;
+    struct super_block *sb = 0;
+    void *fm = 0;
+    __u64 nodeid = 0;
+    if (!file ||
+        bpf_probe_read_kernel(&inode, sizeof(inode),
+                              __builtin_preserve_access_index(&file->f_inode)) ||
+        !inode ||
+        bpf_probe_read_kernel(&sb, sizeof(sb),
+                              __builtin_preserve_access_index(&inode->i_sb)) ||
+        !sb ||
+        bpf_probe_read_kernel(&fm, sizeof(fm),
+                              __builtin_preserve_access_index(&sb->s_fs_info)) ||
+        !fm ||
+        bpf_probe_read_kernel(
+            &nodeid, sizeof(nodeid),
+            __builtin_preserve_access_index(
+                &((struct fuse_inode *)inode)->nodeid)) ||
+        !nodeid)
+        return -1;
+    key->mount = (__u64)fm;
+    key->nodeid = nodeid;
+    return 0;
+}
+
+static __inline __attribute__((always_inline)) void remember_fuse_writer(
+    struct file *file, __u64 pid_tgid) {
+    struct fuse_writer_key key = {};
+    if (fuse_writer_key_for_file(file, &key))
+        return;
+    __u64 now = bpf_ktime_get_ns();
+    struct fuse_writer next = {
+        .last_seen_ns = now,
+    };
+    current_identity(pid_tgid, &next.identity);
+    struct fuse_writer *previous =
+        bpf_map_lookup_elem(&FUSE_LOGICAL_WRITERS, &key);
+    if (previous && now - previous->last_seen_ns <= FUSE_WRITER_MAX_AGE_NS) {
+        if (previous->identity.tgid != next.identity.tgid)
+            next.ambiguous_until_ns = now + FUSE_WRITER_MAX_AGE_NS;
+        else
+            next.ambiguous_until_ns = previous->ambiguous_until_ns;
+    }
+    bpf_map_update_elem(&FUSE_LOGICAL_WRITERS, &key, &next, 0);
+}
+
+static __inline __attribute__((always_inline)) void begin_fuse_request(
+    __u64 daemon_pid_tgid, struct fuse_req *req, struct fuse_in_header *header) {
+    struct active_fuse_request active = {};
+    if (header->pid) {
+        active.origin_pid = header->pid;
+        active.kind = FUSE_ORIGIN_PROTOCOL;
+    } else {
+        active.origin_pid = FUSE_ORIGIN_UNKNOWN;
+        active.kind = FUSE_ORIGIN_PID_ZERO;
+        if (header->opcode == FUSE_WRITE && header->nodeid && req) {
+            void *fm = 0;
+            if (!bpf_probe_read_kernel(
+                    &fm, sizeof(fm),
+                    __builtin_preserve_access_index(&req->fm)) &&
+                fm) {
+                struct fuse_writer_key key = {
+                    .mount = (__u64)fm,
+                    .nodeid = header->nodeid,
+                };
+                struct fuse_writer *writer =
+                    bpf_map_lookup_elem(&FUSE_LOGICAL_WRITERS, &key);
+                __u64 now = bpf_ktime_get_ns();
+                if (writer && now - writer->last_seen_ns <=
+                                  FUSE_WRITER_MAX_AGE_NS &&
+                    writer->ambiguous_until_ns <= now) {
+                    active.origin_pid = writer->identity.pid;
+                    active.kind = FUSE_ORIGIN_WRITEBACK;
+                    active.identity = writer->identity;
+                }
+            }
+        }
+    }
+    bpf_map_update_elem(&ACTIVE_FUSE_REQUESTS, &daemon_pid_tgid, &active, 0);
 }
 
 static __inline __attribute__((always_inline)) void begin_fuse_read(
@@ -440,14 +580,22 @@ static __inline __attribute__((always_inline)) int record_vfs_file(
     event.bytes = count;
     event.direction = direction;
     event.cgroup_id = bpf_get_current_cgroup_id();
-    __u32 *origin_pid = bpf_map_lookup_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid);
-    if (origin_pid) {
-        event.origin_pid = *origin_pid;
-        struct requester_identity *identity = bpf_map_lookup_elem(
-            &FUSE_REQUESTER_IDENTITIES, origin_pid);
+    struct active_fuse_request *active =
+        bpf_map_lookup_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid);
+    if (active) {
+        event.origin_pid = active->origin_pid;
+        event.origin_kind = active->kind;
+        struct requester_identity *identity = 0;
+        if (active->identity.tgid)
+            identity = &active->identity;
+        else
+            identity = bpf_map_lookup_elem(&FUSE_REQUESTER_IDENTITIES,
+                                           &active->origin_pid);
         if (identity) {
+            event.origin_pid = identity->pid;
             event.origin_tgid = identity->tgid;
             event.origin_parent_tgid = identity->parent_tgid;
+            event.origin_cgroup_id = identity->cgroup_id;
             __builtin_memcpy(event.origin_comm, identity->comm,
                              sizeof(event.origin_comm));
             __builtin_memcpy(event.origin_parent_comm, identity->parent_comm,
@@ -518,8 +666,7 @@ int iodyne_fuse_read_complete(struct pt_regs *ctx) {
     if (bpf_probe_read_user(&header, sizeof(header), (void *)user_buffer) ||
         header.len < sizeof(header) || !header.unique)
         return 0;
-    __u32 origin_pid = header.pid ? header.pid : FUSE_ORIGIN_UNKNOWN;
-    bpf_map_update_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid, &origin_pid, 0);
+    begin_fuse_request(pid_tgid, 0, &header);
     return 0;
 }
 
@@ -547,15 +694,13 @@ int iodyne_fuse_request(struct pt_regs *ctx) {
             __builtin_preserve_access_index(&cs->req)) ||
         !req)
         return 0;
-    __u32 origin_pid = 0;
+    struct fuse_in_header header = {};
     if (bpf_probe_read_kernel(
-            &origin_pid, sizeof(origin_pid),
-            __builtin_preserve_access_index(&req->in.h.pid)))
+            &header, sizeof(header),
+            __builtin_preserve_access_index(&req->in.h)))
         return 0;
-    if (!origin_pid)
-        origin_pid = FUSE_ORIGIN_UNKNOWN;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid, &origin_pid, 0);
+    begin_fuse_request(pid_tgid, req, &header);
     return 0;
 }
 
@@ -574,6 +719,22 @@ int iodyne_fuse_requester_identity(struct pt_regs *ctx) {
         !origin_pid)
         return 0;
     remember_fuse_identity(origin_pid, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+// Capture the writer before writeback-cache decouples dirtying the logical
+// FUSE inode from the later PID-zero request serviced by the daemon.
+SEC("kprobe/fuse_file_write_iter")
+int iodyne_fuse_logical_writer(struct pt_regs *ctx) {
+    struct kiocb *iocb = first_pointer_arg(ctx);
+    struct file *file = 0;
+    if (!iocb ||
+        bpf_probe_read_kernel(
+            &file, sizeof(file),
+            __builtin_preserve_access_index(&iocb->ki_filp)) ||
+        !file)
+        return 0;
+    remember_fuse_writer(file, bpf_get_current_pid_tgid());
     return 0;
 }
 

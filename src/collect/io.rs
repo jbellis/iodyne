@@ -359,12 +359,12 @@ impl IoCollector {
     }
 
     /// Called from the main loop and rate-limited to the selected cadence.
-    pub fn sample(&mut self, interval: Duration) {
+    pub fn sample(&mut self, interval: Duration) -> bool {
         self.poll_vfs_events();
         let now = Instant::now();
         let elapsed_dur = now - self.last_sample;
         if elapsed_dur < interval {
-            return;
+            return false;
         }
         let elapsed = elapsed_dur.as_secs_f64().max(0.001);
         self.last_sample = now;
@@ -429,6 +429,7 @@ impl IoCollector {
         self.prev_totals = totals;
         self.sample_traced_latency();
         self.sample_hot_files(elapsed);
+        true
     }
 
     fn sample_hot_files(&mut self, elapsed: f64) {

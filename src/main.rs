@@ -87,6 +87,11 @@ fn run_diag() -> Result<()> {
     )?;
     writeln!(
         out,
+        "  FUSE PID-0 writeback attribution status={:?}",
+        latency.vfs_fuse_writeback_status()
+    )?;
+    writeln!(
+        out,
         "  OverlayFS backing attribution status={:?}",
         latency.vfs_overlay_status()
     )?;

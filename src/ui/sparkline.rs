@@ -29,6 +29,23 @@ pub struct BaselineSparkline<'a> {
     max: Option<f64>,
 }
 
+/// Render a one-row sparkline into text for places such as block titles that
+/// accept styled spans rather than widgets. This intentionally uses the same
+/// braille renderer as the throughput and IOPS graphs.
+pub fn sparkline_symbols(samples: &[f64], width: u16, max: f64) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let area = Rect::new(0, 0, width, 1);
+    let mut buffer = Buffer::empty(area);
+    BaselineSparkline::new(samples)
+        .max(max)
+        .render(area, &mut buffer);
+    (0..width)
+        .map(|x| buffer.cell((x, 0)).map_or(" ", |cell| cell.symbol()))
+        .collect()
+}
+
 impl<'a> BaselineSparkline<'a> {
     pub fn new(samples: &'a [f64]) -> Self {
         Self {
@@ -165,5 +182,21 @@ mod tests {
 
         assert_ne!(last.symbol(), "\u{2800}");
         assert_eq!(last.fg, Color::Cyan);
+    }
+
+    #[test]
+    fn title_symbols_use_the_same_braille_renderer() {
+        let samples = [0.0, 50.0, 100.0];
+        let symbols = sparkline_symbols(&samples, 2, 100.0);
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buffer = Buffer::empty(area);
+        BaselineSparkline::new(&samples)
+            .max(100.0)
+            .render(area, &mut buffer);
+        let rendered = (0..2)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect::<String>();
+
+        assert_eq!(symbols, rendered);
     }
 }
