@@ -44,9 +44,10 @@ const HEAT_LABELS: [&str; 7] = [
     ">=256ms",
 ];
 const WIDE_DETAIL_HEIGHT: u16 = 28;
+#[cfg(test)]
 const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 2;
 const COMPACT_DETAIL_HEIGHT: u16 = 23;
-const DIRECTION_DETAIL_HEIGHT: u16 = 14;
+const DIRECTION_DETAIL_HEIGHT: u16 = 13;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
@@ -961,18 +962,38 @@ fn draw_detail_data(
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let available_inner = area.height.saturating_sub(2);
+    let context_rows = detail_context_row_count(available_inner, context.len());
+    let device_content_height = context_rows
+        .saturating_add(DIRECTION_DETAIL_HEIGHT.min(available_inner.saturating_sub(context_rows)));
+    let minimum_device_height = device_content_height.saturating_add(2).min(area.height);
+    let has_vfs = area.height > minimum_device_height.saturating_add(2);
+    let device_area = Rect {
+        height: if has_vfs {
+            minimum_device_height
+        } else {
+            area.height
+        },
+        ..area
+    };
+    let vfs_area = Rect {
+        y: area.y + device_area.height + has_vfs as u16,
+        height: area
+            .height
+            .saturating_sub(device_area.height + has_vfs as u16),
+        ..area
+    };
     let block = pane_block(Span::styled(
         header,
         Style::default()
             .fg(p::BR_WHITE)
             .add_modifier(Modifier::BOLD),
     ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(device_area);
+    f.render_widget(block, device_area);
     if inner.height == 0 {
         return;
     }
-    let context_rows = detail_context_row_count(inner.height, context.len());
     for (offset, line) in context.iter().take(context_rows as usize).enumerate() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -992,7 +1013,17 @@ fn draw_detail_data(
         height: inner.height.saturating_sub(context_rows),
         ..inner
     };
-    let (read_area, write_area, vfs_area) = detail_areas(body);
+    let gutter = (body.width > 1) as u16;
+    let column_width = body.width.saturating_sub(gutter) / 2;
+    let read_area = Rect {
+        width: column_width,
+        ..body
+    };
+    let write_area = Rect {
+        x: body.x + column_width + gutter,
+        width: body.width.saturating_sub(column_width + gutter),
+        ..body
+    };
     let workload = history.map(|history| workload_view(&history.workload_samples));
     let await_view = history.map(|history| await_view(&history.await_samples));
     draw_direction_detail(
@@ -1020,6 +1051,7 @@ fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
         .min(detail_height.saturating_sub(DIRECTION_DETAIL_HEIGHT))
 }
 
+#[cfg(test)]
 fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
     let packed = Rect {
         height: body.height.min(WIDE_DETAIL_BODY_HEIGHT),
@@ -1088,16 +1120,22 @@ fn draw_direction_detail(
         IoLane::Write => ("WRITE", p::CYAN),
     };
     let total = histogram.iter().sum::<u64>();
-    let block = pane_block(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            name,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" | 60s | n={total} "), Style::default().fg(p::DIM)),
-    ]));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                name,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" | 60s | n={total}"), Style::default().fg(p::DIM)),
+        ])),
+        Rect { height: 1, ..area },
+    );
+    let inner = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
     let label_width = 11.min(inner.width);
     for band in 0..7.min(inner.height as usize) {
         let y = inner.y + band as u16;
@@ -1620,11 +1658,8 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
         Span::styled("·".repeat(bar.empty), Style::default().fg(p::FAINT)),
         Span::raw(" "),
     ];
-    let inode = format!("inode {}", item.inode);
-    let inode_width = inode.chars().count().min(area.width as usize);
-    let inode_x = area.x + area.width.saturating_sub(inode_width as u16);
-    let stats_width = inode_x.saturating_sub(area.x).saturating_sub(2);
-    if stats_width as usize >= vfs_stats_width(bar_width, rate_width, ops_width) {
+    let stats_width = vfs_stats_width(bar_width, rate_width, ops_width);
+    if area.width as usize >= stats_width {
         spans.extend([
             Span::styled(
                 format!("R {read} {read_ops:>ops_width$}/s"),
@@ -1636,35 +1671,36 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
             ),
         ]);
     }
+    let processes = item
+        .display_processes
+        .iter()
+        .map(|(comm, pid)| format!("{comm} [{pid}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    spans.push(Span::styled(
+        format!(" {processes}"),
+        Style::default().fg(p::DIM),
+    ));
     f.render_widget(
         Paragraph::new(Line::from(spans)),
-        Rect {
-            width: stats_width,
-            height: 1,
-            ..area
-        },
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(inode, Style::default().fg(p::DIM))),
-        Rect {
-            x: inode_x,
-            width: inode_width as u16,
-            height: 1,
-            ..area
-        },
+        Rect { height: 1, ..area },
     );
 
-    let path_indent = (bar_width + 1).min(area.width as usize) as u16;
-    let path_width = area.width.saturating_sub(path_indent) as usize;
+    let inode = format!("inode {}  ", item.inode);
+    let inode_width = inode.chars().count();
+    let path_width = (area.width as usize).saturating_sub(inode_width);
+    let path = if path_width == 0 {
+        String::new()
+    } else {
+        truncate_text(&path, path_width)
+    };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            truncate_text(&path, path_width),
-            Style::default().fg(p::DIM),
-        )),
+        Paragraph::new(Line::from(vec![
+            Span::styled(inode, Style::default().fg(p::DIM)),
+            Span::styled(path, Style::default().fg(p::FG)),
+        ])),
         Rect {
-            x: area.x + path_indent,
             y: area.y + 1,
-            width: area.width.saturating_sub(path_indent),
             height: 1,
             ..area
         },
@@ -2675,6 +2711,8 @@ mod tests {
             pid: 7,
             tgid: 7,
             comm: "writer".into(),
+            processes: vec![("writer".into(), 7, 7)],
+            display_processes: vec![("writer".into(), 7)],
             basename: "data.bin".into(),
             path: "/srv/data.bin".into(),
             read_bps,
@@ -3159,13 +3197,13 @@ mod tests {
     fn context_rows_preserve_directional_and_normal_vfs_bodies() {
         assert_eq!(detail_context_row_count(28, 2), 2);
         let (_, _, tall_vfs) = detail_areas(Rect::new(0, 0, 130, 25));
-        assert_eq!(tall_vfs.height, 10);
+        assert_eq!(tall_vfs.height, 11);
 
         assert_eq!(detail_context_row_count(23, 2), 2);
         let (_, _, compact_vfs) = detail_areas(Rect::new(0, 0, 110, 18));
-        assert_eq!(compact_vfs.height, 3);
+        assert_eq!(compact_vfs.height, 4);
 
-        assert_eq!(detail_context_row_count(14, 2), 0);
+        assert_eq!(detail_context_row_count(14, 2), 1);
         let (read, write, _) = detail_areas(Rect::new(0, 0, 60, 13));
         assert_eq!((read.height, write.height), (13, 13));
     }
@@ -3433,18 +3471,18 @@ mod tests {
     fn detail_layout_is_responsive_and_bounded() {
         let wide = Rect::new(0, 0, 130, 18);
         let (read, write, vfs) = detail_areas(wide);
-        assert_eq!((read.height, write.height), (14, 14));
+        assert_eq!((read.height, write.height), (13, 13));
         assert_eq!((read.width, write.width), (64, 65));
         assert_eq!(write.x, read.x + read.width + 1);
         assert_eq!(vfs.width, 130);
-        assert_eq!(vfs.height, 3);
-        assert_eq!(vfs.y, 15);
+        assert_eq!(vfs.height, 4);
+        assert_eq!(vfs.y, 14);
 
         let tall = Rect::new(0, 0, 130, 70);
         let (read, write, vfs) = detail_areas(tall);
-        assert_eq!((read.height, write.height), (14, 14));
-        assert_eq!((vfs.y, vfs.height), (15, 11));
-        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(2)), 4);
+        assert_eq!((read.height, write.height), (13, 13));
+        assert_eq!((vfs.y, vfs.height), (14, 12));
+        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(2)), 5);
         assert_eq!(vfs.y + vfs.height, WIDE_DETAIL_BODY_HEIGHT);
 
         let (overview, detail) = master_detail_heights(68, 5);
@@ -3557,12 +3595,14 @@ mod tests {
                 .map(|x| buffer.cell((x, y)).unwrap().symbol())
                 .collect::<String>()
         };
-        assert!(line(0).ends_with("inode 217317381"));
-        assert!(line(1).starts_with("    /mnt/data/a/deliberately-long-file-name.db"));
+        assert!(line(0).contains("writer [7]"));
+        assert!(line(1).starts_with("inode 217317381  /mnt/data/a/deliberately-long-file-name.db"));
+        assert_eq!(buffer.cell((0, 1)).unwrap().fg, p::DIM);
+        assert_eq!(buffer.cell((17, 1)).unwrap().fg, p::FG);
     }
 
     #[test]
-    fn vfs_path_starts_under_read_label_at_compact_and_wide_widths() {
+    fn vfs_path_follows_flush_left_inode_at_compact_and_wide_widths() {
         for (width, expected_x) in [(80, 4), (100, 8)] {
             let mut item = hot_file(8, 1, 75.0, 25.0);
             item.path = "/resolved/path".into();
@@ -3574,8 +3614,10 @@ mod tests {
             let buffer = terminal.backend().buffer();
 
             assert_eq!(buffer.cell((expected_x, 0)).unwrap().symbol(), "R");
-            assert_eq!(buffer.cell((expected_x, 1)).unwrap().symbol(), "/");
-            assert!((0..expected_x).all(|x| buffer.cell((x, 1)).unwrap().symbol() == " "));
+            let row = (0..width)
+                .map(|x| buffer.cell((x, 1)).unwrap().symbol())
+                .collect::<String>();
+            assert!(row.starts_with("inode 42  /resolved/path"));
         }
     }
 
@@ -3593,8 +3635,8 @@ mod tests {
             .map(|x| buffer.cell((x, 1)).unwrap().symbol())
             .collect::<String>();
 
-        assert!(row.trim().starts_with("[unresolved] data.bin"));
-        assert!(!row.contains("inode 42"));
+        assert!(row.starts_with("inode 42  [unresolved] data.bin"));
+        assert_eq!(row.matches("inode 42").count(), 1);
     }
 
     #[test]

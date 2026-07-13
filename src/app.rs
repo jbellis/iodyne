@@ -89,9 +89,6 @@ impl App {
     }
 
     fn tick(&mut self) {
-        if matches!(self.live, LiveState::Paused) {
-            return;
-        }
         // The collector forms calm one-second display buckets and rate-limits
         // internally. The eBPF backend still accounts for every request in
         // kernel between these polls.
@@ -138,12 +135,17 @@ pub fn run() -> Result<()> {
 fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     // Input wakes the poll immediately; this only caps idle redraws at 10 FPS.
     let frame_budget = Duration::from_millis(100);
+    let mut redraw = true;
     loop {
-        terminal.draw(|f| draw(f, app))?;
+        if matches!(app.live, LiveState::Live) || redraw {
+            terminal.draw(|f| draw(f, app))?;
+            redraw = false;
+        }
         if event::poll(frame_budget)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Release {
                     handle_key(app, k.code);
+                    redraw = true;
                 }
             }
         }
@@ -172,10 +174,7 @@ fn handle_key(app: &mut App, key: KeyCode) {
         KeyCode::Char('p') => {
             app.live = match app.live {
                 LiveState::Live => LiveState::Paused,
-                LiveState::Paused => {
-                    app.io.resume();
-                    LiveState::Live
-                }
+                LiveState::Paused => LiveState::Live,
             };
         }
         KeyCode::Char('u') => app.toggle_io_unmounted(),

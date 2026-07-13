@@ -48,6 +48,10 @@ groups a bounded number of received records once per display interval. A full
 ring drops VFS attribution rather than delaying the filesystem operation, and
 sustained producers cannot monopolize the UI thread.
 
+The probe admits only regular files on filesystems with a nonzero block-device
+major. Device nodes, PTYs, pipes, sockets, and anonymous pseudo-filesystems are
+excluded before they can consume ring capacity or presentation rows.
+
 After both count kprobes attach, `security_file_permission` is attached
 independently as an fentry program and uses `bpf_d_path` to capture the first
 observed path while the kernel `struct path` is still valid. Paths are bounded

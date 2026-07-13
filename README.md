@@ -96,7 +96,7 @@ as temperature, wear, spare, and power-on time. `smartmontools` is optional.
 |---|---|
 | `j` / `k`, `Down` / `Up` | Select a device |
 | `u` | Show mounted devices or all devices |
-| `p` | Pause or resume sampling |
+| `p` | Freeze or resume the display (collection continues) |
 | `,` | Open settings |
 | `b` | Toggle binary/decimal units while settings are open |
 | `q` / `Esc` | Quit |

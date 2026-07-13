@@ -6,6 +6,7 @@
 #define __type(name, val) val *name
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_RINGBUF 27
+#define BPF_MAP_TYPE_ARRAY 2
 #define BPF_NOEXIST 1
 #define BPF_EXIST 2
 #define MAX_VFS_FILES 8192
@@ -13,7 +14,10 @@
 #define TASK_COMM_LEN 16
 #define FILE_NAME_LEN 64
 #define FILE_PATH_LEN 256
+#define S_IFMT 00170000
+#define S_IFREG 0100000
 
+typedef unsigned short __u16;
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
 
@@ -23,6 +27,7 @@ struct super_block {
 struct inode {
     struct super_block *i_sb;
     unsigned long i_ino;
+    __u16 i_mode;
 } __attribute__((preserve_access_index));
 struct qstr {
     const unsigned char *name;
@@ -76,6 +81,13 @@ struct {
     __uint(max_entries, VFS_RING_BYTES);
 } VFS_EVENTS SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} SELF_TGID SEC(".maps");
+
 // Kept separate from counters so first-path arbitration is an atomic
 // BPF_NOEXIST insertion and userspace never observes a partially-written path.
 struct {
@@ -87,6 +99,7 @@ struct {
 
 static long (*bpf_map_update_elem)(void *map, const void *key,
                                    const void *value, __u64 flags) = (void *)2;
+static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static long (*bpf_get_current_comm)(void *buf, __u32 size) = (void *)16;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size,
@@ -113,10 +126,18 @@ static __inline __attribute__((always_inline)) int vfs_key_for_file(
         return -1;
     __u32 dev;
     unsigned long inode_number;
+    __u16 mode;
     if (bpf_probe_read_kernel(&dev, sizeof(dev),
                               __builtin_preserve_access_index(&sb->s_dev)) ||
         bpf_probe_read_kernel(&inode_number, sizeof(inode_number),
-                              __builtin_preserve_access_index(&inode->i_ino)))
+                              __builtin_preserve_access_index(&inode->i_ino)) ||
+        bpf_probe_read_kernel(&mode, sizeof(mode),
+                              __builtin_preserve_access_index(&inode->i_mode)))
+        return -1;
+
+    // Keep the storage view about storage: reject device nodes, PTYs, pipes,
+    // sockets, and regular-looking files on anonymous/pseudo filesystems.
+    if ((mode & S_IFMT) != S_IFREG || (dev >> 20) == 0)
         return -1;
 
     key->major = dev >> 20;
@@ -176,6 +197,10 @@ static __inline __attribute__((always_inline)) int record_vfs(
     struct pt_regs *ctx, __u32 direction) {
     struct file *file = vfs_file_arg(ctx);
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 zero = 0;
+    __u32 *self_tgid = bpf_map_lookup_elem(&SELF_TGID, &zero);
+    if (self_tgid && *self_tgid == (__u32)(pid_tgid >> 32))
+        return 0;
     struct vfs_file_key key = {};
     if (vfs_key_for_file(file, pid_tgid, &key))
         return 0;
@@ -205,6 +230,10 @@ SEC("fentry/security_file_permission")
 int iodyne_vfs_path(__u64 *ctx) {
     struct file *file = (struct file *)ctx[0];
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 zero = 0;
+    __u32 *self_tgid = bpf_map_lookup_elem(&SELF_TGID, &zero);
+    if (self_tgid && *self_tgid == (__u32)(pid_tgid >> 32))
+        return 0;
     struct vfs_file_key key = {};
     if (vfs_key_for_file(file, pid_tgid, &key))
         return 0;

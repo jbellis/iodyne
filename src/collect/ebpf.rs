@@ -234,36 +234,6 @@ impl EbpfLatencyCollector {
         current
     }
 
-    /// Discards all counts accumulated since the previous display sample.
-    /// Used when resuming after a UI pause so the pause interval is not
-    /// rendered as one oversized latency bucket.
-    pub fn reset_baseline(&mut self) {
-        if !self.status.is_active() {
-            self.previous.clear();
-        } else {
-            match self.read_counts() {
-                Ok(counts) => self.previous = counts,
-                Err(message) => {
-                    self.status = EbpfStatus::Unavailable(message);
-                    self.previous.clear();
-                }
-            }
-        }
-        self.reset_vfs_baseline();
-    }
-
-    fn reset_vfs_baseline(&mut self) {
-        if !self.vfs_status.is_active() {
-            return;
-        }
-        match self.read_vfs_counts() {
-            Ok(_) => {}
-            Err(message) => {
-                self.vfs_status = EbpfStatus::Unavailable(message);
-            }
-        }
-    }
-
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     fn load() -> Self {
         match load_linux() {
@@ -475,6 +445,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
+    use aya::maps::Array;
     use aya::programs::KProbe;
 
     #[cfg(target_arch = "x86_64")]
@@ -487,6 +458,14 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus), String> {
     };
     let mut bpf =
         aya::Bpf::load(bytes).map_err(|error| format!("cannot load VFS eBPF object: {error}"))?;
+    let self_tgid = bpf
+        .map_mut("SELF_TGID")
+        .ok_or_else(|| "eBPF self-TGID map is missing".to_string())?;
+    let mut self_tgid = Array::<_, u32>::try_from(self_tgid)
+        .map_err(|error| format!("cannot access eBPF self-TGID map: {error}"))?;
+    self_tgid
+        .set(0, std::process::id(), 0)
+        .map_err(|error| format!("cannot configure eBPF self-TGID filter: {error}"))?;
     for (program_name, function_name) in [
         ("iodyne_vfs_read", "vfs_read"),
         ("iodyne_vfs_write", "vfs_write"),
