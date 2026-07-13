@@ -116,19 +116,21 @@ struct fuse_in_header {
     __u32 padding;
 };
 struct fuse_req {
+    // FUSE request layout is private to the module, whose split BTF Aya 0.12
+    // cannot use for CO-RE. These fields have retained their offsets from the
+    // oldest supported 5.14 vendor kernel through current kernels.
+    char _before_in[56];
     struct {
         struct fuse_in_header h;
     } in;
+    char _before_fm[48];
     void *fm;
-} __attribute__((preserve_access_index));
-struct fuse_inode {
-    struct inode inode;
-    __u64 nodeid;
-} __attribute__((preserve_access_index));
+};
 struct fuse_copy_state {
     int write;
+    __u32 _padding;
     struct fuse_req *req;
-} __attribute__((preserve_access_index));
+};
 struct vfs_file_path {
     char path[FILE_PATH_LEN];
 };
@@ -460,8 +462,8 @@ static __inline __attribute__((always_inline)) int fuse_writer_key_for_file(
         !fm ||
         bpf_probe_read_kernel(
             &nodeid, sizeof(nodeid),
-            __builtin_preserve_access_index(
-                &((struct fuse_inode *)inode)->nodeid)) ||
+            (void *)inode +
+                __builtin_preserve_type_info(*(struct inode *)0, 1)) ||
         !nodeid)
         return -1;
     key->mount = (__u64)fm;
@@ -501,9 +503,7 @@ static __inline __attribute__((always_inline)) void begin_fuse_request(
         active.kind = FUSE_ORIGIN_PID_ZERO;
         if (header->opcode == FUSE_WRITE && header->nodeid && req) {
             void *fm = 0;
-            if (!bpf_probe_read_kernel(
-                    &fm, sizeof(fm),
-                    __builtin_preserve_access_index(&req->fm)) &&
+            if (!bpf_probe_read_kernel(&fm, sizeof(fm), &req->fm) &&
                 fm) {
                 struct fuse_writer_key key = {
                     .mount = (__u64)fm,
@@ -685,19 +685,13 @@ int iodyne_fuse_request(struct pt_regs *ctx) {
         return 0;
     int write = 0;
     struct fuse_req *req = 0;
-    if (bpf_probe_read_kernel(
-            &write, sizeof(write),
-            __builtin_preserve_access_index(&cs->write)) ||
+    if (bpf_probe_read_kernel(&write, sizeof(write), &cs->write) ||
         !write ||
-        bpf_probe_read_kernel(
-            &req, sizeof(req),
-            __builtin_preserve_access_index(&cs->req)) ||
+        bpf_probe_read_kernel(&req, sizeof(req), &cs->req) ||
         !req)
         return 0;
     struct fuse_in_header header = {};
-    if (bpf_probe_read_kernel(
-            &header, sizeof(header),
-            __builtin_preserve_access_index(&req->in.h)))
+    if (bpf_probe_read_kernel(&header, sizeof(header), &req->in.h))
         return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     begin_fuse_request(pid_tgid, req, &header);
@@ -713,9 +707,7 @@ int iodyne_fuse_requester_identity(struct pt_regs *ctx) {
     if (!req)
         return 0;
     __u32 origin_pid = 0;
-    if (bpf_probe_read_kernel(
-            &origin_pid, sizeof(origin_pid),
-            __builtin_preserve_access_index(&req->in.h.pid)) ||
+    if (bpf_probe_read_kernel(&origin_pid, sizeof(origin_pid), &req->in.h.pid) ||
         !origin_pid)
         return 0;
     remember_fuse_identity(origin_pid, bpf_get_current_pid_tgid());
