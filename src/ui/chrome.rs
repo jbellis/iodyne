@@ -9,22 +9,18 @@ use crate::ui::palette as p;
 pub fn draw_footer(f: &mut Frame, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::raw(" "));
-    let groups: &[&[(char, &str)]] = &[
-        &[('p', "Pause"), (',', "Settings")],
-        &[('u', "mounted/all"), ('j', "Select")],
-        &[('q', "Quit")],
+    let groups: &[&[(&str, &str)]] = &[
+        &[("p", "Pause"), (",", "Settings")],
+        &[("u", "mounted/all"), ("j/k", "Select")],
+        &[("-/+", "Sample"), ("q", "Quit")],
     ];
     for (gi, g) in groups.iter().enumerate() {
         if gi > 0 {
             spans.push(Span::styled(" \u{2502} ", Style::default().fg(p::FAINT)));
         }
-        for (k, label) in g.iter() {
+        for (key, label) in g.iter() {
             spans.push(Span::styled(
-                if *k == 'j' {
-                    "j/k".into()
-                } else {
-                    k.to_string()
-                },
+                *key,
                 Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
@@ -83,6 +79,7 @@ mod tests {
             ",:Settings",
             "u:mounted/all",
             "j/k:Select",
+            "-/+:Sample",
             "q:Quit",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text:?}");

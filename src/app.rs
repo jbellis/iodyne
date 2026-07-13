@@ -20,6 +20,10 @@ use crate::ui::chrome;
 use crate::ui::format::{set_unit_mode, UnitMode};
 use crate::ui::palette as p;
 
+const SAMPLE_INTERVAL_STEP: Duration = Duration::from_millis(100);
+const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveState {
     Live,
@@ -37,6 +41,7 @@ pub struct App {
     pub show_settings: bool,
     pub smart: collect::SmartCollector,
     pub selected_io: usize,
+    pub sample_interval: Duration,
     /// Last full enumeration (slow path — system_profiler + diskutil).
     last_metadata_refresh: Instant,
     /// Last usage refresh (fast path — sysinfo only).
@@ -56,6 +61,7 @@ impl App {
         smart.refresh_if_due(&devices);
         Self {
             live: LiveState::Live,
+            sample_interval: collect::io::DEFAULT_SAMPLE_INTERVAL,
             selected_io: 0,
             devices,
             filesystems,
@@ -88,11 +94,22 @@ impl App {
         self.persist_settings();
     }
 
+    fn decrease_sample_interval(&mut self) {
+        self.sample_interval = self
+            .sample_interval
+            .saturating_sub(SAMPLE_INTERVAL_STEP)
+            .max(MIN_SAMPLE_INTERVAL);
+    }
+
+    fn increase_sample_interval(&mut self) {
+        self.sample_interval =
+            (self.sample_interval + SAMPLE_INTERVAL_STEP).min(MAX_SAMPLE_INTERVAL);
+    }
+
     fn tick(&mut self) {
-        // The collector forms calm one-second display buckets and rate-limits
-        // internally. The eBPF backend still accounts for every request in
-        // kernel between these polls.
-        self.io.sample();
+        // The collector forms calm display buckets at the selected cadence.
+        // The eBPF backend still accounts for every request between polls.
+        self.io.sample(self.sample_interval);
         let visible_io = crate::screen::visible_device_count(self);
         self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
 
@@ -162,6 +179,8 @@ fn handle_key(app: &mut App, key: KeyCode) {
             KeyCode::Esc | KeyCode::Char(',') => app.show_settings = false,
             KeyCode::Char('b') => app.toggle_unit_mode(),
             KeyCode::Char('u') => app.toggle_io_unmounted(),
+            KeyCode::Char('-') => app.decrease_sample_interval(),
+            KeyCode::Char('+') | KeyCode::Char('=') => app.increase_sample_interval(),
             KeyCode::Char('q') => app.should_quit = true,
             _ => {}
         }
@@ -178,6 +197,8 @@ fn handle_key(app: &mut App, key: KeyCode) {
             };
         }
         KeyCode::Char('u') => app.toggle_io_unmounted(),
+        KeyCode::Char('-') => app.decrease_sample_interval(),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.increase_sample_interval(),
         KeyCode::Up | KeyCode::Char('k') if app.selected_io > 0 => app.selected_io -= 1,
         KeyCode::Down | KeyCode::Char('j')
             if app.selected_io + 1 < crate::screen::visible_device_count(app) =>
@@ -413,6 +434,7 @@ mod tests {
 
         App {
             live: LiveState::Live,
+            sample_interval: collect::io::DEFAULT_SAMPLE_INTERVAL,
             devices,
             filesystems,
             volumes: VolumeTick::default(),
@@ -452,6 +474,7 @@ mod tests {
             "IOPS",
             "1 device",
             "LIVE",
+            "2000ms",
             "READ",
             "WRITE",
             "Await",
@@ -492,6 +515,7 @@ mod tests {
         let empty = render_screen(&app, 130, 40);
         assert!(empty.contains("No IO data yet"));
         assert!(empty.contains("LIVE"));
+        assert!(empty.contains("2000ms"));
         let _ = render_screen(&app, 60, 20);
     }
 
@@ -520,6 +544,24 @@ mod tests {
                 app.should_quit,
             )
         );
+    }
+
+    #[test]
+    fn sampling_hotkeys_adjust_and_clamp_the_interval() {
+        let mut app = fixture_app(false);
+        assert_eq!(app.sample_interval, Duration::from_secs(2));
+
+        handle_key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.sample_interval, Duration::from_millis(1_900));
+        handle_key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.sample_interval, Duration::from_secs(2));
+
+        app.sample_interval = MIN_SAMPLE_INTERVAL;
+        handle_key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.sample_interval, MIN_SAMPLE_INTERVAL);
+        app.sample_interval = MAX_SAMPLE_INTERVAL;
+        handle_key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.sample_interval, MAX_SAMPLE_INTERVAL);
     }
 
     #[test]

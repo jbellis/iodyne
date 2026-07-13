@@ -1,4 +1,4 @@
-//! Per-device IO sampling in one-second display buckets.
+//! Per-device IO sampling in adjustable display buckets.
 //!
 //! Both supported platforms expose cumulative split-direction byte +
 //! operation + request-time counters:
@@ -28,14 +28,14 @@ use crate::collect::ebpf::{
     LATENCY_BUCKETS,
 };
 
-/// One-second buckets keep the visual timelines calm while the optional eBPF
-/// program continues accounting for every request inside the kernel.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Match btop's calm default cadence. The optional eBPF program continues
+/// accounting for every request inside the kernel between userspace polls.
+pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// One minute of throughput history.
+/// Sixty display samples of throughput history.
 const RING_LEN: usize = 60;
 
-/// One minute of aligned latency observations.
+/// Sixty aligned latency observations.
 const LATENCY_WINDOW: usize = 60;
 
 /// Maximum host-wide VFS entries retained for presentation. Kernel event and
@@ -60,6 +60,9 @@ pub struct VfsFileActivity {
     pub comm: String,
     /// Deduplicated process names and process IDs contributing to this file.
     pub processes: Vec<(String, u32, u32)>,
+    /// Event-time immediate parents keyed by child TGID. Unlike `/proc`, this
+    /// remains available after a short-lived worker exits.
+    pub captured_parents: Vec<(u32, String, u32)>,
     /// Presentation identities, collapsed to immediate parents when available.
     pub display_processes: Vec<(String, u32)>,
     /// Container/workload labels keyed by displayed host PID.
@@ -305,6 +308,9 @@ pub struct IoCollector {
     pub latest: Vec<IoTick>,
     /// Bounded, host-wide VFS completed-byte activity sorted hottest first.
     pub hot_files: Vec<VfsFileActivity>,
+    /// Ring-buffer events are drained on every main-loop pass, independently
+    /// of the slower user-selected display cadence.
+    pending_vfs: HashMap<VfsActivityKey, VfsActivityDelta>,
     vfs_activity_window: VfsActivityWindow,
     latency_probe: EbpfLatencyCollector,
 }
@@ -313,12 +319,13 @@ impl IoCollector {
     pub fn new() -> Self {
         Self {
             // Offset the baseline back so the first `sample()` actually runs.
-            last_sample: Instant::now() - SAMPLE_INTERVAL,
+            last_sample: Instant::now() - DEFAULT_SAMPLE_INTERVAL,
             prev_totals: HashMap::new(),
             history: HashMap::new(),
             traced_history: HashMap::new(),
             latest: Vec::new(),
             hot_files: Vec::new(),
+            pending_vfs: HashMap::new(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::new(),
         }
@@ -333,6 +340,7 @@ impl IoCollector {
             traced_history: HashMap::new(),
             latest: Vec::new(),
             hot_files: Vec::new(),
+            pending_vfs: HashMap::new(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::unavailable_for_test(),
         }
@@ -350,12 +358,12 @@ impl IoCollector {
         self.latency_probe.vfs_status()
     }
 
-    /// Called from the main loop. Internally rate-limits to 1Hz, so
-    /// it's safe to call as often as the loop tick fires.
-    pub fn sample(&mut self) {
+    /// Called from the main loop and rate-limited to the selected cadence.
+    pub fn sample(&mut self, interval: Duration) {
+        self.poll_vfs_events();
         let now = Instant::now();
         let elapsed_dur = now - self.last_sample;
-        if elapsed_dur < SAMPLE_INTERVAL {
+        if elapsed_dur < interval {
             return;
         }
         let elapsed = elapsed_dur.as_secs_f64().max(0.001);
@@ -426,20 +434,54 @@ impl IoCollector {
     fn sample_hot_files(&mut self, elapsed: f64) {
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
+            self.pending_vfs.clear();
             self.vfs_activity_window.clear();
             return;
         }
-        let deltas = self.latency_probe.vfs_snapshot();
-        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
-            self.hot_files.clear();
-            self.vfs_activity_window.clear();
-            return;
-        }
+        let deltas = std::mem::take(&mut self.pending_vfs)
+            .into_values()
+            .collect();
         self.vfs_activity_window.push(deltas, elapsed);
         self.hot_files = self.vfs_activity_window.ranked(HOT_FILE_LIMIT);
         resolve_hot_file_paths(&mut self.hot_files);
         collapse_hot_file_processes(&mut self.hot_files);
         annotate_workload_processes(&mut self.hot_files);
+    }
+
+    fn poll_vfs_events(&mut self) {
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
+            self.pending_vfs.clear();
+            return;
+        }
+        for delta in self.latency_probe.vfs_snapshot() {
+            let key = VfsActivityKey {
+                device: delta.device,
+                inode: delta.inode,
+                tgid: delta.tgid,
+            };
+            if let Some(pending) = self.pending_vfs.get_mut(&key) {
+                pending.read_bytes = pending.read_bytes.saturating_add(delta.read_bytes);
+                pending.write_bytes = pending.write_bytes.saturating_add(delta.write_bytes);
+                pending.read_ops = pending.read_ops.saturating_add(delta.read_ops);
+                pending.write_ops = pending.write_ops.saturating_add(delta.write_ops);
+                pending.pid = delta.pid;
+                pending.comm = delta.comm;
+                pending.container_owned |= delta.container_owned;
+                pending.basename = delta.basename;
+                if delta.parent_tgid != 0 {
+                    pending.parent_tgid = delta.parent_tgid;
+                    pending.parent_comm = delta.parent_comm;
+                }
+                if !delta.path.is_empty() {
+                    pending.path = delta.path;
+                }
+            } else {
+                self.pending_vfs.insert(key, delta);
+            }
+        }
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
+            self.pending_vfs.clear();
+        }
     }
 
     fn sample_traced_latency(&mut self) {
@@ -554,6 +596,8 @@ struct VfsActivityTotal {
     counts: VfsActivityCounts,
     pid: u32,
     comm: String,
+    parent_tgid: u32,
+    parent_comm: String,
     container_owned: bool,
     basename: String,
     path: String,
@@ -615,6 +659,8 @@ impl VfsActivityWindow {
                 counts: VfsActivityCounts::default(),
                 pid: delta.pid,
                 comm: delta.comm.clone(),
+                parent_tgid: delta.parent_tgid,
+                parent_comm: delta.parent_comm.clone(),
                 container_owned: delta.container_owned,
                 basename: delta.basename.clone(),
                 path: delta.path.clone(),
@@ -624,6 +670,10 @@ impl VfsActivityWindow {
             // refreshed while the same filesystem identity remains hot.
             total.pid = delta.pid;
             total.comm = delta.comm;
+            if delta.parent_tgid != 0 {
+                total.parent_tgid = delta.parent_tgid;
+                total.parent_comm = delta.parent_comm;
+            }
             total.container_owned |= delta.container_owned;
             total.basename = delta.basename;
             if !delta.path.is_empty() {
@@ -681,6 +731,10 @@ impl VfsActivityWindow {
                 },
                 comm: total.comm.clone(),
                 processes: vec![(total.comm.clone(), total.pid, key.tgid)],
+                captured_parents: (total.parent_tgid != 0)
+                    .then(|| (key.tgid, total.parent_comm.clone(), total.parent_tgid))
+                    .into_iter()
+                    .collect(),
                 display_processes: vec![(total.comm.clone(), key.tgid)],
                 display_workloads: total
                     .container_owned
@@ -710,6 +764,7 @@ fn merge_vfs_processes(activity: &mut Vec<VfsFileActivity>) {
             existing.read_ops += item.read_ops;
             existing.write_ops += item.write_ops;
             existing.processes.extend(item.processes);
+            existing.captured_parents.extend(item.captured_parents);
             existing.display_workloads.extend(item.display_workloads);
             if existing.path.starts_with(&existing.basename)
                 && !item.path.starts_with(&item.basename)
@@ -724,6 +779,8 @@ fn merge_vfs_processes(activity: &mut Vec<VfsFileActivity>) {
         item.processes
             .sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1)));
         item.processes.dedup();
+        item.captured_parents.sort();
+        item.captured_parents.dedup();
         item.display_processes = item
             .processes
             .iter()
@@ -853,14 +910,21 @@ fn collapse_hot_file_processes(activity: &mut [VfsFileActivity]) {
 fn collapse_hot_file_processes_at(activity: &mut [VfsFileActivity], proc_root: &std::path::Path) {
     let mut cache = HashMap::<u32, Option<(String, u32)>>::new();
     for item in activity {
+        let captured: HashMap<_, _> = item
+            .captured_parents
+            .iter()
+            .map(|(child, comm, parent)| (*child, (comm.clone(), *parent)))
+            .collect();
         let candidates: Vec<_> = item
             .processes
             .iter()
             .map(|(comm, _, tgid)| {
-                let parent = cache
-                    .entry(*tgid)
-                    .or_insert_with(|| parent_process_at(*tgid, proc_root))
-                    .clone();
+                let parent = captured.get(tgid).cloned().or_else(|| {
+                    cache
+                        .entry(*tgid)
+                        .or_insert_with(|| parent_process_at(*tgid, proc_root))
+                        .clone()
+                });
                 ((comm.clone(), *tgid), parent)
             })
             .collect();
@@ -870,13 +934,29 @@ fn collapse_hot_file_processes_at(activity: &mut [VfsFileActivity], proc_root: &
                 *sibling_counts.entry(parent.clone()).or_default() += 1;
             }
         }
-        item.display_processes = candidates
+        let collapsed: Vec<_> = candidates
             .into_iter()
             .map(|(child, parent)| {
-                parent
+                let displayed = parent
                     .filter(|parent| sibling_counts.get(parent).copied().unwrap_or(0) >= 2)
-                    .unwrap_or(child)
+                    .unwrap_or_else(|| child.clone());
+                (child.1, displayed)
             })
+            .collect();
+        let displayed_pids: HashMap<_, _> = collapsed
+            .iter()
+            .map(|(child, (_, displayed))| (*child, *displayed))
+            .collect();
+        for (pid, _) in &mut item.display_workloads {
+            if let Some(displayed) = displayed_pids.get(pid) {
+                *pid = *displayed;
+            }
+        }
+        item.display_workloads.sort();
+        item.display_workloads.dedup();
+        item.display_processes = collapsed
+            .into_iter()
+            .map(|(_, displayed)| displayed)
             .collect();
         item.display_processes.sort();
         item.display_processes.dedup();
@@ -1194,6 +1274,8 @@ mod tests {
             pid: 101,
             tgid: 100,
             comm: "writer".into(),
+            parent_tgid: 0,
+            parent_comm: String::new(),
             container_owned: false,
             basename: format!("file-{inode}"),
             path: String::new(),
@@ -1278,6 +1360,32 @@ mod tests {
         collapse_hot_file_processes_at(&mut activity, &root);
         assert_eq!(activity[0].display_processes, vec![("worker".into(), 100)]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_container_siblings_use_their_captured_parent() {
+        let mut window = VfsActivityWindow::default();
+        let mut first = vfs_delta(44, 1, 0);
+        first.comm = "ssh-keygen".into();
+        first.pid = 100;
+        first.tgid = 100;
+        first.parent_tgid = 200;
+        first.parent_comm = "sshd".into();
+        first.container_owned = true;
+        let mut second = first.clone();
+        second.pid = 101;
+        second.tgid = 101;
+        window.push(vec![first, second], 1.0);
+
+        let mut activity = window.ranked(64);
+        collapse_hot_file_processes_at(&mut activity, std::path::Path::new("/does/not/exist"));
+
+        assert_eq!(activity[0].display_processes, vec![("sshd".into(), 200)]);
+        assert_eq!(
+            activity[0].display_workloads,
+            vec![(200, "container".into())]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1450,6 +1558,7 @@ mod tests {
             tgid: pid,
             comm: "test".into(),
             processes: vec![("test".into(), pid, pid)],
+            captured_parents: Vec::new(),
             display_processes: vec![("test".into(), pid)],
             display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),
@@ -1473,6 +1582,7 @@ mod tests {
             tgid: std::process::id(),
             comm: "test".into(),
             processes: vec![("test".into(), std::process::id(), std::process::id())],
+            captured_parents: Vec::new(),
             display_processes: vec![("test".into(), std::process::id())],
             display_workloads: Vec::new(),
             basename: "data.log".into(),
@@ -1519,6 +1629,7 @@ mod tests {
             tgid: leader_pid,
             comm: "worker".into(),
             processes: vec![("worker".into(), task_pid, leader_pid)],
+            captured_parents: Vec::new(),
             display_processes: vec![("worker".into(), leader_pid)],
             display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),

@@ -48,6 +48,11 @@ struct file {
     struct path f_path;
     struct inode *f_inode;
 } __attribute__((preserve_access_index));
+struct task_struct {
+    int tgid;
+    char comm[TASK_COMM_LEN];
+    struct task_struct *real_parent;
+} __attribute__((preserve_access_index));
 #if defined(__TARGET_ARCH_x86)
 struct pt_regs {
     unsigned long di;
@@ -83,6 +88,10 @@ struct vfs_event {
     char origin_comm[TASK_COMM_LEN];
     char basename[FILE_NAME_LEN];
     __u64 cgroup_id;
+    __u32 parent_tgid;
+    __u32 origin_parent_tgid;
+    char parent_comm[TASK_COMM_LEN];
+    char origin_parent_comm[TASK_COMM_LEN];
 };
 struct fuse_in_header {
     __u32 len;
@@ -113,7 +122,9 @@ struct pending_vfs_io {
 };
 struct requester_identity {
     __u32 tgid;
+    __u32 parent_tgid;
     char comm[TASK_COMM_LEN];
+    char parent_comm[TASK_COMM_LEN];
 };
 
 struct {
@@ -200,6 +211,7 @@ static long (*bpf_map_update_elem)(void *map, const void *key,
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
+static void *(*bpf_get_current_task)(void) = (void *)35;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 static long (*bpf_get_current_comm)(void *buf, __u32 size) = (void *)16;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size,
@@ -212,6 +224,26 @@ static long (*bpf_d_path)(struct path *path, char *buf, __u32 size) =
     (void *)147;
 static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size,
                                   __u64 flags) = (void *)130;
+
+static __inline __attribute__((always_inline)) void current_parent_identity(
+    __u32 *tgid, char comm[TASK_COMM_LEN]) {
+    struct task_struct *task = bpf_get_current_task();
+    struct task_struct *parent = 0;
+    int parent_tgid = 0;
+    if (!task ||
+        bpf_probe_read_kernel(
+            &parent, sizeof(parent),
+            __builtin_preserve_access_index(&task->real_parent)) ||
+        !parent ||
+        bpf_probe_read_kernel(
+            &parent_tgid, sizeof(parent_tgid),
+            __builtin_preserve_access_index(&parent->tgid)) ||
+        parent_tgid <= 1)
+        return;
+    *tgid = (__u32)parent_tgid;
+    bpf_probe_read_kernel(comm, TASK_COMM_LEN,
+                          __builtin_preserve_access_index(&parent->comm));
+}
 
 static __inline __attribute__((always_inline)) int vfs_key_for_file(
     struct file *file, __u64 pid_tgid, struct vfs_file_key *key) {
@@ -254,6 +286,7 @@ static __inline __attribute__((always_inline)) void vfs_event_metadata(
     struct file *file, __u64 pid_tgid, struct vfs_event *event) {
     event->pid = (__u32)pid_tgid;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
+    current_parent_identity(&event->parent_tgid, event->parent_comm);
     struct dentry *dentry;
     if (!bpf_probe_read_kernel(
             &dentry, sizeof(dentry),
@@ -348,6 +381,7 @@ static __inline __attribute__((always_inline)) void remember_fuse_identity(
         .tgid = (__u32)(pid_tgid >> 32),
     };
     bpf_get_current_comm(identity.comm, sizeof(identity.comm));
+    current_parent_identity(&identity.parent_tgid, identity.parent_comm);
     bpf_map_update_elem(&FUSE_REQUESTER_IDENTITIES, &key, &identity, 0);
 }
 
@@ -413,8 +447,11 @@ static __inline __attribute__((always_inline)) int record_vfs_file(
             &FUSE_REQUESTER_IDENTITIES, origin_pid);
         if (identity) {
             event.origin_tgid = identity->tgid;
+            event.origin_parent_tgid = identity->parent_tgid;
             __builtin_memcpy(event.origin_comm, identity->comm,
                              sizeof(event.origin_comm));
+            __builtin_memcpy(event.origin_parent_comm, identity->parent_comm,
+                             sizeof(event.origin_parent_comm));
         }
     }
     vfs_event_metadata(file, pid_tgid, &event);

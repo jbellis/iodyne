@@ -107,6 +107,10 @@ struct VfsEvent {
     origin_comm: [u8; 16],
     basename: [u8; 64],
     cgroup_id: u64,
+    parent_tgid: u32,
+    origin_parent_tgid: u32,
+    parent_comm: [u8; 16],
+    origin_parent_comm: [u8; 16],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +126,9 @@ pub(crate) struct VfsActivityDelta {
     pub pid: u32,
     pub tgid: u32,
     pub comm: String,
+    /// Immediate parent captured while the process was still alive.
+    pub parent_tgid: u32,
+    pub parent_comm: String,
     /// The operation was delegated through fuse-overlayfs. This survives a
     /// short-lived requester exiting before userspace can read its cgroup.
     pub container_owned: bool,
@@ -403,32 +410,48 @@ impl EbpfLatencyCollector {
                         .or_insert_with(|| cgroup_id_is_container(event.cgroup_id));
                 let delegated_by_fuse_overlay =
                     event.origin_pid != 0 && bpf_string(&event.comm) == "fuse-overlayfs";
-                let (pid, comm) = if event.origin_pid == FUSE_ORIGIN_UNKNOWN {
-                    (event.pid, "fuse-overlayfs (async)".to_string())
-                } else if event.origin_pid != 0 {
-                    let identity = delegated_processes
-                        .entry(event.origin_pid)
-                        .or_insert_with(|| delegated_process_identity(event.origin_pid));
-                    if let Some((tgid, comm)) = identity {
-                        effective_key.tgid = *tgid;
-                        (event.origin_pid, comm.clone())
+                let (pid, comm, parent_tgid, parent_comm) =
+                    if event.origin_pid == FUSE_ORIGIN_UNKNOWN {
+                        (event.pid, "fuse-overlayfs".to_string(), 0, String::new())
+                    } else if event.origin_pid != 0 {
+                        let identity = delegated_processes
+                            .entry(event.origin_pid)
+                            .or_insert_with(|| delegated_process_identity(event.origin_pid));
+                        if let Some((tgid, comm)) = identity {
+                            effective_key.tgid = *tgid;
+                            (
+                                event.origin_pid,
+                                comm.clone(),
+                                event.origin_parent_tgid,
+                                bpf_string(&event.origin_parent_comm),
+                            )
+                        } else {
+                            effective_key.tgid = if event.origin_tgid != 0 {
+                                event.origin_tgid
+                            } else {
+                                event.origin_pid
+                            };
+                            let cached_comm = bpf_string(&event.origin_comm);
+                            let comm = if cached_comm.is_empty() {
+                                "process (exited)".to_string()
+                            } else {
+                                cached_comm
+                            };
+                            (
+                                event.origin_pid,
+                                comm,
+                                event.origin_parent_tgid,
+                                bpf_string(&event.origin_parent_comm),
+                            )
+                        }
                     } else {
-                        effective_key.tgid = if event.origin_tgid != 0 {
-                            event.origin_tgid
-                        } else {
-                            event.origin_pid
-                        };
-                        let cached_comm = bpf_string(&event.origin_comm);
-                        let comm = if cached_comm.is_empty() {
-                            "process (exited)".to_string()
-                        } else {
-                            cached_comm
-                        };
-                        (event.origin_pid, comm)
-                    }
-                } else {
-                    (event.pid, bpf_string(&event.comm))
-                };
+                        (
+                            event.pid,
+                            bpf_string(&event.comm),
+                            event.parent_tgid,
+                            bpf_string(&event.parent_comm),
+                        )
+                    };
                 if effective_key.tgid == std::process::id() {
                     continue;
                 }
@@ -444,6 +467,8 @@ impl EbpfLatencyCollector {
                         pid,
                         tgid: effective_key.tgid,
                         comm,
+                        parent_tgid,
+                        parent_comm: parent_comm.clone(),
                         container_owned: delegated_by_fuse_overlay || cgroup_is_container,
                         basename: bpf_string(&event.basename),
                         path: String::new(),
@@ -453,6 +478,10 @@ impl EbpfLatencyCollector {
                         write_ops: 0,
                     });
                 delta.pid = pid;
+                if parent_tgid != 0 {
+                    delta.parent_tgid = parent_tgid;
+                    delta.parent_comm = parent_comm;
+                }
                 delta.container_owned |= delegated_by_fuse_overlay || cgroup_is_container;
                 if event.direction == 0 {
                     delta.read_bytes = delta.read_bytes.saturating_add(event.bytes);
@@ -903,6 +932,10 @@ mod tests {
             origin_comm: [0; 16],
             basename,
             cgroup_id: 0,
+            parent_tgid: 0,
+            origin_parent_tgid: 0,
+            parent_comm: [0; 16],
+            origin_parent_comm: [0; 16],
         }
     }
 

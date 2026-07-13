@@ -11,7 +11,7 @@ The top of the screen is the device overview:
 - separate read and write latency-density lanes on one fixed logarithmic axis;
 - one selected device whose evidence fills the rest of the screen.
 
-The detail view splits reads from writes and shows 60-second latency
+The detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
 merges, and await. Its header identifies the mount and backing-device topology,
 followed by available filesystem, device, mdraid, APFS, and SMART facts. On
@@ -21,6 +21,9 @@ file IO.
 This is the view for answering "which device, which direction, and what kind of
 workload?" It complements `iostat`; it is not a benchmark or a long-term
 metrics store.
+
+Sampling defaults to once every two seconds (0.5 Hz). Use `-` and `+` while
+the TUI is running to adjust the interval in 100 ms steps.
 
 ## Install
 

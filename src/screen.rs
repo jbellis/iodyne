@@ -83,7 +83,8 @@ fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ))
-    .title(live_title(app));
+    .title(live_title(app))
+    .title(sample_interval_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -141,6 +142,26 @@ fn live_title(app: &App) -> Line<'static> {
         format!(" ● {label}  {} ", Local::now().format("%H:%M:%S")),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )])
+    .centered()
+}
+
+fn sample_interval_title(app: &App) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            " - ",
+            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}ms", app.sample_interval.as_millis()),
+            Style::default()
+                .fg(p::BR_WHITE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " + ",
+            Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
+        ),
+    ])
     .right_aligned()
 }
 
@@ -165,7 +186,9 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_io.min(row_count - 1);
     let (throughput_scale, iops_scale) =
         overview_workload_scales(&visible, Some(&aggregate.history), app);
-    let overview_block = pane_block(overview_title(app)).title(live_title(app));
+    let overview_block = pane_block(overview_title(app))
+        .title(live_title(app))
+        .title(sample_interval_title(app));
     let overview_inner = overview_block.inner(sections[0]);
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
@@ -384,7 +407,8 @@ fn draw_no_mounted_io(f: &mut Frame, area: Rect, app: &App) {
         " IO ",
         Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
     ))
-    .title(live_title(app));
+    .title(live_title(app))
+    .title(sample_interval_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -1567,7 +1591,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
     if inner.height == 0 {
         return;
     }
-    if vfs_entry_capacity(inner.height) == 0 {
+    if inner.height < 2 {
         draw_vfs_status(f, inner, "need 2 rows");
         return;
     }
@@ -1592,21 +1616,36 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         return;
     }
 
-    let capacity = vfs_entry_capacity(inner.height);
-    let visible: Vec<_> = entries.into_iter().take(capacity).collect();
-    let scale = vfs_activity_scale(&visible);
-    for (row, item) in visible.into_iter().enumerate() {
+    let mut used_rows = 0_u16;
+    let mut visible = Vec::new();
+    for item in entries {
+        let height = vfs_entry_height(item, inner.width);
+        if used_rows.saturating_add(height) > inner.height {
+            break;
+        }
+        visible.push((item, height));
+        used_rows += height;
+    }
+    if visible.is_empty() {
+        draw_vfs_status(f, inner, "need more rows for wrapped path");
+        return;
+    }
+    let scale_entries: Vec<_> = visible.iter().map(|(item, _)| *item).collect();
+    let scale = vfs_activity_scale(&scale_entries);
+    let mut y = inner.y;
+    for (item, height) in visible {
         draw_vfs_entry(
             f,
             Rect {
                 x: inner.x,
-                y: inner.y + row as u16 * 2,
+                y,
                 width: inner.width,
-                height: 2,
+                height,
             },
             item,
             scale,
         );
+        y += height;
     }
 }
 
@@ -1633,8 +1672,13 @@ fn draw_vfs_status(f: &mut Frame, area: Rect, message: &str) {
     );
 }
 
-pub(crate) fn vfs_entry_capacity(rows: u16) -> usize {
-    (rows / 2) as usize
+fn vfs_entry_height(item: &VfsFileActivity, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let inode_width = format!("inode {}  ", item.inode).chars().count();
+    let first_width = (width as usize).saturating_sub(inode_width);
+    1 + wrapped_path_lines(&vfs_display_path(item), first_width, width as usize).len() as u16
 }
 
 pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, scale: f64) {
@@ -1698,15 +1742,12 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
     let inode = format!("inode {}  ", item.inode);
     let inode_width = inode.chars().count();
     let path_width = (area.width as usize).saturating_sub(inode_width);
-    let path = if path_width == 0 {
-        String::new()
-    } else {
-        truncate_text(&path, path_width)
-    };
+    let path_lines = wrapped_path_lines(&path, path_width, area.width as usize);
+    let first_path = path_lines.first().cloned().unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(inode, Style::default().fg(p::DIM)),
-            Span::styled(path, Style::default().fg(p::FG)),
+            Span::styled(first_path, Style::default().fg(p::FG)),
         ])),
         Rect {
             y: area.y + 1,
@@ -1714,6 +1755,41 @@ pub(crate) fn draw_vfs_entry(f: &mut Frame, area: Rect, item: &VfsFileActivity, 
             ..area
         },
     );
+    for (index, line) in path_lines.iter().skip(1).enumerate() {
+        let y = area.y + 2 + index as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        f.render_widget(
+            Paragraph::new(Span::styled(line.clone(), Style::default().fg(p::FG))),
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+        );
+    }
+}
+
+fn wrapped_path_lines(path: &str, first_width: usize, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut chars = path.chars();
+    let mut lines = Vec::new();
+    if first_width > 0 {
+        lines.push(chars.by_ref().take(first_width).collect());
+    } else {
+        lines.push(String::new());
+    }
+    loop {
+        let line: String = chars.by_ref().take(width).collect();
+        if line.is_empty() {
+            break;
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 pub(crate) fn vfs_activity_scale(entries: &[&VfsFileActivity]) -> f64 {
@@ -1814,19 +1890,6 @@ fn compact_vfs_rate(rate: f64) -> String {
         format!("{amount:.1}")
     };
     format!("{amount}{}", units[unit])
-}
-
-fn truncate_text(value: &str, width: usize) -> String {
-    let len = value.chars().count();
-    if len <= width {
-        return value.to_string();
-    }
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-    let mut truncated: String = value.chars().take(width - 3).collect();
-    truncated.push_str("...");
-    truncated
 }
 
 fn truncate_line(value: &str, width: usize) -> String {
@@ -2721,6 +2784,7 @@ mod tests {
             tgid: 7,
             comm: "writer".into(),
             processes: vec![("writer".into(), 7, 7)],
+            captured_parents: Vec::new(),
             display_processes: vec![("writer".into(), 7)],
             display_workloads: Vec::new(),
             basename: "data.bin".into(),
@@ -3492,7 +3556,7 @@ mod tests {
         let (read, write, vfs) = detail_areas(tall);
         assert_eq!((read.height, write.height), (13, 13));
         assert_eq!((vfs.y, vfs.height), (14, 12));
-        assert_eq!(vfs_entry_capacity(vfs.height.saturating_sub(2)), 5);
+        assert_eq!(vfs.height.saturating_sub(2), 10);
         assert_eq!(vfs.y + vfs.height, WIDE_DETAIL_BODY_HEIGHT);
 
         let (overview, detail) = master_detail_heights(68, 5);
@@ -3534,10 +3598,12 @@ mod tests {
     }
 
     #[test]
-    fn vfs_path_text_only_truncates_at_its_row_edge() {
-        assert_eq!(truncate_text("Cache worker foo", 12), "Cache wor...");
-        assert_eq!(truncate_text("short", 12), "short");
-        assert_eq!(truncate_text("long", 3), "...");
+    fn vfs_path_wraps_after_inode_then_uses_full_width() {
+        assert_eq!(
+            wrapped_path_lines("abcdefghijklmnop", 4, 6),
+            vec!["abcd", "efghij", "klmnop"]
+        );
+        assert_eq!(wrapped_path_lines("short", 12, 20), vec!["short"]);
     }
 
     #[test]
@@ -3674,11 +3740,33 @@ mod tests {
     }
 
     #[test]
-    fn vfs_capacity_only_counts_complete_two_row_entries() {
-        assert_eq!(vfs_entry_capacity(0), 0);
-        assert_eq!(vfs_entry_capacity(1), 0);
-        assert_eq!(vfs_entry_capacity(2), 1);
-        assert_eq!(vfs_entry_capacity(5), 2);
+    fn vfs_entry_height_includes_every_wrapped_path_row() {
+        let mut item = hot_file(8, 1, 75.0, 25.0);
+        item.path = "/a/very/long/container/path/that/continues/across/the/screen".into();
+        let width = 24;
+        let height = vfs_entry_height(&item, width);
+        assert!(height > 2);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_vfs_entry(frame, frame.area(), &item, 100.0))
+            .expect("draw wrapped VFS entry");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (1..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let inode = format!("inode {}  ", item.inode);
+        let mut rendered = rows[0].strip_prefix(&inode).unwrap().trim_end().to_string();
+        for row in &rows[1..] {
+            rendered.push_str(row.trim_end());
+        }
+        assert_eq!(rendered, item.path);
+        assert!(!rendered.contains("..."));
     }
 
     #[test]
