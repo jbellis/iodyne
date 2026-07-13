@@ -3,6 +3,7 @@ pub mod filesystems;
 pub mod io;
 pub mod mounts;
 pub mod smart;
+pub mod topology;
 pub mod volumes;
 
 pub mod ebpf;

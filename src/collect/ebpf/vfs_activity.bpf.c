@@ -168,6 +168,15 @@ struct {
     __uint(max_entries, VFS_RING_BYTES);
 } VFS_EVENTS SEC(".maps");
 
+// Ring-buffer pressure must be observable: losing attribution is acceptable,
+// silently presenting an incomplete sample as complete is not.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} VFS_DROPS SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -604,7 +613,11 @@ static __inline __attribute__((always_inline)) int record_vfs_file(
     }
     vfs_event_metadata(file, pid_tgid, &event);
     // A full ring drops attribution rather than delaying the filesystem call.
-    bpf_ringbuf_output(&VFS_EVENTS, &event, sizeof(event), 0);
+    if (bpf_ringbuf_output(&VFS_EVENTS, &event, sizeof(event), 0) < 0) {
+        __u64 *drops = bpf_map_lookup_elem(&VFS_DROPS, &zero);
+        if (drops)
+            __sync_fetch_and_add(drops, 1);
+    }
     return 0;
 }
 

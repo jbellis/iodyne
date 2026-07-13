@@ -23,7 +23,8 @@ workload?" It complements `iostat`; it is not a benchmark or a long-term
 metrics store.
 
 Sampling defaults to once every two seconds (0.5 Hz). Use `-` and `+` while
-the TUI is running to adjust the interval in 100 ms steps.
+the TUI is running to adjust the interval in 100 ms steps, or select the
+initial cadence with `--interval-ms N` (100 through 10000 ms).
 
 ## Install
 
@@ -83,6 +84,31 @@ Use diagnostics to see which probes and collectors actually loaded:
 sudo "$(command -v iodyne)" --diag
 ```
 
+## JSONL output
+
+`--jsonl` skips terminal setup and writes a versioned JSON object per line.
+The result is a self-contained storage trace suitable for scripts, notebooks,
+or an LLM: the first row identifies the host, devices, mounts, backing topology,
+and available collectors; each later row records one sampling interval.
+
+```sh
+sudo "$(command -v iodyne)" --jsonl --interval-ms 500 > iodyne.jsonl
+```
+
+For each interval, you get exact block-counter deltas alongside the derived
+bandwidth, IOPS, request size, queue depth, and latency values. When eBPF is
+available, the row also includes per-request latency histograms and two views
+of file activity: the raw per-process observations, and the same merged,
+container-aware 10-second hot-file view shown in the TUI. Raw entries retain
+the actual executor as well as the requester inferred through FUSE or
+OverlayFS, so parent-process rollups remain auditable. Collector status and
+ring-buffer drops make gaps explicit. A revised inventory row appears when the
+storage topology changes.
+
+CPU, memory, network, complete process tables, filesystem capacity, SMART,
+argv, and environment data are intentionally omitted; standard host tools are
+better sources for those facts.
+
 ## Platforms
 
 **Linux:** aggregate statistics come from `/proc/diskstats`; device and mount
@@ -91,6 +117,19 @@ Linux 5.11 or newer, kernel BTF at `/sys/kernel/btf/vmlinux`, the expected block
 tracepoints, and permission to load tracing BPF. VFS probes are supplied for
 x86_64 and arm64. Root usually has the required permission, but lockdown,
 containers, vendor kernels, or LSM policy can still reject a probe.
+
+The full bare-host, Docker, and Podman matrix has passed in both unprivileged
+fallback and privileged eBPF modes on these x86_64 EC2 guests:
+
+| Distribution | Tested kernel |
+|---|---|
+| RHEL 9 | `5.14.0-687.15.1.el9_8.x86_64` |
+| Ubuntu 22.04 LTS | `5.15.0-1111-aws` |
+| Debian 12 | `6.1.0-50-cloud-amd64` |
+| Ubuntu 24.04 LTS | `6.8.0-1060-aws` |
+
+The reusable release matrix and its exact expectations are documented under
+[`testing/ec2`](testing/ec2/README.md).
 
 **macOS:** workload statistics come from IOKit; topology comes from `diskutil`
 and `system_profiler`. APFS containers are attributed to their physical stores.
@@ -107,6 +146,7 @@ as temperature, wear, spare, and power-on time. `smartmontools` is optional.
 | `j` / `k`, `Down` / `Up` | Select a device |
 | `u` | Show mounted devices or all devices |
 | `p` | Freeze or resume the display (collection continues) |
+| `-` / `+` | Decrease or increase the sampling interval |
 | `,` | Open settings |
 | `b` | Toggle binary/decimal units while settings are open |
 | `q` / `Esc` | Quit |

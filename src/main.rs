@@ -1,17 +1,20 @@
 use std::env;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 
 mod app;
 mod collect;
 mod config;
+mod jsonl;
 mod screen;
 mod ui;
 
 #[derive(Debug)]
 enum Command {
-    Run,
+    Run { interval: Duration },
+    Jsonl { interval: Duration },
     Diag,
     Help,
     Version,
@@ -19,7 +22,8 @@ enum Command {
 
 fn main() -> Result<()> {
     match parse_args(env::args().skip(1))? {
-        Command::Run => app::run(),
+        Command::Run { interval } => app::run(interval),
+        Command::Jsonl { interval } => jsonl::run(interval),
         Command::Diag => match run_diag() {
             Err(error)
                 if error
@@ -42,20 +46,67 @@ fn main() -> Result<()> {
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
-    let mut command = Command::Run;
-    for arg in args {
-        command = match arg.as_str() {
-            "--diag" => Command::Diag,
-            "-h" | "--help" => Command::Help,
-            "-V" | "--version" => Command::Version,
+    let mut mode: Option<Command> = None;
+    let mut interval = collect::io::DEFAULT_SAMPLE_INTERVAL;
+    let mut interval_set = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--jsonl" => set_mode(&mut mode, Command::Jsonl { interval })?,
+            "--diag" => set_mode(&mut mode, Command::Diag)?,
+            "-h" | "--help" => set_mode(&mut mode, Command::Help)?,
+            "-V" | "--version" => set_mode(&mut mode, Command::Version)?,
+            "--interval-ms" => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--interval-ms requires a value\n\n{}", help_text())
+                })?;
+                interval = parse_interval(&value)?;
+                interval_set = true;
+            }
+            _ if arg.starts_with("--interval-ms=") => {
+                interval = parse_interval(arg.trim_start_matches("--interval-ms="))?;
+                interval_set = true;
+            }
             _ => bail!("unexpected argument: {arg}\n\n{}", help_text()),
-        };
+        }
     }
-    Ok(command)
+    match mode {
+        None | Some(Command::Run { .. }) => Ok(Command::Run { interval }),
+        Some(Command::Jsonl { .. }) => Ok(Command::Jsonl { interval }),
+        Some(_) if interval_set => {
+            bail!(
+                "--interval-ms is valid only in TUI or JSONL mode\n\n{}",
+                help_text()
+            )
+        }
+        Some(command) => Ok(command),
+    }
+}
+
+fn set_mode(mode: &mut Option<Command>, command: Command) -> Result<()> {
+    if mode.is_some() {
+        bail!(
+            "only one of --jsonl, --diag, --help, or --version may be used\n\n{}",
+            help_text()
+        );
+    }
+    *mode = Some(command);
+    Ok(())
+}
+
+fn parse_interval(value: &str) -> Result<Duration> {
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("invalid --interval-ms value: {value}"))?;
+    let interval = Duration::from_millis(millis);
+    if !(app::MIN_SAMPLE_INTERVAL..=app::MAX_SAMPLE_INTERVAL).contains(&interval) {
+        bail!("--interval-ms must be between 100 and 10000");
+    }
+    Ok(interval)
 }
 
 fn help_text() -> &'static str {
-    "Live per-device disk IO, latency, topology, and health TUI\n\nUsage: iodyne [--diag]\n\nOptions:\n      --diag     Print collected state and exit without launching the TUI\n  -h, --help     Print help\n  -V, --version  Print version"
+    "Live per-device disk IO, latency, topology, and health\n\nUsage: iodyne [--jsonl] [--interval-ms N]\n       iodyne --diag\n\nOptions:\n      --jsonl          Write one JSON object per line instead of launching the TUI\n      --interval-ms N  Sampling interval for TUI or JSONL mode (100-10000; default 2000)\n      --diag           Print collected state and exit without launching the TUI\n  -h, --help           Print help\n  -V, --version        Print version"
 }
 
 fn run_diag() -> Result<()> {
@@ -152,7 +203,18 @@ mod tests {
 
     #[test]
     fn parses_supported_flags() {
-        assert!(matches!(parse_args(args(&[])).unwrap(), Command::Run));
+        assert!(matches!(
+            parse_args(args(&[])).unwrap(),
+            Command::Run { interval } if interval == Duration::from_secs(2)
+        ));
+        assert!(matches!(
+            parse_args(args(&["--interval-ms", "500"])).unwrap(),
+            Command::Run { interval } if interval == Duration::from_millis(500)
+        ));
+        assert!(matches!(
+            parse_args(args(&["--jsonl", "--interval-ms=750"])).unwrap(),
+            Command::Jsonl { interval } if interval == Duration::from_millis(750)
+        ));
         assert!(matches!(
             parse_args(args(&["--diag"])).unwrap(),
             Command::Diag
@@ -171,6 +233,14 @@ mod tests {
     fn rejects_unknown_flags_with_help() {
         let error = parse_args(args(&["--wat"])).unwrap_err().to_string();
         assert!(error.contains("unexpected argument: --wat"));
-        assert!(error.contains("Usage: iodyne [--diag]"));
+        assert!(error.contains("Usage: iodyne [--jsonl]"));
+    }
+
+    #[test]
+    fn validates_interval_and_mode_combinations() {
+        assert!(parse_args(args(&["--interval-ms", "99"])).is_err());
+        assert!(parse_args(args(&["--interval-ms=10001"])).is_err());
+        assert!(parse_args(args(&["--diag", "--interval-ms", "500"])).is_err());
+        assert!(parse_args(args(&["--jsonl", "--diag"])).is_err());
     }
 }

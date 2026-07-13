@@ -15,7 +15,7 @@ const FUSE_ORIGIN_PID_ZERO: u32 = 3;
 /// guarantees that sustained producers cannot monopolize the UI thread.
 const MAX_VFS_EVENTS_PER_DRAIN: usize = 8192;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlockDeviceId {
     pub major: u32,
     pub minor: u32,
@@ -40,6 +40,36 @@ pub enum VfsActivitySource {
     /// Counts bytes completed by VFS read/write calls. This is filesystem
     /// traffic rather than physical-device traffic and can include cache hits.
     EbpfCompletedBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VfsAttributionKind {
+    Direct,
+    FuseProtocol,
+    FuseWriteback,
+    FusePidZero,
+    FuseUnresolved,
+    Unknown(u32),
+}
+
+impl Default for VfsAttributionKind {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VfsPathSource {
+    Ebpf,
+    ProcFd,
+    BasenameFallback,
+    Unresolved,
+}
+
+impl Default for VfsPathSource {
+    fn default() -> Self {
+        Self::Unresolved
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,13 +155,26 @@ struct VfsFilePath {
     path: [u8; 256],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VfsActivityDelta {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VfsActivityDelta {
     pub device: BlockDeviceId,
     pub inode: u64,
     pub pid: u32,
     pub tgid: u32,
     pub comm: String,
+    /// Task that actually executed the VFS operation (for example,
+    /// fuse-overlayfs). The fields above are iodyne's attributed requester.
+    pub executor_pid: u32,
+    pub executor_tgid: u32,
+    pub executor_comm: String,
+    pub executor_cgroup_id: u64,
+    /// Requester identity captured by delegated-filesystem hooks before
+    /// userspace resolution. Zero values mean no delegated requester.
+    pub origin_pid: u32,
+    pub origin_tgid: u32,
+    pub origin_comm: String,
+    pub origin_cgroup_id: u64,
+    pub attribution_kind: VfsAttributionKind,
     /// Immediate parent captured while the process was still alive.
     pub parent_tgid: u32,
     pub parent_comm: String,
@@ -140,6 +183,7 @@ pub(crate) struct VfsActivityDelta {
     pub container_owned: bool,
     pub basename: String,
     pub path: String,
+    pub path_source: VfsPathSource,
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub read_ops: u64,
@@ -167,6 +211,8 @@ pub struct EbpfLatencyCollector {
     vfs_overlay_status: EbpfStatus,
     cgroup_container_cache: HashMap<u64, bool>,
     previous: HashMap<HistogramKey, u64>,
+    previous_vfs_drops: u64,
+    pending_vfs_drops: u64,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     latency_bpf: Option<aya::Bpf>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -192,6 +238,8 @@ impl EbpfLatencyCollector {
             vfs_overlay_status: EbpfStatus::Unavailable("test fixture".into()),
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
+            previous_vfs_drops: 0,
+            pending_vfs_drops: 0,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             latency_bpf: None,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -272,7 +320,17 @@ impl EbpfLatencyCollector {
                 return Vec::new();
             }
         };
+        if let Ok(total) = self.read_vfs_drop_count() {
+            self.pending_vfs_drops = self
+                .pending_vfs_drops
+                .saturating_add(total.saturating_sub(self.previous_vfs_drops));
+            self.previous_vfs_drops = total;
+        }
         current
+    }
+
+    pub(crate) fn take_vfs_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_vfs_drops)
     }
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -328,6 +386,8 @@ impl EbpfLatencyCollector {
                     vfs_overlay_status,
                     cgroup_container_cache: HashMap::new(),
                     previous: HashMap::new(),
+                    previous_vfs_drops: 0,
+                    pending_vfs_drops: 0,
                     latency_bpf: Some(latency_bpf),
                     vfs_bpf,
                 }
@@ -351,6 +411,8 @@ impl EbpfLatencyCollector {
                 )),
                 cgroup_container_cache: HashMap::new(),
                 previous: HashMap::new(),
+                previous_vfs_drops: 0,
+                pending_vfs_drops: 0,
                 latency_bpf: None,
                 vfs_bpf: None,
             },
@@ -368,6 +430,8 @@ impl EbpfLatencyCollector {
             vfs_overlay_status: EbpfStatus::DisabledAtBuild,
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
+            previous_vfs_drops: 0,
+            pending_vfs_drops: 0,
         }
     }
 
@@ -382,6 +446,8 @@ impl EbpfLatencyCollector {
             vfs_overlay_status: EbpfStatus::UnsupportedPlatform,
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
+            previous_vfs_drops: 0,
+            pending_vfs_drops: 0,
         }
     }
 
@@ -416,8 +482,9 @@ impl EbpfLatencyCollector {
             .vfs_bpf
             .as_mut()
             .ok_or_else(|| "eBPF collector is not loaded".to_string())?;
-        let mut deltas = HashMap::<VfsFileKey, VfsActivityDelta>::new();
-        let mut path_keys = HashMap::<VfsFileKey, VfsFileKey>::new();
+        type ObservationKey = (VfsFileKey, u32, u32, u32);
+        let mut deltas = HashMap::<ObservationKey, VfsActivityDelta>::new();
+        let mut path_keys = HashMap::<ObservationKey, VfsFileKey>::new();
         let mut delegated_processes = HashMap::<u32, Option<(u32, String)>>::new();
         {
             let events = bpf
@@ -500,9 +567,15 @@ impl EbpfLatencyCollector {
                 if effective_key.tgid == std::process::id() {
                     continue;
                 }
-                path_keys.entry(effective_key).or_insert(event.key);
+                let observation_key = (
+                    effective_key,
+                    event.key.tgid,
+                    event.origin_tgid,
+                    event.origin_kind,
+                );
+                path_keys.entry(observation_key).or_insert(event.key);
                 let delta = deltas
-                    .entry(effective_key)
+                    .entry(observation_key)
                     .or_insert_with(|| VfsActivityDelta {
                         device: BlockDeviceId {
                             major: effective_key.major,
@@ -512,11 +585,21 @@ impl EbpfLatencyCollector {
                         pid,
                         tgid: effective_key.tgid,
                         comm,
+                        executor_pid: event.pid,
+                        executor_tgid: event.key.tgid,
+                        executor_comm: bpf_string(&event.comm),
+                        executor_cgroup_id: event.cgroup_id,
+                        origin_pid: event.origin_pid,
+                        origin_tgid: event.origin_tgid,
+                        origin_comm: bpf_string(&event.origin_comm),
+                        origin_cgroup_id: event.origin_cgroup_id,
+                        attribution_kind: attribution_kind(event.origin_kind),
                         parent_tgid,
                         parent_comm: parent_comm.clone(),
                         container_owned: delegated_by_fuse_overlay || cgroup_is_container,
                         basename: bpf_string(&event.basename),
                         path: String::new(),
+                        path_source: VfsPathSource::Unresolved,
                         read_bytes: 0,
                         write_bytes: 0,
                         read_ops: 0,
@@ -546,9 +629,14 @@ impl EbpfLatencyCollector {
                 let paths = AyaHashMap::<_, VfsFileKey, VfsFilePath>::try_from(paths)
                     .map_err(|error| format!("cannot access eBPF VFS path map: {error}"))?;
                 for (key, delta) in &mut deltas {
-                    let path_key = path_keys.get(key).unwrap_or(key);
+                    let path_key = path_keys.get(key).unwrap_or(&key.0);
                     match paths.get(path_key, 0) {
-                        Ok(path) => delta.path = bpf_string(&path.path),
+                        Ok(path) => {
+                            delta.path = bpf_string(&path.path);
+                            if !delta.path.is_empty() {
+                                delta.path_source = VfsPathSource::Ebpf;
+                            }
+                        }
                         Err(MapError::KeyNotFound) => {}
                         Err(error) => {
                             return Err(format!("cannot read eBPF VFS path: {error}"));
@@ -565,6 +653,24 @@ impl EbpfLatencyCollector {
         Ok(deltas.into_values().collect())
     }
 
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    fn read_vfs_drop_count(&mut self) -> Result<u64, String> {
+        use aya::maps::Array;
+
+        let bpf = self
+            .vfs_bpf
+            .as_mut()
+            .ok_or_else(|| "eBPF collector is not loaded".to_string())?;
+        let drops = bpf
+            .map_mut("VFS_DROPS")
+            .ok_or_else(|| "eBPF VFS drop counter is missing".to_string())?;
+        let drops = Array::<_, u64>::try_from(drops)
+            .map_err(|error| format!("cannot access eBPF VFS drop counter: {error}"))?;
+        drops
+            .get(&0, 0)
+            .map_err(|error| format!("cannot read eBPF VFS drop counter: {error}"))
+    }
+
     #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
     fn read_counts(&mut self) -> Result<HashMap<HistogramKey, u64>, String> {
         Ok(HashMap::new())
@@ -573,6 +679,11 @@ impl EbpfLatencyCollector {
     #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
     fn read_vfs_counts(&mut self) -> Result<Vec<VfsActivityDelta>, String> {
         Ok(Vec::new())
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    fn read_vfs_drop_count(&mut self) -> Result<u64, String> {
+        Ok(0)
     }
 }
 
@@ -884,6 +995,17 @@ fn decode_vfs_event(bytes: &[u8]) -> Option<VfsEvent> {
     }
     // Ring-buffer records are byte slices and do not promise Rust alignment.
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<VfsEvent>()) })
+}
+
+fn attribution_kind(origin_kind: u32) -> VfsAttributionKind {
+    match origin_kind {
+        0 => VfsAttributionKind::Direct,
+        FUSE_ORIGIN_PROTOCOL => VfsAttributionKind::FuseProtocol,
+        FUSE_ORIGIN_WRITEBACK => VfsAttributionKind::FuseWriteback,
+        FUSE_ORIGIN_PID_ZERO => VfsAttributionKind::FusePidZero,
+        FUSE_ORIGIN_UNKNOWN => VfsAttributionKind::FuseUnresolved,
+        value => VfsAttributionKind::Unknown(value),
+    }
 }
 
 fn bucket_bounds(index: usize) -> (u64, Option<u64>) {

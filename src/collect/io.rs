@@ -65,10 +65,14 @@ pub struct VfsFileActivity {
     pub captured_parents: Vec<(u32, String, u32)>,
     /// Presentation identities, collapsed to immediate parents when available.
     pub display_processes: Vec<(String, u32)>,
+    /// Explicit mapping from each contributing child TGID to the identity
+    /// selected for presentation after sibling collapse.
+    pub process_rollups: Vec<(u32, String, u32)>,
     /// Container/workload labels keyed by displayed host PID.
     pub display_workloads: Vec<(u32, String)>,
     pub basename: String,
     pub path: String,
+    pub path_source: crate::collect::ebpf::VfsPathSource,
     pub read_bps: f64,
     pub write_bps: f64,
     pub read_ops: f64,
@@ -207,6 +211,7 @@ struct DeviceTotals {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct IntervalMetrics {
+    raw: DeviceIntervalRaw,
     read_bps: f64,
     write_bps: f64,
     read_iops: f64,
@@ -217,14 +222,38 @@ struct IntervalMetrics {
     await_sample: AwaitSample,
 }
 
+/// Exact counter deltas observed for one block device interval. These are the
+/// evidence from which the normalized rates in [`IoTick`] are derived.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIntervalRaw {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub read_merges: Option<u64>,
+    pub write_merges: Option<u64>,
+    pub read_time_ns: u64,
+    pub write_time_ns: u64,
+    pub weighted_io_time_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceInterval {
+    pub device: String,
+    pub raw: DeviceIntervalRaw,
+    pub derived: IoTick,
+}
+
 fn interval_metrics(
     current: DeviceTotals,
     previous: DeviceTotals,
     elapsed: f64,
 ) -> IntervalMetrics {
     let elapsed = elapsed.max(0.001);
-    let read_bytes = current.bytes_read.saturating_sub(previous.bytes_read) as f64;
-    let write_bytes = current.bytes_written.saturating_sub(previous.bytes_written) as f64;
+    let read_bytes_raw = current.bytes_read.saturating_sub(previous.bytes_read);
+    let write_bytes_raw = current.bytes_written.saturating_sub(previous.bytes_written);
+    let read_bytes = read_bytes_raw as f64;
+    let write_bytes = write_bytes_raw as f64;
     let read_ops = current.ops_read.saturating_sub(previous.ops_read);
     let write_ops = current.ops_written.saturating_sub(previous.ops_written);
     let read_time = current
@@ -263,7 +292,30 @@ fn interval_metrics(
         _ => None,
     };
 
+    let (read_merges, write_merges) = match (current.merges, previous.merges) {
+        (Some((current_read, current_write)), Some((previous_read, previous_write))) => (
+            Some(current_read.saturating_sub(previous_read)),
+            Some(current_write.saturating_sub(previous_write)),
+        ),
+        _ => (None, None),
+    };
+    let weighted_io_time_ns = match (current.weighted_io_time_ns, previous.weighted_io_time_ns) {
+        (Some(current), Some(previous)) => Some(current.saturating_sub(previous)),
+        _ => None,
+    };
+
     IntervalMetrics {
+        raw: DeviceIntervalRaw {
+            read_bytes: read_bytes_raw,
+            write_bytes: write_bytes_raw,
+            read_ops,
+            write_ops,
+            read_merges,
+            write_merges,
+            read_time_ns: read_time,
+            write_time_ns: write_time,
+            weighted_io_time_ns,
+        },
         read_bps: read_bytes / elapsed,
         write_bps: write_bytes / elapsed,
         read_iops: read_ops as f64 / elapsed,
@@ -306,6 +358,10 @@ pub struct IoCollector {
     /// retained so each device's p99 timeline represents real time.
     pub traced_history: HashMap<String, VecDeque<TracedLatencySample>>,
     pub latest: Vec<IoTick>,
+    pub latest_intervals: Vec<DeviceInterval>,
+    pub latest_vfs: Vec<VfsActivityDelta>,
+    pub latest_vfs_dropped_events: u64,
+    pub latest_elapsed: Duration,
     /// Bounded, host-wide VFS completed-byte activity sorted hottest first.
     pub hot_files: Vec<VfsFileActivity>,
     /// Ring-buffer events are drained on every main-loop pass, independently
@@ -324,6 +380,10 @@ impl IoCollector {
             history: HashMap::new(),
             traced_history: HashMap::new(),
             latest: Vec::new(),
+            latest_intervals: Vec::new(),
+            latest_vfs: Vec::new(),
+            latest_vfs_dropped_events: 0,
+            latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
             pending_vfs: HashMap::new(),
             vfs_activity_window: VfsActivityWindow::default(),
@@ -339,6 +399,10 @@ impl IoCollector {
             history: HashMap::new(),
             traced_history: HashMap::new(),
             latest: Vec::new(),
+            latest_intervals: Vec::new(),
+            latest_vfs: Vec::new(),
+            latest_vfs_dropped_events: 0,
+            latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
             pending_vfs: HashMap::new(),
             vfs_activity_window: VfsActivityWindow::default(),
@@ -350,12 +414,49 @@ impl IoCollector {
         self.latency_probe.source()
     }
 
+    pub fn latency_status(&self) -> &EbpfStatus {
+        self.latency_probe.status()
+    }
+
     pub fn hot_files_source(&self) -> VfsActivitySource {
         self.latency_probe.vfs_source()
     }
 
     pub fn hot_files_status(&self) -> &EbpfStatus {
         self.latency_probe.vfs_status()
+    }
+
+    pub fn vfs_path_status(&self) -> &EbpfStatus {
+        self.latency_probe.vfs_path_status()
+    }
+
+    pub fn vfs_fuse_status(&self) -> &EbpfStatus {
+        self.latency_probe.vfs_fuse_status()
+    }
+
+    pub fn vfs_fuse_writeback_status(&self) -> &EbpfStatus {
+        self.latency_probe.vfs_fuse_writeback_status()
+    }
+
+    pub fn vfs_overlay_status(&self) -> &EbpfStatus {
+        self.latency_probe.vfs_overlay_status()
+    }
+
+    /// Establish a cumulative-counter baseline without emitting a sample.
+    pub fn prime(&mut self) {
+        self.poll_vfs_events();
+        self.prev_totals = self.read_totals();
+        self.last_sample = Instant::now();
+        self.latest.clear();
+        self.latest_intervals.clear();
+        self.latest_vfs.clear();
+        self.latest_vfs_dropped_events = 0;
+    }
+
+    pub fn sampled_device_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.prev_totals.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Called from the main loop and rate-limited to the selected cadence.
@@ -367,10 +468,12 @@ impl IoCollector {
             return false;
         }
         let elapsed = elapsed_dur.as_secs_f64().max(0.001);
+        self.latest_elapsed = elapsed_dur;
         self.last_sample = now;
 
         let totals = self.read_totals();
         let mut new_latest: Vec<IoTick> = Vec::new();
+        let mut new_intervals: Vec<DeviceInterval> = Vec::new();
         for (device, t) in &totals {
             let Some(prev) = self.prev_totals.get(device).copied() else {
                 // Cumulative kernel counters need one baseline observation.
@@ -411,7 +514,7 @@ impl IoCollector {
                 None
             };
 
-            new_latest.push(IoTick {
+            let tick = IoTick {
                 device: device.clone(),
                 bps,
                 split: Some((read_bps, write_bps)),
@@ -422,10 +525,18 @@ impl IoCollector {
                 await_sample: metrics.await_sample,
                 latency_avg,
                 latency_pct,
+            };
+            new_intervals.push(DeviceInterval {
+                device: device.clone(),
+                raw: metrics.raw,
+                derived: tick.clone(),
             });
+            new_latest.push(tick);
         }
         new_latest.sort_by(|a, b| a.device.cmp(&b.device));
+        new_intervals.sort_by(|a, b| a.device.cmp(&b.device));
         self.latest = new_latest;
+        self.latest_intervals = new_intervals;
         self.prev_totals = totals;
         self.sample_traced_latency();
         self.sample_hot_files(elapsed);
@@ -433,15 +544,34 @@ impl IoCollector {
     }
 
     fn sample_hot_files(&mut self, elapsed: f64) {
+        self.latest_vfs_dropped_events = self.latency_probe.take_vfs_drops();
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
+            self.latest_vfs.clear();
             self.pending_vfs.clear();
             self.vfs_activity_window.clear();
             return;
         }
-        let deltas = std::mem::take(&mut self.pending_vfs)
+        let deltas: Vec<_> = std::mem::take(&mut self.pending_vfs)
             .into_values()
             .collect();
+        self.latest_vfs = deltas.clone();
+        self.latest_vfs.sort_by(|a, b| {
+            (
+                a.device.major,
+                a.device.minor,
+                a.inode,
+                a.tgid,
+                a.executor_tgid,
+            )
+                .cmp(&(
+                    b.device.major,
+                    b.device.minor,
+                    b.inode,
+                    b.tgid,
+                    b.executor_tgid,
+                ))
+        });
         self.vfs_activity_window.push(deltas, elapsed);
         self.hot_files = self.vfs_activity_window.ranked(HOT_FILE_LIMIT);
         resolve_hot_file_paths(&mut self.hot_files);
@@ -459,6 +589,9 @@ impl IoCollector {
                 device: delta.device,
                 inode: delta.inode,
                 tgid: delta.tgid,
+                executor_tgid: delta.executor_tgid,
+                origin_tgid: delta.origin_tgid,
+                attribution_kind: delta.attribution_kind,
             };
             if let Some(pending) = self.pending_vfs.get_mut(&key) {
                 pending.read_bytes = pending.read_bytes.saturating_add(delta.read_bytes);
@@ -475,6 +608,7 @@ impl IoCollector {
                 }
                 if !delta.path.is_empty() {
                     pending.path = delta.path;
+                    pending.path_source = delta.path_source;
                 }
             } else {
                 self.pending_vfs.insert(key, delta);
@@ -552,6 +686,9 @@ struct VfsActivityKey {
     device: BlockDeviceId,
     inode: u64,
     tgid: u32,
+    executor_tgid: u32,
+    origin_tgid: u32,
+    attribution_kind: crate::collect::ebpf::VfsAttributionKind,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -602,6 +739,7 @@ struct VfsActivityTotal {
     container_owned: bool,
     basename: String,
     path: String,
+    path_source: crate::collect::ebpf::VfsPathSource,
 }
 
 #[derive(Debug)]
@@ -647,6 +785,9 @@ impl VfsActivityWindow {
                 device: delta.device,
                 inode: delta.inode,
                 tgid: delta.tgid,
+                executor_tgid: delta.executor_tgid,
+                origin_tgid: delta.origin_tgid,
+                attribution_kind: delta.attribution_kind,
             };
             let mut counts = VfsActivityCounts {
                 read_bytes: delta.read_bytes as f64,
@@ -665,6 +806,7 @@ impl VfsActivityWindow {
                 container_owned: delta.container_owned,
                 basename: delta.basename.clone(),
                 path: delta.path.clone(),
+                path_source: delta.path_source,
             });
             total.counts.add(counts);
             // Keep presentation metadata current if a PID or filename is
@@ -679,6 +821,7 @@ impl VfsActivityWindow {
             total.basename = delta.basename;
             if !delta.path.is_empty() {
                 total.path = delta.path;
+                total.path_source = delta.path_source;
             }
         }
 
@@ -730,6 +873,11 @@ impl VfsActivityWindow {
                 } else {
                     total.path.clone()
                 },
+                path_source: if total.path.is_empty() {
+                    crate::collect::ebpf::VfsPathSource::BasenameFallback
+                } else {
+                    total.path_source
+                },
                 comm: total.comm.clone(),
                 processes: vec![(total.comm.clone(), total.pid, key.tgid)],
                 captured_parents: (total.parent_tgid != 0)
@@ -737,6 +885,7 @@ impl VfsActivityWindow {
                     .into_iter()
                     .collect(),
                 display_processes: vec![(total.comm.clone(), key.tgid)],
+                process_rollups: vec![(key.tgid, total.comm.clone(), key.tgid)],
                 display_workloads: total
                     .container_owned
                     .then(|| (key.tgid, "container".to_string()))
@@ -771,6 +920,7 @@ fn merge_vfs_processes(activity: &mut Vec<VfsFileActivity>) {
                 && !item.path.starts_with(&item.basename)
             {
                 existing.path = item.path;
+                existing.path_source = item.path_source;
             }
         } else {
             merged.insert(key, item);
@@ -895,6 +1045,7 @@ fn resolve_hot_file_paths_at(activity: &mut [VfsFileActivity], proc_root: &std::
         });
         if let Some(path) = path {
             item.path.clone_from(path);
+            item.path_source = crate::collect::ebpf::VfsPathSource::ProcFd;
         }
     }
 }
@@ -943,6 +1094,10 @@ fn collapse_hot_file_processes_at(activity: &mut [VfsFileActivity], proc_root: &
                     .unwrap_or_else(|| child.clone());
                 (child.1, displayed)
             })
+            .collect();
+        item.process_rollups = collapsed
+            .iter()
+            .map(|(child, (comm, displayed))| (*child, comm.clone(), *displayed))
             .collect();
         let displayed_pids: HashMap<_, _> = collapsed
             .iter()
@@ -1284,6 +1439,7 @@ mod tests {
             write_bytes,
             read_ops: 2,
             write_ops: 3,
+            ..VfsActivityDelta::default()
         }
     }
 
@@ -1350,6 +1506,10 @@ mod tests {
 
         assert_eq!(activity[0].display_processes, vec![("codex".into(), 200)]);
         assert_eq!(activity[0].processes.len(), 2);
+        assert_eq!(
+            activity[0].process_rollups,
+            vec![(100, "codex".into(), 200), (101, "codex".into(), 200)]
+        );
 
         let mut single = VfsActivityWindow::default();
         let mut child = vfs_delta(43, 1, 0);
@@ -1561,9 +1721,11 @@ mod tests {
             processes: vec![("test".into(), pid, pid)],
             captured_parents: Vec::new(),
             display_processes: vec![("test".into(), pid)],
+            process_rollups: vec![(pid, "test".into(), pid)],
             display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),
             path: fallback_file_path("Cargo.toml", metadata.ino()),
+            path_source: crate::collect::ebpf::VfsPathSource::BasenameFallback,
             read_bps: 1.0,
             write_bps: 0.0,
             read_ops: 1.0,
@@ -1585,9 +1747,11 @@ mod tests {
             processes: vec![("test".into(), std::process::id(), std::process::id())],
             captured_parents: Vec::new(),
             display_processes: vec![("test".into(), std::process::id())],
+            process_rollups: vec![(std::process::id(), "test".into(), std::process::id())],
             display_workloads: Vec::new(),
             basename: "data.log".into(),
             path: "/captured/at/event/time/data.log".into(),
+            path_source: crate::collect::ebpf::VfsPathSource::Ebpf,
             read_bps: 1.0,
             write_bps: 0.0,
             read_ops: 1.0,
@@ -1632,9 +1796,11 @@ mod tests {
             processes: vec![("worker".into(), task_pid, leader_pid)],
             captured_parents: Vec::new(),
             display_processes: vec![("worker".into(), leader_pid)],
+            process_rollups: vec![(leader_pid, "worker".into(), leader_pid)],
             display_workloads: Vec::new(),
             basename: "Cargo.toml".into(),
             path: fallback_file_path("Cargo.toml", metadata.ino()),
+            path_source: crate::collect::ebpf::VfsPathSource::BasenameFallback,
             read_bps: 1.0,
             write_bps: 0.0,
             read_ops: 1.0,
@@ -1695,6 +1861,13 @@ mod tests {
         );
 
         let metrics = interval_metrics(current, previous, 0.5);
+        assert_eq!(metrics.raw.read_bytes, 50_000);
+        assert_eq!(metrics.raw.write_bytes, 25_000);
+        assert_eq!(metrics.raw.read_ops, 20);
+        assert_eq!(metrics.raw.write_ops, 5);
+        assert_eq!(metrics.raw.read_time_ns, 40_000_000);
+        assert_eq!(metrics.raw.write_time_ns, 50_000_000);
+        assert_eq!(metrics.raw.weighted_io_time_ns, Some(750_000_000));
         assert_near(metrics.read_bps, 100_000.0);
         assert_near(metrics.write_bps, 50_000.0);
         assert_near(metrics.read_iops, 40.0);

@@ -23,8 +23,8 @@ use crate::ui::format::{set_unit_mode, UnitMode};
 use crate::ui::palette as p;
 
 const SAMPLE_INTERVAL_STEP: Duration = Duration::from_millis(100);
-const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_HISTORY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,20 +56,21 @@ pub struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(sample_interval: Duration) -> Self {
         let settings = Settings::load();
         set_unit_mode(settings.unit_mode);
         let devices = collect::devices::collect();
         let filesystems = collect::filesystems::collect();
         let volumes = collect::volumes::collect();
-        let io = collect::IoCollector::new();
+        let mut io = collect::IoCollector::new();
+        io.prime();
         let mut cpu_system = System::new();
         cpu_system.refresh_cpu_usage();
         let mut smart = collect::SmartCollector::new();
         smart.refresh_if_due(&devices);
         Self {
             live: LiveState::Live,
-            sample_interval: collect::io::DEFAULT_SAMPLE_INTERVAL,
+            sample_interval,
             cpu_usage: 0.0,
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
             cpu_system,
@@ -153,8 +154,8 @@ impl App {
     }
 }
 
-pub fn run() -> Result<()> {
-    let mut app = App::new();
+pub fn run(sample_interval: Duration) -> Result<()> {
+    let mut app = App::new(sample_interval);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
