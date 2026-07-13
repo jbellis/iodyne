@@ -54,7 +54,9 @@ Privileged Linux additionally attempts two independent eBPF collectors:
   including time queued and in service. Bounded in-kernel histograms are read
   once per display interval; individual events are not streamed to userspace.
 - **VFS activity** attributes requested bytes and operations to filesystem
-  device, inode, and process. A `security_file_permission` fentry probe calls
+  device, inode, and process. Compact operation records flow through a bounded
+  kernel ring buffer and are aggregated into display intervals in userspace.
+  A `security_file_permission` fentry probe calls
   `bpf_d_path()` while the file path is valid, so short-lived files normally
   retain their path. Paths are bounded to 256 bytes; `/proc/<pid>/fd` remains a
   fallback when event-time capture is unavailable.

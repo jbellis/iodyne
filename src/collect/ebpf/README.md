@@ -41,11 +41,12 @@ current CO-RE field paths are `request.q.disk`, `request.cmd_flags`, and
 iodyne falls back to aggregate await statistics.
 
 Separate VFS objects contain optional `vfs_read` and `vfs_write` kprobes. Their
-map creation, load, and attach status is independent: a kernel without the LRU
-map type or either VFS symbol can still provide block latency. File activity is
-accumulated in an 8192-entry LRU map keyed by filesystem device, inode, and
-process TGID. Atomic counters keep updates safe when several threads in a
-process access the same file.
+map creation, load, and attach status is independent: a kernel without the ring
+buffer map type or either VFS symbol can still provide block latency. Each
+operation emits a compact record to a 1 MiB ring buffer; userspace drains and
+groups a bounded number of received records once per display interval. A full
+ring drops VFS attribution rather than delaying the filesystem operation, and
+sustained producers cannot monopolize the UI thread.
 
 After both count kprobes attach, `security_file_permission` is attached
 independently as an fentry program and uses `bpf_d_path` to capture the first
@@ -58,8 +59,9 @@ an earlier object or map-creation failure disables the complete VFS collector
 An empty map value records a failed or overlong-path attempt so the helper is
 not retried for every operation. Userspace prefers an event-time path, then
 scans at most 256 descriptors for each unresolved candidate process, then shows
-basename and inode. It only polls paths for active count keys plus one race
-retry; it never installs recursive watches or walks filesystem trees.
+basename and inode. It only polls paths for keys received from the ring during
+the current interval; it never installs recursive watches or walks filesystem
+trees.
 
 VFS byte counts are the `count` requested at function entry, not bytes returned
 to the caller and not physical disk bytes. Page-cache hits are included;

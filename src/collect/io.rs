@@ -38,12 +38,12 @@ const RING_LEN: usize = 60;
 /// One minute of aligned latency observations.
 const LATENCY_WINDOW: usize = 60;
 
-/// Maximum host-wide VFS entries retained for presentation. Kernel memory is
-/// separately bounded by the 8192-entry LRU map.
+/// Maximum host-wide VFS entries retained for presentation. Kernel event and
+/// path storage are separately bounded.
 const HOT_FILE_LIMIT: usize = 64;
 /// Smooth VFS activity over ten seconds so short collector intervals do not
 /// make the hottest-file ranking flicker. Samples remain bounded by the
-/// kernel's 8192-entry LRU map and this finite time window.
+/// kernel event ring and this finite time window.
 const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const PROC_FD_SCAN_LIMIT: usize = 256;
@@ -568,10 +568,10 @@ struct VfsActivityFrame {
     counts: HashMap<VfsActivityKey, VfsActivityCounts>,
 }
 
-/// A time-weighted rolling sum of requested VFS operations. The eBPF map is
-/// bounded to 8192 live keys; this queue retains only frames intersecting the
-/// last ten seconds and therefore has a fixed time/memory bound at the 1 Hz
-/// collector cadence. No file tree is watched or traversed.
+/// A time-weighted rolling sum of requested VFS operations. This queue retains
+/// only frames intersecting the last ten seconds and therefore has a fixed
+/// time/memory bound at the 1 Hz collector cadence. No file tree is watched or
+/// traversed.
 #[derive(Debug, Default)]
 struct VfsActivityWindow {
     frames: VecDeque<VfsActivityFrame>,
