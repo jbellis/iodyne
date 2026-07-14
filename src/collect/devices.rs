@@ -53,9 +53,15 @@ pub struct DeviceTick {
     pub size_bytes: u64,
     pub used_bytes: u64,
     pub is_removable: bool,
+    /// Collected inventory evidence reserved for richer device facts.
+    #[allow(dead_code)]
     pub firmware: Option<String>,
+    /// Collected inventory evidence reserved for richer device facts.
+    #[allow(dead_code)]
     pub serial: Option<String>,
     pub smart_ok: Option<bool>,
+    /// Distinguishes discovered devices with no reported media capacity.
+    #[allow(dead_code)]
     pub idle: bool,
 }
 

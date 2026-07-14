@@ -84,11 +84,15 @@ pub struct IoTick {
     pub device: String,
     /// Combined read + write bytes/sec.
     pub bps: f64,
-    /// Per-direction byte rates.
+    /// Compatibility view of per-direction byte rates. Workload history is
+    /// the preferred source for rendering aligned directional series.
+    #[allow(dead_code)]
     pub split: Option<(f64, f64)>,
     /// Combined read + write operations/sec.
     pub iops: f64,
-    /// Per-direction operation rates: (read, write).
+    /// Compatibility view of per-direction operation rates: (read, write).
+    /// Workload history is the preferred source for rendering.
+    #[allow(dead_code)]
     pub iops_split: Option<(f64, f64)>,
     /// Mean bytes per completed operation in this interval.
     pub avg_request_bytes: Option<f64>,

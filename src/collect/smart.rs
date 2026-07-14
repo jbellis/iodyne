@@ -36,7 +36,11 @@ pub struct AtaAttr {
     pub id: u8,
     pub name: String,
     pub value: u32,
+    /// Preserved SMART evidence not currently rendered in the compact UI.
+    #[allow(dead_code)]
     pub worst: u32,
+    /// Preserved SMART failure threshold for future detailed evidence output.
+    #[allow(dead_code)]
     pub thresh: Option<u32>,
     pub raw: String,
 }

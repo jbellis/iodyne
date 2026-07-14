@@ -20,6 +20,8 @@ pub struct FsTick {
     pub used_bytes: u64,
     pub avail_bytes: u64,
     pub inode_pct: Option<u32>,
+    /// Retained as mount-level evidence for future filtering and JSON output.
+    #[allow(dead_code)]
     pub is_removable: bool,
     pub is_system: bool,
 }
@@ -34,11 +36,11 @@ pub fn collect() -> Vec<FsTick> {
         .iter()
         .map(|d| {
             let mount = d.mount_point().to_string_lossy().to_string();
-            let mut device = d.name().to_string_lossy().to_string();
+            let reported_device = d.name().to_string_lossy().to_string();
             #[cfg(target_os = "macos")]
-            if let Some(source) = mount_table.get(&mount) {
-                device = source.clone();
-            }
+            let device = mount_table.get(&mount).cloned().unwrap_or(reported_device);
+            #[cfg(not(target_os = "macos"))]
+            let device = reported_device;
             let fs_type = d.file_system().to_string_lossy().to_string();
             let total = d.total_space();
             let avail = d.available_space();

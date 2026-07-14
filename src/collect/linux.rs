@@ -27,7 +27,6 @@ pub struct LinuxDevice {
     pub serial: Option<String>,
     pub size_bytes: u64,
     pub removable: bool,
-    pub rotational: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -109,7 +108,6 @@ fn parse_block(base: &Path, name: &str) -> LinuxDevice {
         serial,
         size_bytes: size_sectors.saturating_mul(SECTOR_BYTES),
         removable,
-        rotational,
     }
 }
 

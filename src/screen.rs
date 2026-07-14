@@ -2265,6 +2265,7 @@ fn format_iops(iops: f64) -> String {
     }
 }
 
+#[cfg(test)]
 fn mounts_for_device(device: &str, filesystems: &[FsTick]) -> Option<String> {
     let mut mounts: Vec<String> = filesystems
         .iter()

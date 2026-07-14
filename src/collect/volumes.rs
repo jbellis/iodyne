@@ -30,6 +30,8 @@ pub struct MdRaidArray {
 #[derive(Debug, Clone, Default)]
 pub struct MdRaidMember {
     pub device: String,
+    /// Kernel RAID slot retained for diagnostics and degraded-array evidence.
+    #[allow(dead_code)]
     pub index: u32,
     pub flag: Option<String>, // "(F)" failed, "(S)" spare, "(W)" write-mostly
 }
@@ -45,7 +47,11 @@ pub struct MdRaidProgress {
 #[derive(Debug, Clone, Default)]
 pub struct ApfsContainer {
     pub bsd: String,
+    /// Parsed APFS capacity evidence reserved for a richer volume view.
+    #[allow(dead_code)]
     pub size_bytes: u64,
+    /// Parsed APFS usage evidence reserved for a richer volume view.
+    #[allow(dead_code)]
     pub used_bytes: u64,
     pub physical_store: Option<String>,
     pub volumes: Vec<ApfsVolume>,
@@ -54,10 +60,16 @@ pub struct ApfsContainer {
 #[derive(Debug, Clone, Default)]
 pub struct ApfsVolume {
     pub bsd: String,
+    /// Parsed APFS metadata retained even though topology only needs the BSD ID.
+    #[allow(dead_code)]
     pub name: String,
+    #[allow(dead_code)]
     pub role: String,
+    #[allow(dead_code)]
     pub mount_point: Option<String>,
+    #[allow(dead_code)]
     pub consumed_bytes: u64,
+    #[allow(dead_code)]
     pub filevault: bool,
 }
 
@@ -404,6 +416,7 @@ fn parse_progress(line: &str) -> Option<MdRaidProgress> {
 
 /// Extracts the first byte count from a line like
 /// "   319709114368 B (319.7 GB) (32.1% used)" → 319_709_114_368.
+#[cfg(target_os = "macos")]
 fn first_byte_count(s: &str) -> u64 {
     let mut digits = String::new();
     for ch in s.chars() {
