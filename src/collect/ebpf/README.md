@@ -40,7 +40,8 @@ current CO-RE field paths are `request.q.disk`, `request.cmd_flags`, and
 `request.__data_len`; kernels whose BTF lacks them reject the load, and
 iodyne falls back to aggregate await statistics.
 
-Separate VFS objects contain optional `vfs_read` and `vfs_write` kprobes. Their
+Separate VFS objects contain `vfs_read`, `vfs_write`, `vfs_iter_read`, and
+`vfs_iter_write` kprobes. Their
 map creation, load, and attach status is independent: a kernel without the ring
 buffer map type or either VFS symbol can still provide block latency. Each
 successful operation emits its completed byte count as a compact record to a
@@ -67,13 +68,12 @@ the FUSE daemon. `--diag` reports the direct requester hook and PID-zero
 writeback hook separately.
 
 Kernel OverlayFS is handled without a delegation lookup because the original
-container task remains current. Entry/return probes on `ovl_read_iter` and
-`ovl_write_iter` scope the nested `vfs_iter_read` and `vfs_iter_write` calls;
-those nested calls expose the real upper/lower regular file and its physical
-filesystem device. A nesting counter prevents stacked overlays from leaking
-state, and direct iter I/O outside OverlayFS is ignored. These hooks attach
-independently, so a kernel without OverlayFS symbols retains base VFS and FUSE
-collection. `--diag` reports their attach status.
+container task remains current. Its nested `vfs_iter_read` and
+`vfs_iter_write` calls expose the real upper/lower regular file and its
+physical filesystem device. Direct iter I/O outside OverlayFS is also counted,
+covering vectored callers that bypass scalar `vfs_read`/`vfs_write`. This does
+not depend on optional internal OverlayFS symbols. `--diag` reports backing
+attribution active whenever the generic iter probes attach.
 
 The probe admits only regular files on filesystems with a nonzero block-device
 major. Device nodes, PTYs, pipes, sockets, and anonymous pseudo-filesystems are
@@ -97,12 +97,12 @@ trees.
 VFS byte counts are successful return values from the probed VFS calls, not
 caller buffer capacities and not physical disk bytes. Page-cache hits are
 included; buffered writeback is attributed to the writing process at the
-original VFS call rather than to a later kernel worker. mmap I/O, direct paths that bypass
-`vfs_read`/`vfs_write` (including some io_uring operations), metadata I/O, and
-files whose operations bypass these hooks may be absent. Overlong paths and
-kernels that reject event-time path capture use the `/proc` fallback; when that
-also cannot resolve a file, iodyne retains the bounded basename and inode
-identity.
+original VFS call rather than to a later kernel worker. mmap I/O, metadata I/O,
+and direct file-operation paths that bypass both scalar and iter VFS helpers
+(including some io_uring operations) remain outside this collector. Overlong
+paths and kernels that reject event-time path capture use the `/proc` fallback;
+when that also cannot resolve a file, iodyne retains the bounded basename and
+inode identity.
 
 For displayed host processes, userspace also reads the bounded
 `/proc/<pid>/cgroup` record and recognizes Docker, Podman/libpod, containerd,

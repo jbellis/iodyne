@@ -233,25 +233,16 @@ struct {
     __type(value, struct pending_vfs_io);
 } PENDING_VFS_IO SEC(".maps");
 
-// Overlay backing calls nest below a logical VFS operation on the same
-// thread, so they need independent pending state.
+// Iter-based calls can nest below a scalar operation (notably through
+// OverlayFS), so they need independent pending state. They also cover direct
+// vfs_iter_read/write callers such as readv/writev that never pass through
+// vfs_read/write.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, __u64);
     __type(value, struct pending_vfs_io);
-} PENDING_OVERLAY_IO SEC(".maps");
-
-// Kernel OverlayFS forwards logical operations to real upper/lower files
-// through vfs_iter_read/write while the original container task remains
-// current. A nesting counter scopes those otherwise-generic helpers so direct
-// iter I/O is not counted twice.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u64);
-    __type(value, __u32);
-} ACTIVE_OVERLAY_REQUESTS SEC(".maps");
+} PENDING_ITER_IO SEC(".maps");
 
 // Kept separate from counters so first-path arbitration is an atomic
 // BPF_NOEXIST insertion and userspace never observes a partially-written path.
@@ -551,24 +542,6 @@ static __inline __attribute__((always_inline)) void finish_fuse_reply(
     bpf_map_delete_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid);
 }
 
-static __inline __attribute__((always_inline)) void begin_overlay_request(
-    __u64 pid_tgid) {
-    __u32 *depth = bpf_map_lookup_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid);
-    __u32 next = depth && *depth < 0xffffffffU ? *depth + 1 : 1;
-    bpf_map_update_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid, &next, 0);
-}
-
-static __inline __attribute__((always_inline)) void finish_overlay_request(
-    __u64 pid_tgid) {
-    __u32 *depth = bpf_map_lookup_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid);
-    if (!depth || *depth <= 1) {
-        bpf_map_delete_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid);
-        return;
-    }
-    __u32 next = *depth - 1;
-    bpf_map_update_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid, &next, 0);
-}
-
 static __inline __attribute__((always_inline)) struct file *first_file_arg(
     struct pt_regs *ctx) {
     return vfs_file_arg(ctx);
@@ -751,50 +724,23 @@ int iodyne_fuse_reply(struct pt_regs *ctx) {
     return 0;
 }
 
-SEC("kprobe/ovl_read_iter")
-int iodyne_overlay_read_enter(struct pt_regs *ctx) {
-    begin_overlay_request(bpf_get_current_pid_tgid());
-    return 0;
-}
-SEC("kretprobe/ovl_read_iter")
-int iodyne_overlay_read_exit(struct pt_regs *ctx) {
-    finish_overlay_request(bpf_get_current_pid_tgid());
-    return 0;
-}
-SEC("kprobe/ovl_write_iter")
-int iodyne_overlay_write_enter(struct pt_regs *ctx) {
-    begin_overlay_request(bpf_get_current_pid_tgid());
-    return 0;
-}
-SEC("kretprobe/ovl_write_iter")
-int iodyne_overlay_write_exit(struct pt_regs *ctx) {
-    finish_overlay_request(bpf_get_current_pid_tgid());
-    return 0;
-}
-
 SEC("kprobe/vfs_iter_read")
-int iodyne_overlay_backing_read(struct pt_regs *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    if (!bpf_map_lookup_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid))
-        return 0;
-    begin_pending_io(&PENDING_OVERLAY_IO, first_file_arg(ctx), 0);
+int iodyne_vfs_iter_read(struct pt_regs *ctx) {
+    begin_pending_io(&PENDING_ITER_IO, first_file_arg(ctx), 0);
     return 0;
 }
 SEC("kprobe/vfs_iter_write")
-int iodyne_overlay_backing_write(struct pt_regs *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    if (!bpf_map_lookup_elem(&ACTIVE_OVERLAY_REQUESTS, &pid_tgid))
-        return 0;
-    begin_pending_io(&PENDING_OVERLAY_IO, first_file_arg(ctx), 1);
+int iodyne_vfs_iter_write(struct pt_regs *ctx) {
+    begin_pending_io(&PENDING_ITER_IO, first_file_arg(ctx), 1);
     return 0;
 }
 SEC("kretprobe/vfs_iter_read")
-int iodyne_overlay_backing_read_complete(struct pt_regs *ctx) {
-    return complete_pending_io(&PENDING_OVERLAY_IO, ctx);
+int iodyne_vfs_iter_read_complete(struct pt_regs *ctx) {
+    return complete_pending_io(&PENDING_ITER_IO, ctx);
 }
 SEC("kretprobe/vfs_iter_write")
-int iodyne_overlay_backing_write_complete(struct pt_regs *ctx) {
-    return complete_pending_io(&PENDING_OVERLAY_IO, ctx);
+int iodyne_vfs_iter_write_complete(struct pt_regs *ctx) {
+    return complete_pending_io(&PENDING_ITER_IO, ctx);
 }
 
 // bpf_d_path is restricted to a small verifier allowlist that includes

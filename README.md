@@ -74,9 +74,9 @@ Privileged Linux additionally attempts two independent eBPF collectors:
 
 These are deliberately different accounting layers. The block view describes
 physical requests reaching a device. The VFS view describes bytes completed by
-`vfs_read`/`vfs_write`: reads satisfied by page cache are included, and buffered
-writes are charged when accepted by the VFS rather than when writeback later
-reaches storage.
+scalar and iter VFS read/write helpers: reads satisfied by page cache are
+included, and buffered writes are charged when accepted by the VFS rather than
+when writeback later reaches storage.
 
 Use diagnostics to see which probes and collectors actually loaded:
 
@@ -158,8 +158,8 @@ otherwise under `~/.config/iodyne/`.
 
 - VFS activity is a rolling 10-second hot set, not an audit log. Its bounded
   8,192-entry kernel map can evict colder entries.
-- mmap IO, metadata IO, and paths that bypass `vfs_read`/`vfs_write` (including
-  some `io_uring` operations) are absent from VFS attribution.
+- mmap IO, metadata IO, and paths that bypass both scalar and iter VFS helpers
+  (including some `io_uring` operations) are absent from VFS attribution.
 - Long paths may fall back to a basename and inode. Hard links are represented
   by the first observed path for that identity.
 - LVM and ZFS-specific topology are not decoded. Device-mapper IO remains

@@ -758,6 +758,10 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, Ebp
         ("iodyne_vfs_write", "vfs_write"),
         ("iodyne_fuse_read_complete", "vfs_read"),
         ("iodyne_vfs_write_complete", "vfs_write"),
+        ("iodyne_vfs_iter_read", "vfs_iter_read"),
+        ("iodyne_vfs_iter_write", "vfs_iter_write"),
+        ("iodyne_vfs_iter_read_complete", "vfs_iter_read"),
+        ("iodyne_vfs_iter_write_complete", "vfs_iter_write"),
     ] {
         let program: &mut KProbe = bpf
             .program_mut(program_name)
@@ -799,28 +803,10 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, Ebp
         )),
     };
 
-    // OverlayFS is commonly a module, so these symbols may be absent even on
-    // kernels that support it. Attach exits and physical backing hooks first;
-    // an entry hook is enabled only when its cleanup and recorder are live.
-    let overlay_status = (|| -> Result<(), String> {
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_read_exit", "ovl_read_iter")?;
-        attach_optional_kprobe(
-            &mut bpf,
-            "iodyne_overlay_backing_read_complete",
-            "vfs_iter_read",
-        )?;
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_backing_read", "vfs_iter_read")?;
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_read_enter", "ovl_read_iter")?;
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_write_exit", "ovl_write_iter")?;
-        attach_optional_kprobe(
-            &mut bpf,
-            "iodyne_overlay_backing_write_complete",
-            "vfs_iter_write",
-        )?;
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_backing_write", "vfs_iter_write")?;
-        attach_optional_kprobe(&mut bpf, "iodyne_overlay_write_enter", "ovl_write_iter")?;
-        Ok(())
-    })();
+    // OverlayFS forwards to the generic iter helpers attached above, which
+    // expose its real upper/lower backing file without depending on optional
+    // internal ovl_* symbols.
+    let overlay_status = Ok::<(), String>(());
     // Path capture is a separate, newer capability. Count probes remain
     // attached when BTF lookup, verifier policy, or the helper allowlist
     // rejects this program.
