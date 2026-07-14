@@ -184,14 +184,17 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Release {
                     handle_key(app, k.code);
+                    if app.should_quit {
+                        // Skip the final collector/metadata tick. Returning
+                        // still restores the terminal; process teardown can
+                        // reclaim collector and eBPF resources.
+                        return Ok(());
+                    }
                     redraw = true;
                 }
             }
         }
         app.tick();
-        if app.should_quit {
-            return Ok(());
-        }
     }
 }
 
