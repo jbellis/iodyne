@@ -371,6 +371,9 @@ pub struct IoCollector {
     /// Ring-buffer events are drained on every main-loop pass, independently
     /// of the slower user-selected display cadence.
     pending_vfs: HashMap<VfsActivityKey, VfsActivityDelta>,
+    /// VFS activity ages from the frequent ring-buffer drain, not from the
+    /// slower display sample that publishes the latest ranked view.
+    last_vfs_window_update: Instant,
     vfs_activity_window: VfsActivityWindow,
     latency_probe: EbpfLatencyCollector,
 }
@@ -390,6 +393,7 @@ impl IoCollector {
             latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
             pending_vfs: HashMap::new(),
+            last_vfs_window_update: Instant::now(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::new(),
         }
@@ -409,6 +413,7 @@ impl IoCollector {
             latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
             pending_vfs: HashMap::new(),
+            last_vfs_window_update: Instant::now(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::unavailable_for_test(),
         }
@@ -543,11 +548,11 @@ impl IoCollector {
         self.latest_intervals = new_intervals;
         self.prev_totals = totals;
         self.sample_traced_latency();
-        self.sample_hot_files(elapsed);
+        self.sample_hot_files();
         true
     }
 
-    fn sample_hot_files(&mut self, elapsed: f64) {
+    fn sample_hot_files(&mut self) {
         self.latest_vfs_dropped_events = self.latency_probe.take_vfs_drops();
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
@@ -576,7 +581,6 @@ impl IoCollector {
                     b.executor_tgid,
                 ))
         });
-        self.vfs_activity_window.push(deltas, elapsed);
         self.hot_files = self.vfs_activity_window.ranked(HOT_FILE_LIMIT);
         resolve_hot_file_paths(&mut self.hot_files);
         collapse_hot_file_processes(&mut self.hot_files);
@@ -584,11 +588,30 @@ impl IoCollector {
     }
 
     fn poll_vfs_events(&mut self) {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_vfs_window_update)
+            .as_secs_f64();
+        self.last_vfs_window_update = now;
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.pending_vfs.clear();
+            self.vfs_activity_window.clear();
             return;
         }
-        for delta in self.latency_probe.vfs_snapshot() {
+        let deltas = self.latency_probe.vfs_snapshot();
+        // Age activity at drain cadence. `pending_vfs` below still aggregates
+        // the same deltas for the raw per-display-interval JSON view, but must
+        // not refresh their age when that slower interval completes.
+        self.record_vfs_drain(deltas, elapsed);
+        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
+            self.pending_vfs.clear();
+            self.vfs_activity_window.clear();
+        }
+    }
+
+    fn record_vfs_drain(&mut self, deltas: Vec<VfsActivityDelta>, elapsed: f64) {
+        self.vfs_activity_window.push(deltas.clone(), elapsed);
+        for delta in deltas {
             let key = VfsActivityKey {
                 device: delta.device,
                 inode: delta.inode,
@@ -617,9 +640,6 @@ impl IoCollector {
             } else {
                 self.pending_vfs.insert(key, delta);
             }
-        }
-        if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
-            self.pending_vfs.clear();
         }
     }
 
@@ -1652,6 +1672,20 @@ mod tests {
         window.push(Vec::new(), 1.0);
         assert!(window.ranked(64).is_empty());
         assert_near(window.elapsed, 10.0);
+    }
+
+    #[test]
+    fn pending_display_deltas_do_not_refresh_activity_age() {
+        let mut collector = IoCollector::new_for_test();
+        collector.record_vfs_drain(vec![vfs_delta(1, 1_000, 0)], 0.1);
+        assert_eq!(collector.pending_vfs.len(), 1);
+        assert_eq!(collector.vfs_activity_window.ranked(64).len(), 1);
+
+        // Raw interval output may still be pending when the display cadence is
+        // long, but the hot-file window ages from drains and must expire it.
+        collector.record_vfs_drain(Vec::new(), 10.1);
+        assert_eq!(collector.pending_vfs.len(), 1);
+        assert!(collector.vfs_activity_window.ranked(64).is_empty());
     }
 
     #[test]
