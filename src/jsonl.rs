@@ -22,15 +22,18 @@ pub fn run(interval: Duration, intervals: Option<u64>) -> Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     match run_stream(interval, intervals, &mut out) {
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe) =>
-        {
-            Ok(())
-        }
+        Err(error) if is_broken_pipe(&error) => Ok(()),
         result => result,
     }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+        || error
+            .downcast_ref::<serde_json::Error>()
+            .is_some_and(|json| json.io_error_kind() == Some(io::ErrorKind::BrokenPipe))
 }
 
 fn run_stream(interval: Duration, intervals: Option<u64>, out: &mut impl Write) -> Result<()> {
@@ -348,6 +351,10 @@ fn sample_data(collector: &IoCollector, elapsed_ns: u64) -> SampleData {
         collectors: collector_statuses(collector),
         quality: Quality {
             vfs_observations: collector.latest_vfs.len(),
+            vfs_ring_admitted_events: collector
+                .hot_files_status()
+                .is_active()
+                .then_some(collector.latest_vfs_admitted_events),
             vfs_ring_dropped_events: collector
                 .hot_files_status()
                 .is_active()
@@ -761,6 +768,7 @@ fn status(value: &EbpfStatus) -> Status {
 #[derive(Serialize)]
 struct Quality {
     vfs_observations: usize,
+    vfs_ring_admitted_events: Option<u64>,
     vfs_ring_dropped_events: Option<u64>,
 }
 
@@ -802,6 +810,30 @@ mod tests {
         assert_eq!(inventory.latency_bucket_bounds_us[0].lower_us, 0);
         assert_eq!(inventory.latency_bucket_bounds_us[0].upper_us, Some(2));
         assert_eq!(inventory.latency_bucket_bounds_us[31].upper_us, None);
+    }
+
+    #[test]
+    fn broken_pipe_detection_includes_serde_wrapped_io_errors() {
+        let io_error = anyhow::Error::new(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        assert!(is_broken_pipe(&io_error));
+
+        let mut out = BrokenPipeWriter;
+        let json_error = serde_json::to_writer(&mut out, &serde_json::json!({"x": 1}))
+            .expect_err("writer should fail");
+        let json_error = anyhow::Error::new(json_error);
+        assert!(is_broken_pipe(&json_error));
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

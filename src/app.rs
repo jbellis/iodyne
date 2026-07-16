@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,6 +28,9 @@ const SAMPLE_INTERVAL_STEP: Duration = Duration::from_millis(100);
 pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_HISTORY_LEN: usize = 16;
+const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const BACKGROUND_COLLECTOR_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveState {
@@ -48,13 +53,35 @@ pub struct App {
     pub cpu_usage: f64,
     pub cpu_history: VecDeque<f64>,
     cpu_system: System,
-    /// Last full enumeration (slow path — system_profiler + diskutil).
-    last_metadata_refresh: Instant,
-    /// Last usage refresh (fast path — sysinfo only).
-    last_usage_refresh: Instant,
+    /// Latest slow collector state published by the background TUI thread.
+    background_snapshot: Option<Arc<Mutex<CollectorSnapshot>>>,
     /// Remaining sampled intervals before clean exit; must be at least one when set.
     remaining_intervals: Option<u64>,
     pub should_quit: bool,
+}
+
+#[derive(Clone)]
+struct CollectorSnapshot {
+    devices: Vec<collect::DeviceTick>,
+    filesystems: Vec<collect::FsTick>,
+    volumes: collect::VolumeTick,
+    smart_by_device: std::collections::HashMap<String, collect::smart::SmartTick>,
+}
+
+impl CollectorSnapshot {
+    fn from_state(
+        devices: Vec<collect::DeviceTick>,
+        filesystems: Vec<collect::FsTick>,
+        volumes: collect::VolumeTick,
+        smart: &collect::SmartCollector,
+    ) -> Self {
+        Self {
+            devices,
+            filesystems,
+            volumes,
+            smart_by_device: smart.by_device.clone(),
+        }
+    }
 }
 
 impl App {
@@ -70,6 +97,12 @@ impl App {
         cpu_system.refresh_cpu_usage();
         let mut smart = collect::SmartCollector::new();
         smart.refresh_if_due(&devices);
+        let background_snapshot = Some(spawn_background_collector(CollectorSnapshot::from_state(
+            devices.clone(),
+            filesystems.clone(),
+            volumes.clone(),
+            &smart,
+        )));
         Self {
             live: LiveState::Live,
             sample_interval,
@@ -85,8 +118,7 @@ impl App {
             settings,
             show_settings: false,
             smart,
-            last_metadata_refresh: Instant::now(),
-            last_usage_refresh: Instant::now(),
+            background_snapshot,
             remaining_intervals,
             should_quit: false,
         }
@@ -132,6 +164,7 @@ impl App {
     }
 
     fn tick(&mut self) {
+        self.apply_background_snapshot();
         // The collector forms calm display buckets at the selected cadence.
         // The eBPF backend still accounts for every request between polls.
         if self.io.sample(self.sample_interval) {
@@ -148,24 +181,57 @@ impl App {
         }
         let visible_io = crate::screen::visible_device_count(self);
         self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
-
-        // Slower path: sysinfo-only — used bytes + mounts list at 1Hz.
-        let usage_elapsed = self.last_usage_refresh.elapsed();
-        if usage_elapsed >= Duration::from_millis(1000) {
-            collect::devices::refresh_usage(&mut self.devices);
-            self.filesystems = collect::filesystems::collect();
-            self.last_usage_refresh = Instant::now();
-        }
-        // Slow path: system_profiler + diskutil. Picks up new drives.
-        if self.last_metadata_refresh.elapsed() >= Duration::from_secs(30) {
-            self.devices = collect::devices::collect();
-            self.volumes = collect::volumes::collect();
-            self.last_metadata_refresh = Instant::now();
-        }
-        // SMART has its own 5-minute cadence handled inside the collector;
-        // we just nudge it on each tick.
-        self.smart.refresh_if_due(&self.devices);
     }
+
+    fn apply_background_snapshot(&mut self) {
+        let Some(snapshot) = &self.background_snapshot else {
+            return;
+        };
+        let Ok(snapshot) = snapshot.lock() else {
+            return;
+        };
+        self.devices.clone_from(&snapshot.devices);
+        self.filesystems.clone_from(&snapshot.filesystems);
+        self.volumes = snapshot.volumes.clone();
+        self.smart.by_device.clone_from(&snapshot.smart_by_device);
+    }
+}
+
+fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<CollectorSnapshot>> {
+    let shared = Arc::new(Mutex::new(initial.clone()));
+    let thread_shared = Arc::clone(&shared);
+    thread::spawn(move || {
+        let mut devices = initial.devices;
+        let mut filesystems = initial.filesystems;
+        let mut volumes = initial.volumes;
+        let mut smart = collect::SmartCollector::new();
+        smart.by_device = initial.smart_by_device;
+        let mut last_usage_refresh = Instant::now();
+        let mut last_metadata_refresh = Instant::now();
+        loop {
+            if last_usage_refresh.elapsed() >= USAGE_REFRESH_INTERVAL {
+                collect::devices::refresh_usage(&mut devices);
+                filesystems = collect::filesystems::collect();
+                last_usage_refresh = Instant::now();
+            }
+            if last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
+                devices = collect::devices::collect();
+                volumes = collect::volumes::collect();
+                last_metadata_refresh = Instant::now();
+            }
+            smart.refresh_if_due(&devices);
+            if let Ok(mut snapshot) = thread_shared.lock() {
+                *snapshot = CollectorSnapshot::from_state(
+                    devices.clone(),
+                    filesystems.clone(),
+                    volumes.clone(),
+                    &smart,
+                );
+            }
+            thread::sleep(BACKGROUND_COLLECTOR_POLL);
+        }
+    });
+    shared
 }
 
 /// Run TUI mode, optionally exiting after at least one sampled interval.
@@ -491,8 +557,7 @@ mod tests {
             show_settings: false,
             smart,
             selected_io: 0,
-            last_metadata_refresh: Instant::now(),
-            last_usage_refresh: Instant::now(),
+            background_snapshot: None,
             remaining_intervals: None,
             should_quit: false,
         }

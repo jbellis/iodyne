@@ -45,6 +45,11 @@ const HOT_FILE_LIMIT: usize = 64;
 /// make the hottest-file ranking flicker. Samples remain bounded by the
 /// kernel event ring and this finite time window.
 const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
+/// Maximum wall-clock gap that a single VFS ring drain is allowed to age the
+/// hot-file window. Longer stalls are treated as a brief blind spot: new
+/// events are scaled back to their observed rate while retained history ages
+/// by at most ten normal 100 ms drains.
+const MAX_DRAIN_AGE_SECS: f64 = 1.0;
 #[cfg(target_os = "linux")]
 const PROC_FD_SCAN_LIMIT: usize = 256;
 #[cfg(target_os = "linux")]
@@ -442,6 +447,7 @@ pub struct IoCollector {
     pub latest: Vec<IoTick>,
     pub latest_intervals: Vec<DeviceInterval>,
     pub latest_vfs: Vec<VfsActivityDelta>,
+    pub latest_vfs_admitted_events: u64,
     pub latest_vfs_dropped_events: u64,
     pub latest_elapsed: Duration,
     /// Bounded, host-wide VFS completed-byte activity sorted hottest first.
@@ -467,6 +473,7 @@ impl IoCollector {
             latest: Vec::new(),
             latest_intervals: Vec::new(),
             latest_vfs: Vec::new(),
+            latest_vfs_admitted_events: 0,
             latest_vfs_dropped_events: 0,
             latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
@@ -487,6 +494,7 @@ impl IoCollector {
             latest: Vec::new(),
             latest_intervals: Vec::new(),
             latest_vfs: Vec::new(),
+            latest_vfs_admitted_events: 0,
             latest_vfs_dropped_events: 0,
             latest_elapsed: Duration::ZERO,
             hot_files: Vec::new(),
@@ -537,6 +545,7 @@ impl IoCollector {
         self.latest.clear();
         self.latest_intervals.clear();
         self.latest_vfs.clear();
+        self.latest_vfs_admitted_events = 0;
         self.latest_vfs_dropped_events = 0;
     }
 
@@ -631,6 +640,7 @@ impl IoCollector {
     }
 
     fn sample_hot_files(&mut self) {
+        self.latest_vfs_admitted_events = self.latency_probe.take_vfs_admitted();
         self.latest_vfs_dropped_events = self.latency_probe.take_vfs_drops();
         if self.latency_probe.vfs_source() != VfsActivitySource::EbpfCompletedBytes {
             self.hot_files.clear();
@@ -871,16 +881,12 @@ impl VfsActivityWindow {
     fn push(&mut self, deltas: Vec<VfsActivityDelta>, elapsed: f64) {
         let window = VFS_ACTIVITY_WINDOW.as_secs_f64();
         let elapsed = elapsed.max(0.001);
-        let retained_elapsed = elapsed.min(window);
+        let retained_elapsed = elapsed.min(MAX_DRAIN_AGE_SECS);
         // If collection was delayed beyond the window, assume activity was
         // uniform across that interval. This preserves the observed rate
         // without presenting old counts as a ten-second burst.
         let retained_fraction = retained_elapsed / elapsed;
         let mut frame_counts = HashMap::<VfsActivityKey, VfsActivityCounts>::new();
-
-        if elapsed >= window {
-            self.clear();
-        }
 
         for delta in deltas {
             let key = VfsActivityKey {
@@ -1796,7 +1802,9 @@ mod tests {
     fn hot_file_activity_expires_after_ten_seconds() {
         let mut window = VfsActivityWindow::default();
         window.push(vec![vfs_delta(1, 1_000, 0)], 1.0);
-        window.push(Vec::new(), 9.0);
+        for _ in 0..9 {
+            window.push(Vec::new(), 1.0);
+        }
         assert_near(window.ranked(64)[0].read_bps, 100.0);
 
         window.push(Vec::new(), 1.0);
@@ -1812,10 +1820,12 @@ mod tests {
         assert_eq!(collector.vfs_activity_window.ranked(64).len(), 1);
 
         // Raw interval output may still be pending when the display cadence is
-        // long, but the hot-file window ages from drains and must expire it.
+        // long, but the hot-file window ages from drains. A stalled drain only
+        // advances the window by the bounded blind-spot age.
         collector.record_vfs_drain(Vec::new(), 10.1);
         assert_eq!(collector.pending_vfs.len(), 1);
-        assert!(collector.vfs_activity_window.ranked(64).is_empty());
+        assert_eq!(collector.vfs_activity_window.ranked(64).len(), 1);
+        assert_near(collector.vfs_activity_window.elapsed, 1.1);
     }
 
     #[test]
@@ -1824,10 +1834,10 @@ mod tests {
         window.push(vec![vfs_delta(1, 600, 0)], 6.0);
         window.push(vec![vfs_delta(1, 800, 0)], 8.0);
 
-        // Four of the first sample's six seconds expired, leaving 200 + 800
-        // completed bytes in the ten-second window.
+        // Each delayed sample is compressed to one retained second at its
+        // observed rate: 100 + 100 completed bytes over two retained seconds.
         assert_near(window.ranked(64)[0].read_bps, 100.0);
-        assert_near(window.elapsed, 10.0);
+        assert_near(window.elapsed, 2.0);
     }
 
     #[test]
@@ -1836,8 +1846,37 @@ mod tests {
         window.push(vec![vfs_delta(1, 20_000, 0)], 20.0);
 
         assert_near(window.ranked(64)[0].read_bps, 1_000.0);
-        assert_near(window.elapsed, 10.0);
+        assert_near(window.elapsed, MAX_DRAIN_AGE_SECS);
         assert_eq!(window.frames.len(), 1);
+    }
+
+    #[test]
+    fn stalled_drain_ages_retained_activity_by_bounded_gap() {
+        let mut window = VfsActivityWindow::default();
+        for _ in 0..10 {
+            window.push(vec![vfs_delta(1, 1_000, 0)], 1.0);
+        }
+
+        window.push(vec![vfs_delta(2, 30_000, 0)], 30.0);
+
+        let ranked = window.ranked(64);
+        let a = ranked.iter().find(|item| item.inode == 1).unwrap();
+        let b = ranked.iter().find(|item| item.inode == 2).unwrap();
+        assert_near(window.elapsed, VFS_ACTIVITY_WINDOW.as_secs_f64());
+        assert_near(a.read_bps, 900.0);
+        assert_near(b.read_bps, 100.0);
+        let b_frame = window.frames.back().unwrap();
+        assert_near(b_frame.elapsed, MAX_DRAIN_AGE_SECS);
+        assert_near(
+            b_frame
+                .counts
+                .values()
+                .find(|counts| counts.read_bytes > 0.0)
+                .unwrap()
+                .read_bytes
+                / b_frame.elapsed,
+            1_000.0,
+        );
     }
 
     #[test]

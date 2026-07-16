@@ -212,6 +212,7 @@ pub struct EbpfLatencyCollector {
     cgroup_container_cache: HashMap<u64, bool>,
     previous: HashMap<HistogramKey, u64>,
     previous_vfs_drops: u64,
+    pending_vfs_admitted: u64,
     pending_vfs_drops: u64,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     latency_bpf: Option<aya::Bpf>,
@@ -239,6 +240,7 @@ impl EbpfLatencyCollector {
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
+            pending_vfs_admitted: 0,
             pending_vfs_drops: 0,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             latency_bpf: None,
@@ -333,6 +335,10 @@ impl EbpfLatencyCollector {
         std::mem::take(&mut self.pending_vfs_drops)
     }
 
+    pub(crate) fn take_vfs_admitted(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_vfs_admitted)
+    }
+
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     fn load() -> Self {
         match load_linux() {
@@ -387,6 +393,7 @@ impl EbpfLatencyCollector {
                     cgroup_container_cache: HashMap::new(),
                     previous: HashMap::new(),
                     previous_vfs_drops: 0,
+                    pending_vfs_admitted: 0,
                     pending_vfs_drops: 0,
                     latency_bpf: Some(latency_bpf),
                     vfs_bpf,
@@ -412,6 +419,7 @@ impl EbpfLatencyCollector {
                 cgroup_container_cache: HashMap::new(),
                 previous: HashMap::new(),
                 previous_vfs_drops: 0,
+                pending_vfs_admitted: 0,
                 pending_vfs_drops: 0,
                 latency_bpf: None,
                 vfs_bpf: None,
@@ -431,6 +439,7 @@ impl EbpfLatencyCollector {
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
+            pending_vfs_admitted: 0,
             pending_vfs_drops: 0,
         }
     }
@@ -447,6 +456,7 @@ impl EbpfLatencyCollector {
             cgroup_container_cache: HashMap::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
+            pending_vfs_admitted: 0,
             pending_vfs_drops: 0,
         }
     }
@@ -486,6 +496,7 @@ impl EbpfLatencyCollector {
         let mut deltas = HashMap::<ObservationKey, VfsActivityDelta>::new();
         let mut path_keys = HashMap::<ObservationKey, VfsFileKey>::new();
         let mut delegated_processes = HashMap::<u32, Option<(u32, String)>>::new();
+        let mut admitted = 0_u64;
         {
             let events = bpf
                 .map_mut("VFS_EVENTS")
@@ -567,6 +578,7 @@ impl EbpfLatencyCollector {
                 if effective_key.tgid == std::process::id() {
                     continue;
                 }
+                admitted = admitted.saturating_add(1);
                 let observation_key = (
                     effective_key,
                     event.key.tgid,
@@ -620,6 +632,7 @@ impl EbpfLatencyCollector {
                 }
             }
         }
+        self.pending_vfs_admitted = self.pending_vfs_admitted.saturating_add(admitted);
 
         if self.vfs_path_status.is_active() && !deltas.is_empty() {
             let path_result = (|| -> Result<(), String> {

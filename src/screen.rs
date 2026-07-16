@@ -44,8 +44,6 @@ const HEAT_LABELS: [&str; 7] = [
     ">=256ms",
 ];
 const WIDE_DETAIL_HEIGHT: u16 = 28;
-#[cfg(test)]
-const WIDE_DETAIL_BODY_HEIGHT: u16 = WIDE_DETAIL_HEIGHT - 2;
 const COMPACT_DETAIL_HEIGHT: u16 = 23;
 const DIRECTION_DETAIL_HEIGHT: u16 = 13;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
@@ -200,7 +198,6 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         .constraints([
             Constraint::Length(overview_height),
             Constraint::Length(detail_height),
-            Constraint::Min(0),
         ])
         .split(area);
     let selected = app.selected_io.min(row_count - 1);
@@ -682,7 +679,7 @@ fn master_detail_heights(height: u16, device_count: usize) -> (u16, u16) {
     if height <= 3 {
         return (height, 0);
     }
-    let detail_reserve = if height >= 34 {
+    let min_detail = if height >= 34 {
         WIDE_DETAIL_HEIGHT
     } else if height >= 26 {
         COMPACT_DETAIL_HEIGHT
@@ -690,12 +687,12 @@ fn master_detail_heights(height: u16, device_count: usize) -> (u16, u16) {
         height.saturating_sub(4).min(WIDE_DETAIL_HEIGHT)
     };
     let min_overview = height.min(4);
-    let detail = detail_reserve.min(height.saturating_sub(min_overview));
-    let max_overview = height.saturating_sub(detail).max(1);
+    let min_detail = min_detail.min(height.saturating_sub(min_overview));
+    let max_overview = height.saturating_sub(min_detail).max(1);
     let devices = device_count.max(1).min(u16::MAX as usize) as u16;
     // Top and bottom borders plus the shared column/latency scale row.
     let overview = devices.saturating_add(3).min(max_overview);
-    (overview, detail.min(height.saturating_sub(overview)))
+    (overview, height.saturating_sub(overview))
 }
 
 fn draw_overview_row(
@@ -1097,12 +1094,8 @@ fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
 
 #[cfg(test)]
 fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
-    let packed = Rect {
-        height: body.height.min(WIDE_DETAIL_BODY_HEIGHT),
-        ..body
-    };
-    let directional_height = packed.height.min(DIRECTION_DETAIL_HEIGHT);
-    let separator_height = (packed.height > directional_height) as u16;
+    let directional_height = body.height.min(DIRECTION_DETAIL_HEIGHT);
+    let separator_height = (body.height > directional_height) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1110,7 +1103,7 @@ fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
             Constraint::Length(separator_height),
             Constraint::Min(0),
         ])
-        .split(packed);
+        .split(body);
     let gutter = (rows[0].width > 1) as u16;
     let column_width = rows[0].width.saturating_sub(gutter) / 2;
     let read = Rect {
@@ -1593,11 +1586,21 @@ fn direction_metric_label(title: &str, value: &str) -> String {
     format!(" {title:<12} {:>11} ", value.trim())
 }
 
-fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App) {
-    if area.width == 0 || area.height == 0 {
-        return;
+fn vfs_drop_percent(admitted: u64, dropped: u64) -> Option<u64> {
+    if dropped == 0 {
+        return None;
     }
-    let block = pane_block(Line::from(vec![
+    let total = admitted.saturating_add(dropped);
+    (total > 0).then(|| (dropped.saturating_mul(100).saturating_add(total / 2)) / total)
+}
+
+fn vfs_activity_block<'a>(
+    visible: Option<usize>,
+    total: usize,
+    admitted: u64,
+    dropped: u64,
+) -> Block<'a> {
+    let mut spans = vec![
         Span::styled(
             " VFS ",
             Style::default()
@@ -1605,18 +1608,45 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("| 10s ", Style::default().fg(p::DIM)),
-    ]));
+    ];
+    if let Some(visible) = visible {
+        spans.push(Span::styled(
+            format!("| {visible} of {total} "),
+            Style::default().fg(p::DIM),
+        ));
+    }
+    if let Some(percent) = vfs_drop_percent(admitted, dropped) {
+        spans.push(Span::styled(
+            format!("| ~{percent}% dropped "),
+            Style::default().fg(p::DIM),
+        ));
+    }
+    pane_block(Line::from(spans))
+}
+
+fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = vfs_activity_block(
+        None,
+        0,
+        app.io.latest_vfs_admitted_events,
+        app.io.latest_vfs_dropped_events,
+    );
     let inner = block.inner(area);
-    f.render_widget(block, area);
     if inner.height == 0 {
+        f.render_widget(block, area);
         return;
     }
     if inner.height < 2 {
+        f.render_widget(block, area);
         draw_vfs_status(f, inner, "need 2 rows");
         return;
     }
 
     if app.io.hot_files_source() != VfsActivitySource::EbpfCompletedBytes {
+        f.render_widget(block, area);
         draw_vfs_status(f, inner, vfs_unavailable_message(app.io.hot_files_status()));
         return;
     }
@@ -1627,6 +1657,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         None => app.io.hot_files.iter().collect(),
     };
     if entries.is_empty() {
+        f.render_widget(block, area);
         let status = if fs_devices.as_ref().is_some_and(HashSet::is_empty) {
             "no mounted filesystem attribution"
         } else {
@@ -1638,7 +1669,7 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
 
     let mut used_rows = 0_u16;
     let mut visible = Vec::new();
-    for item in entries {
+    for &item in &entries {
         let height = vfs_entry_height(item, inner.width);
         if used_rows.saturating_add(height) > inner.height {
             break;
@@ -1647,9 +1678,17 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         used_rows += height;
     }
     if visible.is_empty() {
+        f.render_widget(block, area);
         draw_vfs_status(f, inner, "need more rows for wrapped path");
         return;
     }
+    let block = vfs_activity_block(
+        Some(visible.len()),
+        entries.len(),
+        app.io.latest_vfs_admitted_events,
+        app.io.latest_vfs_dropped_events,
+    );
+    f.render_widget(block, area);
     let scale_entries: Vec<_> = visible.iter().map(|(item, _)| *item).collect();
     let scale = vfs_activity_scale(&scale_entries);
     let mut y = inner.y;
@@ -3325,6 +3364,9 @@ mod tests {
         assert_eq!(master_detail_heights(28, 8), (5, 23));
         assert_eq!(master_detail_heights(8, 8), (4, 4));
         assert_eq!(master_detail_heights(1, 8), (1, 0));
+        let (overview, detail) = master_detail_heights(74, 8);
+        assert_eq!(overview + detail, 74);
+        assert_eq!((overview, detail), (11, 63));
         let (overview, detail) = master_detail_heights(28, 8);
         assert!(overview + detail <= 28);
         assert_eq!(row_geometry(60).label + row_geometry(60).plot, 60);
@@ -3555,6 +3597,15 @@ mod tests {
     }
 
     #[test]
+    fn vfs_drop_percentage_rounds_and_omits_clean_intervals() {
+        assert_eq!(vfs_drop_percent(0, 0), None);
+        assert_eq!(vfs_drop_percent(10, 0), None);
+        assert_eq!(vfs_drop_percent(0, 5), Some(100));
+        assert_eq!(vfs_drop_percent(95, 5), Some(5));
+        assert_eq!(vfs_drop_percent(2, 1), Some(33));
+    }
+
+    #[test]
     fn histogram_bars_show_every_nonzero_band() {
         assert_eq!(histogram_filled_cells(0.0, 10), 0);
         assert_eq!(histogram_filled_cells(0.1, 10), 1);
@@ -3578,13 +3629,13 @@ mod tests {
         let tall = Rect::new(0, 0, 130, 70);
         let (read, write, vfs) = detail_areas(tall);
         assert_eq!((read.height, write.height), (13, 13));
-        assert_eq!((vfs.y, vfs.height), (14, 12));
-        assert_eq!(vfs.height.saturating_sub(2), 10);
-        assert_eq!(vfs.y + vfs.height, WIDE_DETAIL_BODY_HEIGHT);
+        assert_eq!((vfs.y, vfs.height), (14, 56));
+        assert_eq!(vfs.height.saturating_sub(2), 54);
+        assert_eq!(vfs.y + vfs.height, tall.height);
 
         let (overview, detail) = master_detail_heights(68, 5);
-        assert_eq!((overview, detail), (8, WIDE_DETAIL_HEIGHT));
-        assert_eq!(overview + detail, 36);
+        assert_eq!((overview, detail), (8, 60));
+        assert_eq!(overview + detail, 68);
 
         let narrow = Rect::new(0, 0, 72, 12);
         let (read, write, vfs) = detail_areas(narrow);
