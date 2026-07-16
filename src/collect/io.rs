@@ -19,7 +19,7 @@
 //! display bucket. Real per-op p99 needs eBPF biolatency (Linux)
 //! or IOReport subscription (macOS), both deferred.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub use crate::collect::ebpf::VfsActivitySource;
@@ -47,6 +47,8 @@ const HOT_FILE_LIMIT: usize = 64;
 const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const PROC_FD_SCAN_LIMIT: usize = 256;
+#[cfg(target_os = "linux")]
+const DISKSTATS_TIME_WRAP_MODULUS_NS: u64 = 4_294_967_296 * 1_000_000;
 
 /// Rolling host-wide VFS activity attributed to a file and process. Rates are
 /// averaged over up to the most recent ten seconds. Byte rates are completed
@@ -198,6 +200,20 @@ impl Default for TracedLatencySample {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+struct DiscardTotals {
+    ops: u64,
+    merges: u64,
+    bytes: u64,
+    time_ns: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FlushTotals {
+    ops: u64,
+    time_ns: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 struct DeviceTotals {
     bytes_read: u64,
     bytes_written: u64,
@@ -211,6 +227,12 @@ struct DeviceTotals {
     /// Weighted I/O time accumulates elapsed time multiplied by the number of
     /// requests queued or in service. Present for Linux diskstats only.
     weighted_io_time_ns: Option<u64>,
+    discards: Option<DiscardTotals>,
+    flushes: Option<FlushTotals>,
+    /// Modulus for cumulative millisecond time counters that wrap. Linux
+    /// diskstats time columns are printed as u32 milliseconds; macOS IOKit
+    /// counters are u64 nanoseconds and resets should clamp to zero instead.
+    time_wrap_modulus_ns: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -239,6 +261,12 @@ pub struct DeviceIntervalRaw {
     pub read_time_ns: u64,
     pub write_time_ns: u64,
     pub weighted_io_time_ns: Option<u64>,
+    pub discard_ops: Option<u64>,
+    pub discard_merges: Option<u64>,
+    pub discard_bytes: Option<u64>,
+    pub discard_time_ns: Option<u64>,
+    pub flush_ops: Option<u64>,
+    pub flush_time_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,18 +282,23 @@ fn interval_metrics(
     elapsed: f64,
 ) -> IntervalMetrics {
     let elapsed = elapsed.max(0.001);
+    let time_wrap_modulus_ns = current.time_wrap_modulus_ns;
     let read_bytes_raw = current.bytes_read.saturating_sub(previous.bytes_read);
     let write_bytes_raw = current.bytes_written.saturating_sub(previous.bytes_written);
     let read_bytes = read_bytes_raw as f64;
     let write_bytes = write_bytes_raw as f64;
     let read_ops = current.ops_read.saturating_sub(previous.ops_read);
     let write_ops = current.ops_written.saturating_sub(previous.ops_written);
-    let read_time = current
-        .total_time_read_ns
-        .saturating_sub(previous.total_time_read_ns);
-    let write_time = current
-        .total_time_write_ns
-        .saturating_sub(previous.total_time_write_ns);
+    let read_time = wrapping_time_delta(
+        current.total_time_read_ns,
+        previous.total_time_read_ns,
+        time_wrap_modulus_ns,
+    );
+    let write_time = wrapping_time_delta(
+        current.total_time_write_ns,
+        previous.total_time_write_ns,
+        time_wrap_modulus_ns,
+    );
     let total_ops = read_ops.saturating_add(write_ops);
 
     let read_request_bytes = if read_ops > 0 {
@@ -290,7 +323,9 @@ fn interval_metrics(
 
     let queue_depth = match (current.weighted_io_time_ns, previous.weighted_io_time_ns) {
         (Some(current), Some(previous)) => {
-            let weighted_seconds = current.saturating_sub(previous) as f64 / 1_000_000_000.0;
+            let weighted_seconds = wrapping_time_delta(current, previous, time_wrap_modulus_ns)
+                as f64
+                / 1_000_000_000.0;
             Some(weighted_seconds / elapsed)
         }
         _ => None,
@@ -304,8 +339,35 @@ fn interval_metrics(
         _ => (None, None),
     };
     let weighted_io_time_ns = match (current.weighted_io_time_ns, previous.weighted_io_time_ns) {
-        (Some(current), Some(previous)) => Some(current.saturating_sub(previous)),
+        (Some(current), Some(previous)) => {
+            Some(wrapping_time_delta(current, previous, time_wrap_modulus_ns))
+        }
         _ => None,
+    };
+    let (discard_ops, discard_merges, discard_bytes, discard_time_ns) =
+        match (current.discards, previous.discards) {
+            (Some(current), Some(previous)) => (
+                Some(current.ops.saturating_sub(previous.ops)),
+                Some(current.merges.saturating_sub(previous.merges)),
+                Some(current.bytes.saturating_sub(previous.bytes)),
+                Some(wrapping_time_delta(
+                    current.time_ns,
+                    previous.time_ns,
+                    time_wrap_modulus_ns,
+                )),
+            ),
+            _ => (None, None, None, None),
+        };
+    let (flush_ops, flush_time_ns) = match (current.flushes, previous.flushes) {
+        (Some(current), Some(previous)) => (
+            Some(current.ops.saturating_sub(previous.ops)),
+            Some(wrapping_time_delta(
+                current.time_ns,
+                previous.time_ns,
+                time_wrap_modulus_ns,
+            )),
+        ),
+        _ => (None, None),
     };
 
     IntervalMetrics {
@@ -319,6 +381,12 @@ fn interval_metrics(
             read_time_ns: read_time,
             write_time_ns: write_time,
             weighted_io_time_ns,
+            discard_ops,
+            discard_merges,
+            discard_bytes,
+            discard_time_ns,
+            flush_ops,
+            flush_time_ns,
         },
         read_bps: read_bytes / elapsed,
         write_bps: write_bytes / elapsed,
@@ -351,6 +419,16 @@ fn interval_metrics(
                 None
             },
         },
+    }
+}
+
+fn wrapping_time_delta(current: u64, previous: u64, modulus: Option<u64>) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        modulus
+            .map(|modulus| current.saturating_add(modulus).saturating_sub(previous))
+            .unwrap_or(0)
     }
 }
 
@@ -1285,6 +1363,9 @@ fn totals_macos() -> HashMap<String, DeviceTotals> {
                     total_time_read_ns: s.total_time_read_ns,
                     total_time_write_ns: s.total_time_write_ns,
                     weighted_io_time_ns: None,
+                    discards: None,
+                    flushes: None,
+                    time_wrap_modulus_ns: None,
                 },
             )
         })
@@ -1296,11 +1377,24 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
     let Ok(text) = std::fs::read_to_string("/proc/diskstats") else {
         return HashMap::new();
     };
-    parse_diskstats_linux(&text)
+    let whole_disks = std::fs::read_dir("/sys/block").ok().map(|entries| {
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<HashSet<_>>()
+    });
+    parse_diskstats_linux(&text, whole_disks.as_ref())
 }
 
+/// Parses Linux `/proc/diskstats`, using `/sys/block` membership as the
+/// authoritative whole-disk rule when available. Partitions appear under their
+/// parent in sysfs, not as top-level `/sys/block` entries; the name heuristic is
+/// retained only as a fallback for environments where sysfs cannot be read.
 #[cfg(target_os = "linux")]
-fn parse_diskstats_linux(text: &str) -> HashMap<String, DeviceTotals> {
+fn parse_diskstats_linux(
+    text: &str,
+    whole_disks: Option<&HashSet<String>>,
+) -> HashMap<String, DeviceTotals> {
     const SECTOR_BYTES: u64 = 512;
     const MS_TO_NS: u64 = 1_000_000;
     let mut out = HashMap::new();
@@ -1313,8 +1407,10 @@ fn parse_diskstats_linux(text: &str) -> HashMap<String, DeviceTotals> {
         if name.starts_with("loop") || name.starts_with("ram") {
             continue;
         }
-        if is_partition_name(name) {
-            continue;
+        match whole_disks {
+            Some(disks) if !disks.contains(name) => continue,
+            None if is_partition_name(name) => continue,
+            _ => {}
         }
         let Ok(reads) = fields[3].parse::<u64>() else {
             continue;
@@ -1340,7 +1436,35 @@ fn parse_diskstats_linux(text: &str) -> HashMap<String, DeviceTotals> {
         let Ok(ms_writing) = fields[10].parse::<u64>() else {
             continue;
         };
+        // `%util` from field 12 is deliberately not collected: on parallel
+        // devices, especially NVMe, 100% busy can still leave substantial
+        // capacity. Queue depth is not surfaced in the TUI either because
+        // interval await already covers that latency signal.
         let weighted_ms = fields.get(13).and_then(|value| value.parse::<u64>().ok());
+        let discards = match (
+            fields.get(14).and_then(|value| value.parse::<u64>().ok()),
+            fields.get(15).and_then(|value| value.parse::<u64>().ok()),
+            fields.get(16).and_then(|value| value.parse::<u64>().ok()),
+            fields.get(17).and_then(|value| value.parse::<u64>().ok()),
+        ) {
+            (Some(ops), Some(merges), Some(sectors), Some(ms)) => Some(DiscardTotals {
+                ops,
+                merges,
+                bytes: sectors.saturating_mul(SECTOR_BYTES),
+                time_ns: ms.saturating_mul(MS_TO_NS),
+            }),
+            _ => None,
+        };
+        let flushes = match (
+            fields.get(18).and_then(|value| value.parse::<u64>().ok()),
+            fields.get(19).and_then(|value| value.parse::<u64>().ok()),
+        ) {
+            (Some(ops), Some(ms)) => Some(FlushTotals {
+                ops,
+                time_ns: ms.saturating_mul(MS_TO_NS),
+            }),
+            _ => None,
+        };
         out.insert(
             name.to_string(),
             DeviceTotals {
@@ -1352,6 +1476,9 @@ fn parse_diskstats_linux(text: &str) -> HashMap<String, DeviceTotals> {
                 total_time_read_ns: ms_reading.saturating_mul(MS_TO_NS),
                 total_time_write_ns: ms_writing.saturating_mul(MS_TO_NS),
                 weighted_io_time_ns: weighted_ms.map(|ms| ms.saturating_mul(MS_TO_NS)),
+                discards,
+                flushes,
+                time_wrap_modulus_ns: Some(DISKSTATS_TIME_WRAP_MODULUS_NS),
             },
         );
     }
@@ -1437,6 +1564,9 @@ mod tests {
             total_time_read_ns: read_time_ns,
             total_time_write_ns: write_time_ns,
             weighted_io_time_ns,
+            discards: None,
+            flushes: None,
+            time_wrap_modulus_ns: None,
         }
     }
 
@@ -1920,6 +2050,30 @@ mod tests {
     }
 
     #[test]
+    fn linux_time_counter_wrap_is_included_in_interval_delta() {
+        let modulus_ns = 4_294_967_296_u64 * 1_000_000;
+        let previous = totals(0, 0, 10, 0, 4_294_967_290_u64 * 1_000_000, 0, None);
+        let current = DeviceTotals {
+            time_wrap_modulus_ns: Some(modulus_ns),
+            ..totals(0, 0, 11, 0, 5_000_000, 0, None)
+        };
+
+        let metrics = interval_metrics(current, previous, 1.0);
+        assert_eq!(metrics.raw.read_time_ns, 11_000_000);
+        assert_near(metrics.await_sample.read_us.unwrap(), 11_000.0);
+    }
+
+    #[test]
+    fn reset_without_time_wrap_modulus_clamps_interval_delta_to_zero() {
+        let previous = totals(0, 0, 10, 0, 10_000_000, 0, None);
+        let current = totals(0, 0, 11, 0, 5_000_000, 0, None);
+
+        let metrics = interval_metrics(current, previous, 1.0);
+        assert_eq!(metrics.raw.read_time_ns, 0);
+        assert_near(metrics.await_sample.read_us.unwrap(), 0.0);
+    }
+
+    #[test]
     fn interval_without_operations_has_no_request_size_or_await() {
         let previous = totals(1_000, 2_000, 100, 50, 1_000, 2_000, None);
         let metrics = interval_metrics(previous, previous, 0.2);
@@ -2073,7 +2227,7 @@ mod tests {
             "   7 0 loop0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
         );
 
-        let parsed = parse_diskstats_linux(input);
+        let parsed = parse_diskstats_linux(input, None);
         assert_eq!(parsed.len(), 1);
         let disk = parsed.get("sda").unwrap();
         assert_eq!(disk.bytes_read, 200 * 512);
@@ -2084,6 +2238,79 @@ mod tests {
         assert_eq!(disk.total_time_read_ns, 300_000_000);
         assert_eq!(disk.total_time_write_ns, 700_000_000);
         assert_eq!(disk.weighted_io_time_ns, Some(900_000_000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diskstats_sysfs_membership_selects_whole_disks_before_name_heuristic() {
+        let whole_disks = HashSet::from([
+            "sda".to_string(),
+            "md0".to_string(),
+            "zram0".to_string(),
+            "nbd0".to_string(),
+            "loop0".to_string(),
+        ]);
+        let input = concat!(
+            "   8 0 sda 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "   8 1 sda1 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "   9 0 md0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            " 254 0 zram0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "  43 0 nbd0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "   7 0 loop0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+        );
+
+        let parsed = parse_diskstats_linux(input, Some(&whole_disks));
+        let names = parsed.keys().cloned().collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "sda".to_string(),
+                "md0".to_string(),
+                "zram0".to_string(),
+                "nbd0".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diskstats_without_sysfs_membership_uses_legacy_name_heuristic() {
+        let input = concat!(
+            "   8 0 sda 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "   9 0 md0 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+        );
+
+        let parsed = parse_diskstats_linux(input, None);
+        assert!(parsed.contains_key("sda"));
+        assert!(!parsed.contains_key("md0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_diskstats_optional_discard_and_flush_counters() {
+        let input = concat!(
+            "   8 0 sda 10 2 20 30 40 4 50 60 0 70 80 5 6 7 8 9 10\n",
+            "   8 16 sdb 1 0 2 3 4 0 5 6 0 7 8\n",
+        );
+
+        let parsed = parse_diskstats_linux(input, None);
+        let sda = parsed.get("sda").unwrap();
+        let discards = sda.discards.unwrap();
+        assert_eq!(discards.ops, 5);
+        assert_eq!(discards.merges, 6);
+        assert_eq!(discards.bytes, 7 * 512);
+        assert_eq!(discards.time_ns, 8_000_000);
+        let flushes = sda.flushes.unwrap();
+        assert_eq!(flushes.ops, 9);
+        assert_eq!(flushes.time_ns, 10_000_000);
+        assert_eq!(
+            sda.time_wrap_modulus_ns,
+            Some(DISKSTATS_TIME_WRAP_MODULUS_NS)
+        );
+
+        let sdb = parsed.get("sdb").unwrap();
+        assert!(sdb.discards.is_none());
+        assert!(sdb.flushes.is_none());
     }
 
     #[test]

@@ -327,12 +327,12 @@ struct SampleData {
     quality: Quality,
 }
 
-fn sample_data(collector: &IoCollector, _elapsed_ns: u64) -> SampleData {
+fn sample_data(collector: &IoCollector, elapsed_ns: u64) -> SampleData {
     SampleData {
         devices: collector
             .latest_intervals
             .iter()
-            .map(|interval| device_sample(interval, collector))
+            .map(|interval| device_sample(interval, collector, elapsed_ns))
             .collect(),
         vfs: VfsSample {
             observations: collector.latest_vfs.iter().map(vfs_observation).collect(),
@@ -369,6 +369,12 @@ struct DeviceRaw {
     read_time_ns: u64,
     write_time_ns: u64,
     weighted_io_time_ns: Option<u64>,
+    discard_ops: Option<u64>,
+    discard_merges: Option<u64>,
+    discard_bytes: Option<u64>,
+    discard_time_ns: Option<u64>,
+    flush_ops: Option<u64>,
+    flush_time_ns: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -386,6 +392,11 @@ struct DeviceDerived {
     write_merges_per_sec: Option<f64>,
     read_await_us: Option<f64>,
     write_await_us: Option<f64>,
+    discard_bps: Option<f64>,
+    discard_iops: Option<f64>,
+    discard_await_us: Option<f64>,
+    flush_iops: Option<f64>,
+    flush_await_us: Option<f64>,
     queue_depth: Option<f64>,
     rolling_tick_await_us: Option<RollingAwait>,
 }
@@ -406,8 +417,13 @@ struct LatencyHistogram {
     write_counts: [u64; LATENCY_BUCKETS],
 }
 
-fn device_sample(interval: &DeviceInterval, collector: &IoCollector) -> DeviceSample {
+fn device_sample(
+    interval: &DeviceInterval,
+    collector: &IoCollector,
+    elapsed_ns: u64,
+) -> DeviceSample {
     let tick = &interval.derived;
+    let elapsed_seconds = (elapsed_ns as f64 / 1_000_000_000.0).max(0.001);
     let workload = collector
         .history
         .get(&interval.device)
@@ -421,6 +437,26 @@ fn device_sample(interval: &DeviceInterval, collector: &IoCollector) -> DeviceSa
         } => (Some(read_per_sec), Some(write_per_sec)),
         MergeRates::Unavailable => (None, None),
     };
+    let discard_bps = interval
+        .raw
+        .discard_bytes
+        .map(|bytes| bytes as f64 / elapsed_seconds);
+    let discard_iops = interval
+        .raw
+        .discard_ops
+        .map(|ops| ops as f64 / elapsed_seconds);
+    let discard_await_us = match (interval.raw.discard_time_ns, interval.raw.discard_ops) {
+        (Some(time_ns), Some(ops)) if ops > 0 => Some(time_ns as f64 / ops as f64 / 1_000.0),
+        _ => None,
+    };
+    let flush_iops = interval
+        .raw
+        .flush_ops
+        .map(|ops| ops as f64 / elapsed_seconds);
+    let flush_await_us = match (interval.raw.flush_time_ns, interval.raw.flush_ops) {
+        (Some(time_ns), Some(ops)) if ops > 0 => Some(time_ns as f64 / ops as f64 / 1_000.0),
+        _ => None,
+    };
     DeviceSample {
         device: interval.device.clone(),
         raw: DeviceRaw {
@@ -433,6 +469,12 @@ fn device_sample(interval: &DeviceInterval, collector: &IoCollector) -> DeviceSa
             read_time_ns: interval.raw.read_time_ns,
             write_time_ns: interval.raw.write_time_ns,
             weighted_io_time_ns: interval.raw.weighted_io_time_ns,
+            discard_ops: interval.raw.discard_ops,
+            discard_merges: interval.raw.discard_merges,
+            discard_bytes: interval.raw.discard_bytes,
+            discard_time_ns: interval.raw.discard_time_ns,
+            flush_ops: interval.raw.flush_ops,
+            flush_time_ns: interval.raw.flush_time_ns,
         },
         derived: DeviceDerived {
             read_bps: workload.read_bps,
@@ -448,6 +490,11 @@ fn device_sample(interval: &DeviceInterval, collector: &IoCollector) -> DeviceSa
             write_merges_per_sec,
             read_await_us: tick.await_sample.read_us,
             write_await_us: tick.await_sample.write_us,
+            discard_bps,
+            discard_iops,
+            discard_await_us,
+            flush_iops,
+            flush_await_us,
             queue_depth: tick.queue_depth,
             rolling_tick_await_us: tick.latency_pct.as_ref().map(|pct| RollingAwait {
                 p50_read: pct.p50_r,
@@ -748,5 +795,47 @@ mod tests {
         assert_eq!(inventory.latency_bucket_bounds_us[0].lower_us, 0);
         assert_eq!(inventory.latency_bucket_bounds_us[0].upper_us, Some(2));
         assert_eq!(inventory.latency_bucket_bounds_us[31].upper_us, None);
+    }
+
+    #[test]
+    fn device_jsonl_includes_discard_and_flush_raw_and_derived_values() {
+        let collector = IoCollector::new_for_test();
+        let interval = DeviceInterval {
+            device: "sda".into(),
+            raw: crate::collect::io::DeviceIntervalRaw {
+                discard_ops: Some(4),
+                discard_merges: Some(1),
+                discard_bytes: Some(8_192),
+                discard_time_ns: Some(8_000_000),
+                flush_ops: Some(2),
+                flush_time_ns: Some(1_000_000),
+                ..Default::default()
+            },
+            derived: crate::collect::io::IoTick {
+                device: "sda".into(),
+                ..Default::default()
+            },
+        };
+
+        let encoded =
+            serde_json::to_value(device_sample(&interval, &collector, 2_000_000_000)).unwrap();
+
+        assert_eq!(encoded["raw"]["discard_ops"], 4);
+        assert_eq!(encoded["raw"]["discard_merges"], 1);
+        assert_eq!(encoded["raw"]["discard_bytes"], 8_192);
+        assert_eq!(encoded["raw"]["discard_time_ns"], 8_000_000);
+        assert_eq!(encoded["raw"]["flush_ops"], 2);
+        assert_eq!(encoded["raw"]["flush_time_ns"], 1_000_000);
+        assert_eq!(encoded["derived"]["discard_bps"].as_f64().unwrap(), 4_096.0);
+        assert_eq!(encoded["derived"]["discard_iops"].as_f64().unwrap(), 2.0);
+        assert_eq!(
+            encoded["derived"]["discard_await_us"].as_f64().unwrap(),
+            2_000.0
+        );
+        assert_eq!(encoded["derived"]["flush_iops"].as_f64().unwrap(), 1.0);
+        assert_eq!(
+            encoded["derived"]["flush_await_us"].as_f64().unwrap(),
+            500.0
+        );
     }
 }

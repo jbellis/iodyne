@@ -96,14 +96,14 @@ sudo "$(command -v iodyne)" --jsonl --interval-ms 500 > iodyne.jsonl
 ```
 
 For each interval, you get exact block-counter deltas alongside the derived
-bandwidth, IOPS, request size, queue depth, and latency values. When eBPF is
-available, the row also includes per-request latency histograms and two views
-of file activity: the raw per-process observations, and the same merged,
-container-aware 10-second hot-file view shown in the TUI. Raw entries retain
-the actual executor as well as the requester inferred through FUSE or
-OverlayFS, so parent-process rollups remain auditable. Collector status and
-ring-buffer drops make gaps explicit. A revised inventory row appears when the
-storage topology changes.
+bandwidth, IOPS, request size, discard and flush rates, queue depth, and
+latency values. When eBPF is available, the row also includes per-request
+latency histograms and two views of file activity: the raw per-process
+observations, and the same merged, container-aware 10-second hot-file view
+shown in the TUI. Raw entries retain the actual executor as well as the
+requester inferred through FUSE or OverlayFS, so parent-process rollups remain
+auditable. Collector status and ring-buffer drops make gaps explicit. A
+revised inventory row appears when the storage topology changes.
 
 CPU, memory, network, complete process tables, filesystem capacity, SMART,
 argv, and environment data are intentionally omitted; standard host tools are
@@ -166,6 +166,7 @@ otherwise under `~/.config/iodyne/`.
   visible, but the detail header may not reconstruct the complete stack.
 - SMART access varies by controller, bridge, permissions, and device support;
   missing fields are omitted rather than inferred.
+- Discard (TRIM) and flush activity appears in JSONL only, not in the TUI.
 - The interface is designed around a 130x36 terminal and remains useful at
   110x30. Smaller terminals necessarily omit detail.
 
