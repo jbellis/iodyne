@@ -104,8 +104,8 @@ latency histograms and two views of file activity: the raw per-process
 observations, and the same merged, container-aware 10-second hot-file view
 shown in the TUI. Raw entries retain the actual executor as well as the
 requester inferred through FUSE or OverlayFS, so parent-process rollups remain
-auditable. Collector status and aggregation-table drops make gaps explicit. A
-revised inventory row appears when the storage topology changes.
+auditable. Collector status makes gaps explicit. A revised inventory row
+appears when the storage topology changes.
 
 CPU, memory, network, complete process tables, filesystem capacity, SMART,
 argv, and environment data are intentionally omitted; standard host tools are
@@ -159,8 +159,8 @@ otherwise under `~/.config/iodyne/`.
 
 ## Limits
 
-- VFS activity is a rolling 10-second hot set, not an audit log. Its bounded
-  8,192-entry kernel map can evict colder entries.
+- VFS activity is a rolling 10-second hot set bounded to 8,192 concurrent
+  file×process entries; it is not an audit log.
 - mmap IO, metadata IO, and paths that bypass both scalar and iter VFS helpers
   (including some `io_uring` operations) are absent from VFS attribution.
 - Long paths may fall back to a basename and inode. Hard links are represented
@@ -170,8 +170,6 @@ otherwise under `~/.config/iodyne/`.
 - SMART access varies by controller, bridge, permissions, and device support;
   missing fields are omitted rather than inferred.
 - Discard (TRIM) and flush activity appears in JSONL only, not in the TUI.
-- The interface is designed around a 130x36 terminal and remains useful at
-  110x30. Smaller terminals necessarily omit detail.
 
 `iodyne` does not write storage, change kernel settings, or persist telemetry.
 
@@ -180,7 +178,7 @@ otherwise under `~/.config/iodyne/`.
 Rust 1.75 or newer is required to build from source:
 
 ```sh
-git clone https://github.com/matthart1983/iodyne.git
+git clone https://github.com/jbellis/iodyne.git
 cd iodyne
 cargo build --release
 ./target/release/iodyne
@@ -198,4 +196,4 @@ MIT
 
 ## Acknowledgements
 
-Iodyne began as a fork of [diskwatch]([url](https://github.com/matthart1983/diskwatch/)) by Matt Hartley and retains some of its code. Thank you!
+Iodyne began as a fork of [diskwatch](https://github.com/matthart1983/diskwatch/) by Matt Hartley and retains some of its code. Thank you!
