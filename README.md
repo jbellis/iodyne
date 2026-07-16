@@ -1,4 +1,5 @@
 # iodyne
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/ae1834b3-03ae-4019-a2a3-c3fa677aac99" />
 
 `iodyne` is a read-only terminal view of storage behavior on one host. It keeps
 all devices on comparable scales, so the busy or slow device stands out before
