@@ -17,10 +17,11 @@ const SCHEMA_VERSION: u32 = 1;
 const TOPOLOGY_REFRESH: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub fn run(interval: Duration) -> Result<()> {
+/// Run JSONL mode, optionally exiting after at least one sampled interval.
+pub fn run(interval: Duration, intervals: Option<u64>) -> Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    match run_stream(interval, &mut out) {
+    match run_stream(interval, intervals, &mut out) {
         Err(error)
             if error
                 .downcast_ref::<io::Error>()
@@ -32,7 +33,7 @@ pub fn run(interval: Duration) -> Result<()> {
     }
 }
 
-fn run_stream(interval: Duration, out: &mut impl Write) -> Result<()> {
+fn run_stream(interval: Duration, intervals: Option<u64>, out: &mut impl Write) -> Result<()> {
     let started = Utc::now();
     let stream_id = format!(
         "{}-{}",
@@ -48,6 +49,7 @@ fn run_stream(interval: Duration, out: &mut impl Write) -> Result<()> {
     let mut sampled_device_names = collector.sampled_device_names();
     let mut inventory_revision = 1_u64;
     let mut sequence = 0_u64;
+    let mut samples_written = 0_u64;
     write_record(
         out,
         &InventoryRecord {
@@ -111,6 +113,10 @@ fn run_stream(interval: Duration, out: &mut impl Write) -> Result<()> {
                 },
             )?;
             sequence += 1;
+            samples_written += 1;
+            if intervals.is_some_and(|limit| samples_written >= limit) {
+                return Ok(());
+            }
         }
         thread::sleep(POLL_INTERVAL.min(interval));
     }
@@ -761,6 +767,7 @@ struct Quality {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn raw_vfs_serialization_keeps_executor_and_attributed_process() {
@@ -795,6 +802,33 @@ mod tests {
         assert_eq!(inventory.latency_bucket_bounds_us[0].lower_us, 0);
         assert_eq!(inventory.latency_bucket_bounds_us[0].upper_us, Some(2));
         assert_eq!(inventory.latency_bucket_bounds_us[31].upper_us, None);
+    }
+
+    #[test]
+    fn run_stream_exits_after_requested_sample_records() {
+        let mut output = Vec::new();
+
+        run_stream(Duration::from_millis(100), Some(2), &mut output).unwrap();
+
+        let records = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["record_type"] == "sample")
+                .count(),
+            2
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|record| record["record_type"] == "inventory")
+                .count()
+                >= 1
+        );
     }
 
     #[test]

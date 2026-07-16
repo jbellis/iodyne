@@ -52,11 +52,13 @@ pub struct App {
     last_metadata_refresh: Instant,
     /// Last usage refresh (fast path — sysinfo only).
     last_usage_refresh: Instant,
+    /// Remaining sampled intervals before clean exit; must be at least one when set.
+    remaining_intervals: Option<u64>,
     pub should_quit: bool,
 }
 
 impl App {
-    fn new(sample_interval: Duration) -> Self {
+    fn new(sample_interval: Duration, remaining_intervals: Option<u64>) -> Self {
         let settings = Settings::load();
         set_unit_mode(settings.unit_mode);
         let devices = collect::devices::collect();
@@ -85,6 +87,7 @@ impl App {
             smart,
             last_metadata_refresh: Instant::now(),
             last_usage_refresh: Instant::now(),
+            remaining_intervals,
             should_quit: false,
         }
     }
@@ -118,6 +121,16 @@ impl App {
             (self.sample_interval + SAMPLE_INTERVAL_STEP).min(MAX_SAMPLE_INTERVAL);
     }
 
+    fn note_interval_completed(&mut self) {
+        let Some(remaining) = self.remaining_intervals else {
+            return;
+        };
+        self.remaining_intervals = Some(remaining.saturating_sub(1));
+        if self.remaining_intervals == Some(0) {
+            self.should_quit = true;
+        }
+    }
+
     fn tick(&mut self) {
         // The collector forms calm display buckets at the selected cadence.
         // The eBPF backend still accounts for every request between polls.
@@ -131,6 +144,7 @@ impl App {
                     self.cpu_history.pop_front();
                 }
             }
+            self.note_interval_completed();
         }
         let visible_io = crate::screen::visible_device_count(self);
         self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
@@ -154,8 +168,9 @@ impl App {
     }
 }
 
-pub fn run(sample_interval: Duration) -> Result<()> {
-    let mut app = App::new(sample_interval);
+/// Run TUI mode, optionally exiting after at least one sampled interval.
+pub fn run(sample_interval: Duration, intervals: Option<u64>) -> Result<()> {
+    let mut app = App::new(sample_interval, intervals);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -195,6 +210,10 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
             }
         }
         app.tick();
+        if app.should_quit {
+            terminal.draw(|f| draw(f, app))?;
+            return Ok(());
+        }
     }
 }
 
@@ -474,6 +493,7 @@ mod tests {
             selected_io: 0,
             last_metadata_refresh: Instant::now(),
             last_usage_refresh: Instant::now(),
+            remaining_intervals: None,
             should_quit: false,
         }
     }
@@ -601,6 +621,23 @@ mod tests {
         app.sample_interval = MAX_SAMPLE_INTERVAL;
         handle_key(&mut app, KeyCode::Char('+'));
         assert_eq!(app.sample_interval, MAX_SAMPLE_INTERVAL);
+    }
+
+    #[test]
+    fn interval_quota_sets_quit_only_when_configured() {
+        let mut app = fixture_app(false);
+        app.remaining_intervals = Some(1);
+
+        app.note_interval_completed();
+
+        assert_eq!(app.remaining_intervals, Some(0));
+        assert!(app.should_quit);
+
+        let mut app = fixture_app(false);
+        app.note_interval_completed();
+
+        assert_eq!(app.remaining_intervals, None);
+        assert!(!app.should_quit);
     }
 
     #[test]

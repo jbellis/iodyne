@@ -24,7 +24,8 @@ metrics store.
 
 Sampling defaults to once every two seconds (0.5 Hz). Use `-` and `+` while
 the TUI is running to adjust the interval in 100 ms steps, or select the
-initial cadence with `--interval-ms N` (100 through 10000 ms).
+initial cadence with `--interval-ms N` (100 through 10000 ms). `--intervals N`
+processes N sampling intervals and then exits, in both TUI and JSONL modes.
 
 ## Install
 
