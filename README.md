@@ -129,6 +129,7 @@ fallback and privileged eBPF modes on these x86_64 EC2 guests:
 | Ubuntu 22.04 LTS | `5.15.0-1111-aws` |
 | Debian 12 | `6.1.0-50-cloud-amd64` |
 | Ubuntu 24.04 LTS | `6.8.0-1060-aws` |
+| Ubuntu 26.04 LTS | `6.6.87.2-microsoft-standard-WSL2` |
 
 The reusable release matrix and its exact expectations are documented under
 [`testing/ec2`](testing/ec2/README.md).
