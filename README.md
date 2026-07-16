@@ -194,3 +194,7 @@ cargo build --release --no-default-features
 ## License
 
 MIT
+
+## Acknowledgements
+
+Iodyne began as a fork of [diskwatch]([url](https://github.com/matthart1983/diskwatch/)) by Matt Hartley and retains some of its code. Thank you!
