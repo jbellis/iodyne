@@ -15,7 +15,9 @@ use chrono::Local;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -98,37 +100,29 @@ fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn overview_title(app: &App) -> Line<'static> {
-    let source = match app.io.latency_source() {
-        LatencySource::AggregateAwait => "AGGREGATE AWAIT",
-        LatencySource::EbpfPerRequest => "PER-REQUEST eBPF",
+fn device_range_title(start: usize, count: usize, device_count: usize) -> Line<'static> {
+    let first = start.max(1).min(device_count);
+    let last = start
+        .saturating_add(count)
+        .saturating_sub(1)
+        .min(device_count);
+    let range = if count == 0 || last == 0 || first > last {
+        "0".to_string()
+    } else if first == last {
+        first.to_string()
+    } else {
+        format!("{first}–{last}")
     };
-    let mut spans = vec![
+    Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            source,
+            format!("DEVICES {range} of {device_count}"),
             Style::default()
                 .fg(p::BR_WHITE)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
-    if app.io.latest.len() > 1 {
-        spans.extend([
-            Span::styled(" | ", Style::default().fg(p::FAINT)),
-            Span::styled(
-                if app.io_show_unmounted {
-                    "all"
-                } else {
-                    "mounted"
-                },
-                Style::default()
-                    .fg(p::BR_WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    }
-    spans.push(Span::raw(" "));
-    Line::from(spans)
+        Span::raw(" "),
+    ])
 }
 
 fn center_status_title(app: &App) -> Line<'static> {
@@ -203,10 +197,16 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_io.min(row_count - 1);
     let (throughput_scale, iops_scale) =
         overview_workload_scales(&visible, Some(&aggregate.history), app);
-    let overview_block = pane_block(overview_title(app))
+    let overview_inner = pane_block("").inner(sections[0]);
+    let device_area = Rect {
+        y: overview_inner.y.saturating_add(1),
+        height: overview_inner.height.saturating_sub(1),
+        ..overview_inner
+    };
+    let (start, count, _) = visible_band_window(device_area.height, row_count, selected);
+    let overview_block = pane_block(device_range_title(start, count, visible.len()))
         .title(center_status_title(app))
         .title(cpu_title(app));
-    let overview_inner = overview_block.inner(sections[0]);
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
         draw_scale_legend(
@@ -217,12 +217,6 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             },
         );
     }
-    let device_area = Rect {
-        y: overview_inner.y.saturating_add(1),
-        height: overview_inner.height.saturating_sub(1),
-        ..overview_inner
-    };
-    let (start, count, _) = visible_band_window(device_area.height, row_count, selected);
     for (slot, index) in (start..start + count).enumerate() {
         let row = Rect {
             x: device_area.x,
@@ -251,6 +245,21 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
                 iops_scale,
             );
         }
+    }
+    if count < row_count {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+        let scrollbar_area = Rect {
+            x: sections[0].x,
+            y: device_area.y,
+            width: sections[0].width,
+            height: device_area.height,
+        };
+        let mut scrollbar_state = ScrollbarState::new(row_count)
+            .position(start)
+            .viewport_content_length(count);
+        f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
     if selected == 0 {
         draw_aggregate_detail(f, sections[1], &aggregate, app);

@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "iodyne"
-version = "0.1.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "aya",

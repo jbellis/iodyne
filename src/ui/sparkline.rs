@@ -99,12 +99,10 @@ impl<'a> Widget for BaselineSparkline<'a> {
             let x = leading + visible_x;
             let normalized = (value / max).clamp(0.0, 1.0);
             let filled = (normalized * dot_h as f64).round() as usize;
-            // Keep the one-dot baseline exclusive to sampled zeroes. With a
-            // shared scale, a genuinely active device can be far below the
-            // busiest device; giving positive values at least two dots keeps
-            // that activity visible without abandoning cross-device scaling.
-            let minimum = if value > 0.0 { 2 } else { 1 };
-            let filled = filled.max(minimum).min(dot_h);
+            // Every sampled value gets at least the bottom dot. Zeroes are
+            // dim while small positive values use the metric color, preserving
+            // activity without overstating its height on a shared scale.
+            let filled = filled.max(1).min(dot_h);
 
             for y_from_bottom in 0..filled {
                 let dot_y = dot_h - 1 - y_from_bottom;
@@ -190,16 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn positive_samples_below_shared_scale_are_visibly_above_zero() {
+    fn positive_samples_below_shared_scale_use_the_colored_baseline() {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
         BaselineSparkline::new(&[0.0, 1.0])
             .max(100.0)
+            .style(Style::default().fg(Color::Cyan))
             .render(area, &mut buffer);
 
-        // The left braille column is zero (dot 7); the right is positive and
-        // must also include dot 6, making the cell taller than a flat baseline.
-        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "\u{28e0}");
+        let cell = buffer.cell((0, 0)).unwrap();
+        assert_eq!(cell.symbol(), "\u{28c0}");
+        assert_eq!(cell.fg, Color::Cyan);
     }
 
     #[test]
@@ -216,5 +215,10 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(symbols, rendered);
+    }
+
+    #[test]
+    fn title_symbols_render_low_positive_percentages_as_one_dot() {
+        assert_eq!(sparkline_symbols(&[3.0], 1, 100.0), "⢀");
     }
 }

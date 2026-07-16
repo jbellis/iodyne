@@ -343,7 +343,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     if app.show_settings {
         draw_settings_overlay(f, full, app);
     }
-    chrome::draw_footer(f, layout[1]);
+    let collection_source = match app.io.latency_source() {
+        collect::ebpf::LatencySource::AggregateAwait => "AGGREGATE AWAIT",
+        collect::ebpf::LatencySource::EbpfPerRequest => "PER-REQUEST eBPF",
+    };
+    chrome::draw_footer(f, layout[1], app.io_show_unmounted, collection_source);
 }
 
 fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -620,6 +624,35 @@ mod tests {
         assert_populated_screen(110, 30);
         let _ = render_screen(&fixture_app(true), 60, 20);
         let _ = render_screen(&fixture_app(true), 24, 10);
+    }
+
+    #[test]
+    fn clipped_device_overview_and_global_footer_show_navigation_context() {
+        let mut app = fixture_app(true);
+        let template = app.io.latest[0].clone();
+        for suffix in ['b', 'c', 'd', 'e', 'f', 'g', 'h'] {
+            let mut tick = template.clone();
+            tick.device = format!("sd{suffix}");
+            app.io.latest.push(tick);
+        }
+        app.io_show_unmounted = true;
+        app.selected_io = 8;
+
+        let screen = render_screen(&app, 130, 40);
+        assert!(screen.contains("DEVICES 2–8 of 8"));
+        assert!(screen.contains('↑'));
+        assert!(screen.contains('↓'));
+        let source_line = screen
+            .lines()
+            .find(|line| line.contains("AGGREGATE AWAIT") || line.contains("PER-REQUEST eBPF"))
+            .expect("collection source title");
+        assert!(
+            source_line
+                .find("AGGREGATE AWAIT")
+                .or_else(|| source_line.find("PER-REQUEST eBPF"))
+                .is_some_and(|x| x > 100),
+            "source was not lower-right aligned: {source_line:?}"
+        );
     }
 
     #[test]
