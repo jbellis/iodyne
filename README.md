@@ -60,8 +60,8 @@ Privileged Linux additionally attempts two independent eBPF collectors:
   including time queued and in service. Bounded in-kernel histograms are read
   once per display interval; individual events are not streamed to userspace.
 - **VFS activity** attributes completed bytes and operations to filesystem
-  device, inode, and process. Compact operation records flow through a bounded
-  kernel ring buffer and are aggregated into display intervals in userspace.
+  device, inode, and process. Counts are aggregated in a bounded kernel table
+  and drained into display intervals by userspace.
   For classic FUSE daemons, backing-file operations are attributed to the
   requester PID carried by the FUSE protocol instead of the daemon process.
   Kernel OverlayFS operations are mapped to their real upper/lower backing
@@ -104,7 +104,7 @@ latency histograms and two views of file activity: the raw per-process
 observations, and the same merged, container-aware 10-second hot-file view
 shown in the TUI. Raw entries retain the actual executor as well as the
 requester inferred through FUSE or OverlayFS, so parent-process rollups remain
-auditable. Collector status and ring-buffer drops make gaps explicit. A
+auditable. Collector status and aggregation-table drops make gaps explicit. A
 revised inventory row appears when the storage topology changes.
 
 CPU, memory, network, complete process tables, filesystem capacity, SMART,

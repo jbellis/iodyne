@@ -5,13 +5,12 @@
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) val *name
 #define BPF_MAP_TYPE_LRU_HASH 9
-#define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_NOEXIST 1
 #define BPF_EXIST 2
 #define MAX_VFS_FILES 8192
-#define VFS_RING_BYTES (1024 * 1024)
+#define MAX_VFS_AGG_ENTRIES 8192
 #define TASK_COMM_LEN 16
 #define FILE_NAME_LEN 64
 #define FILE_PATH_LEN 256
@@ -84,26 +83,31 @@ struct vfs_file_key {
     __u32 tgid;
     __u32 _padding;
 };
-struct vfs_event {
-    struct vfs_file_key key;
-    __u64 bytes;
-    __u32 pid;
-    __u32 direction;
-    // Original caller from a delegated userspace-filesystem request. Zero
-    // means the current task performed the operation directly.
+struct vfs_agg_key {
+    __u32 major;
+    __u32 minor;
+    __u64 inode;
+    __u32 tgid;
     __u32 origin_pid;
+    __u32 origin_kind;
+    __u32 _padding;
+};
+struct vfs_agg_value {
+    __u64 read_bytes;
+    __u64 write_bytes;
+    __u64 read_ops;
+    __u64 write_ops;
+    __u32 pid;
     __u32 origin_tgid;
-    char comm[TASK_COMM_LEN];
-    char origin_comm[TASK_COMM_LEN];
-    char basename[FILE_NAME_LEN];
     __u64 cgroup_id;
+    __u64 origin_cgroup_id;
     __u32 parent_tgid;
     __u32 origin_parent_tgid;
+    char comm[TASK_COMM_LEN];
+    char origin_comm[TASK_COMM_LEN];
     char parent_comm[TASK_COMM_LEN];
     char origin_parent_comm[TASK_COMM_LEN];
-    __u32 origin_kind;
-    __u32 _origin_padding;
-    __u64 origin_cgroup_id;
+    char basename[FILE_NAME_LEN];
 };
 struct fuse_in_header {
     __u32 len;
@@ -164,12 +168,15 @@ struct fuse_writer {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, VFS_RING_BYTES);
-} VFS_EVENTS SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_VFS_AGG_ENTRIES);
+    __type(key, struct vfs_agg_key);
+    __type(value, struct vfs_agg_value);
+} VFS_AGG SEC(".maps");
 
-// Ring-buffer pressure must be observable: losing attribution is acceptable,
-// silently presenting an incomplete sample as complete is not.
+// Aggregation-table pressure must be observable: losing attribution is
+// acceptable, silently presenting an incomplete sample as complete is not.
+// Counts operations that could not be recorded because the table was full.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -270,8 +277,6 @@ static long (*bpf_probe_read_user)(void *dst, __u32 size,
                                    const void *unsafe_ptr) = (void *)112;
 static long (*bpf_d_path)(struct path *path, char *buf, __u32 size) =
     (void *)147;
-static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size,
-                                  __u64 flags) = (void *)130;
 
 static __inline __attribute__((always_inline)) void current_parent_identity(
     __u32 *tgid, char comm[TASK_COMM_LEN]) {
@@ -330,11 +335,11 @@ static __inline __attribute__((always_inline)) int vfs_key_for_file(
     return 0;
 }
 
-static __inline __attribute__((always_inline)) void vfs_event_metadata(
-    struct file *file, __u64 pid_tgid, struct vfs_event *event) {
-    event->pid = (__u32)pid_tgid;
-    bpf_get_current_comm(event->comm, sizeof(event->comm));
-    current_parent_identity(&event->parent_tgid, event->parent_comm);
+static __inline __attribute__((always_inline)) void vfs_agg_metadata(
+    struct file *file, __u64 pid_tgid, struct vfs_agg_value *value) {
+    value->pid = (__u32)pid_tgid;
+    bpf_get_current_comm(value->comm, sizeof(value->comm));
+    current_parent_identity(&value->parent_tgid, value->parent_comm);
     struct dentry *dentry;
     if (!bpf_probe_read_kernel(
             &dentry, sizeof(dentry),
@@ -345,8 +350,19 @@ static __inline __attribute__((always_inline)) void vfs_event_metadata(
                 &name, sizeof(name),
                 __builtin_preserve_access_index(&dentry->d_name.name)) &&
             name)
-            bpf_probe_read_kernel_str(event->basename,
-                                      sizeof(event->basename), name);
+            bpf_probe_read_kernel_str(value->basename,
+                                      sizeof(value->basename), name);
+    }
+}
+
+static __inline __attribute__((always_inline)) void vfs_agg_add(
+    struct vfs_agg_value *value, __u64 count, __u32 direction) {
+    if (direction == 0) {
+        __sync_fetch_and_add(&value->read_bytes, count);
+        __sync_fetch_and_add(&value->read_ops, 1);
+    } else if (direction == 1) {
+        __sync_fetch_and_add(&value->write_bytes, count);
+        __sync_fetch_and_add(&value->write_ops, 1);
     }
 }
 
@@ -557,36 +573,65 @@ static __inline __attribute__((always_inline)) int record_vfs_file(
     struct vfs_file_key key = {};
     if (vfs_key_for_file(file, pid_tgid, &key))
         return 0;
-    struct vfs_event event = {};
-    event.key = key;
-    event.bytes = count;
-    event.direction = direction;
-    event.cgroup_id = bpf_get_current_cgroup_id();
+
+    __u32 origin_pid = 0;
+    __u32 origin_kind = 0;
+    struct requester_identity *identity = 0;
     struct active_fuse_request *active =
         bpf_map_lookup_elem(&ACTIVE_FUSE_REQUESTS, &pid_tgid);
     if (active) {
-        event.origin_pid = active->origin_pid;
-        event.origin_kind = active->kind;
-        struct requester_identity *identity = 0;
+        origin_pid = active->origin_pid;
+        origin_kind = active->kind;
         if (active->identity.tgid)
             identity = &active->identity;
-        else
+        else if (active->origin_pid != FUSE_ORIGIN_UNKNOWN)
             identity = bpf_map_lookup_elem(&FUSE_REQUESTER_IDENTITIES,
                                            &active->origin_pid);
-        if (identity) {
-            event.origin_pid = identity->pid;
-            event.origin_tgid = identity->tgid;
-            event.origin_parent_tgid = identity->parent_tgid;
-            event.origin_cgroup_id = identity->cgroup_id;
-            __builtin_memcpy(event.origin_comm, identity->comm,
-                             sizeof(event.origin_comm));
-            __builtin_memcpy(event.origin_parent_comm, identity->parent_comm,
-                             sizeof(event.origin_parent_comm));
-        }
+        if (identity)
+            origin_pid = identity->pid;
     }
-    vfs_event_metadata(file, pid_tgid, &event);
-    // A full ring drops attribution rather than delaying the filesystem call.
-    if (bpf_ringbuf_output(&VFS_EVENTS, &event, sizeof(event), 0) < 0) {
+
+    struct vfs_agg_key agg_key = {
+        .major = key.major,
+        .minor = key.minor,
+        .inode = key.inode,
+        .tgid = key.tgid,
+        .origin_pid = origin_pid,
+        .origin_kind = origin_kind,
+        ._padding = 0,
+    };
+    struct vfs_agg_value *value = bpf_map_lookup_elem(&VFS_AGG, &agg_key);
+    if (value) {
+        vfs_agg_add(value, count, direction);
+        return 0;
+    }
+
+    struct vfs_agg_value next = {};
+    if (direction == 0) {
+        next.read_bytes = count;
+        next.read_ops = 1;
+    } else if (direction == 1) {
+        next.write_bytes = count;
+        next.write_ops = 1;
+    }
+    next.cgroup_id = bpf_get_current_cgroup_id();
+    if (identity) {
+        next.origin_tgid = identity->tgid;
+        next.origin_parent_tgid = identity->parent_tgid;
+        next.origin_cgroup_id = identity->cgroup_id;
+        __builtin_memcpy(next.origin_comm, identity->comm,
+                         sizeof(next.origin_comm));
+        __builtin_memcpy(next.origin_parent_comm, identity->parent_comm,
+                         sizeof(next.origin_parent_comm));
+    }
+    vfs_agg_metadata(file, pid_tgid, &next);
+
+    if (bpf_map_update_elem(&VFS_AGG, &agg_key, &next, BPF_NOEXIST)) {
+        value = bpf_map_lookup_elem(&VFS_AGG, &agg_key);
+        if (value) {
+            vfs_agg_add(value, count, direction);
+            return 0;
+        }
         __u64 *drops = bpf_map_lookup_elem(&VFS_DROPS, &zero);
         if (drops)
             __sync_fetch_and_add(drops, 1);

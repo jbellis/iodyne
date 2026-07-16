@@ -11,9 +11,6 @@ const FUSE_ORIGIN_UNKNOWN: u32 = u32::MAX;
 const FUSE_ORIGIN_PROTOCOL: u32 = 1;
 const FUSE_ORIGIN_WRITEBACK: u32 = 2;
 const FUSE_ORIGIN_PID_ZERO: u32 = 3;
-/// One ringful at the current event size. Bounding each synchronous drain
-/// guarantees that sustained producers cannot monopolize the UI thread.
-const MAX_VFS_EVENTS_PER_DRAIN: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlockDeviceId {
@@ -127,26 +124,36 @@ struct VfsFileKey {
     _padding: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(C)]
+struct VfsAggKey {
+    major: u32,
+    minor: u32,
+    inode: u64,
+    tgid: u32,
+    origin_pid: u32,
+    origin_kind: u32,
+    _padding: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-struct VfsEvent {
-    key: VfsFileKey,
-    bytes: u64,
+struct VfsAggValue {
+    read_bytes: u64,
+    write_bytes: u64,
+    read_ops: u64,
+    write_ops: u64,
     pid: u32,
-    direction: u32,
-    origin_pid: u32,
     origin_tgid: u32,
-    comm: [u8; 16],
-    origin_comm: [u8; 16],
-    basename: [u8; 64],
     cgroup_id: u64,
+    origin_cgroup_id: u64,
     parent_tgid: u32,
     origin_parent_tgid: u32,
+    comm: [u8; 16],
+    origin_comm: [u8; 16],
     parent_comm: [u8; 16],
     origin_parent_comm: [u8; 16],
-    origin_kind: u32,
-    _origin_padding: u32,
-    origin_cgroup_id: u64,
+    basename: [u8; 64],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -197,7 +204,10 @@ unsafe impl aya::Pod for HistogramKey {}
 unsafe impl aya::Pod for VfsFileKey {}
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-unsafe impl aya::Pod for VfsEvent {}
+unsafe impl aya::Pod for VfsAggKey {}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+unsafe impl aya::Pod for VfsAggValue {}
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 unsafe impl aya::Pod for VfsFilePath {}
@@ -485,7 +495,7 @@ impl EbpfLatencyCollector {
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     fn read_vfs_counts(&mut self) -> Result<Vec<VfsActivityDelta>, String> {
-        use aya::maps::{HashMap as AyaHashMap, MapError, RingBuf};
+        use aya::maps::{HashMap as AyaHashMap, MapError};
 
         let cgroup_container_cache = &mut self.cgroup_container_cache;
         let bpf = self
@@ -497,140 +507,151 @@ impl EbpfLatencyCollector {
         let mut path_keys = HashMap::<ObservationKey, VfsFileKey>::new();
         let mut delegated_processes = HashMap::<u32, Option<(u32, String)>>::new();
         let mut admitted = 0_u64;
-        {
-            let events = bpf
-                .map_mut("VFS_EVENTS")
-                .ok_or_else(|| "eBPF VFS event ring is missing".to_string())?;
-            let mut events = RingBuf::try_from(events)
-                .map_err(|error| format!("cannot access eBPF VFS event ring: {error}"))?;
-            for _ in 0..MAX_VFS_EVENTS_PER_DRAIN {
-                let Some(item) = events.next() else {
-                    break;
-                };
-                let Some(event) = decode_vfs_event(&item) else {
-                    continue;
-                };
-                let mut effective_key = event.key;
-                let effective_cgroup_id = if event.origin_cgroup_id != 0 {
-                    event.origin_cgroup_id
-                } else {
-                    event.cgroup_id
-                };
-                let cgroup_is_container = effective_cgroup_id != 0
-                    && *cgroup_container_cache
-                        .entry(effective_cgroup_id)
-                        .or_insert_with(|| cgroup_id_is_container(effective_cgroup_id));
-                let delegated_by_fuse_overlay = matches!(
-                    event.origin_kind,
-                    FUSE_ORIGIN_PROTOCOL | FUSE_ORIGIN_WRITEBACK | FUSE_ORIGIN_PID_ZERO
-                ) && bpf_string(&event.comm) == "fuse-overlayfs";
-                let (pid, comm, parent_tgid, parent_comm) =
-                    if event.origin_pid == FUSE_ORIGIN_UNKNOWN {
-                        (event.pid, "fuse-overlayfs".to_string(), 0, String::new())
-                    } else if event.origin_pid != 0 {
-                        // A protocol header PID is relative to the requester's
-                        // PID namespace. Only consult host /proc after a BPF
-                        // hook has supplied the corresponding host identity.
-                        if event.origin_tgid != 0 {
-                            let identity = delegated_processes
-                                .entry(event.origin_pid)
-                                .or_insert_with(|| delegated_process_identity(event.origin_pid));
-                            if let Some((tgid, comm)) = identity {
-                                effective_key.tgid = *tgid;
-                                (
-                                    event.origin_pid,
-                                    comm.clone(),
-                                    event.origin_parent_tgid,
-                                    bpf_string(&event.origin_parent_comm),
-                                )
-                            } else {
-                                effective_key.tgid = event.origin_tgid;
-                                let cached_comm = bpf_string(&event.origin_comm);
-                                let comm = if cached_comm.is_empty() {
-                                    "process (exited)".to_string()
-                                } else {
-                                    cached_comm
-                                };
-                                (
-                                    event.origin_pid,
-                                    comm,
-                                    event.origin_parent_tgid,
-                                    bpf_string(&event.origin_parent_comm),
-                                )
-                            }
-                        } else {
-                            effective_key.tgid = event.origin_pid;
-                            (
-                                event.origin_pid,
-                                format!("pid {} (unresolved)", event.origin_pid),
-                                0,
-                                String::new(),
-                            )
-                        }
-                    } else {
-                        (
-                            event.pid,
-                            bpf_string(&event.comm),
-                            event.parent_tgid,
-                            bpf_string(&event.parent_comm),
-                        )
-                    };
-                if effective_key.tgid == std::process::id() {
-                    continue;
-                }
-                admitted = admitted.saturating_add(1);
-                let observation_key = (
-                    effective_key,
-                    event.key.tgid,
-                    event.origin_tgid,
-                    event.origin_kind,
-                );
-                path_keys.entry(observation_key).or_insert(event.key);
-                let delta = deltas
-                    .entry(observation_key)
-                    .or_insert_with(|| VfsActivityDelta {
-                        device: BlockDeviceId {
-                            major: effective_key.major,
-                            minor: effective_key.minor,
-                        },
-                        inode: effective_key.inode,
-                        pid,
-                        tgid: effective_key.tgid,
-                        comm,
-                        executor_pid: event.pid,
-                        executor_tgid: event.key.tgid,
-                        executor_comm: bpf_string(&event.comm),
-                        executor_cgroup_id: event.cgroup_id,
-                        origin_pid: event.origin_pid,
-                        origin_tgid: event.origin_tgid,
-                        origin_comm: bpf_string(&event.origin_comm),
-                        origin_cgroup_id: event.origin_cgroup_id,
-                        attribution_kind: attribution_kind(event.origin_kind),
-                        parent_tgid,
-                        parent_comm: parent_comm.clone(),
-                        container_owned: delegated_by_fuse_overlay || cgroup_is_container,
-                        basename: bpf_string(&event.basename),
-                        path: String::new(),
-                        path_source: VfsPathSource::Unresolved,
-                        read_bytes: 0,
-                        write_bytes: 0,
-                        read_ops: 0,
-                        write_ops: 0,
-                    });
-                delta.pid = pid;
-                if parent_tgid != 0 {
-                    delta.parent_tgid = parent_tgid;
-                    delta.parent_comm = parent_comm;
-                }
-                delta.container_owned |= delegated_by_fuse_overlay || cgroup_is_container;
-                if event.direction == 0 {
-                    delta.read_bytes = delta.read_bytes.saturating_add(event.bytes);
-                    delta.read_ops = delta.read_ops.saturating_add(1);
-                } else if event.direction == 1 {
-                    delta.write_bytes = delta.write_bytes.saturating_add(event.bytes);
-                    delta.write_ops = delta.write_ops.saturating_add(1);
+        let entries = {
+            let agg = bpf
+                .map_mut("VFS_AGG")
+                .ok_or_else(|| "eBPF VFS aggregation map is missing".to_string())?;
+            let mut agg = AyaHashMap::<_, VfsAggKey, VfsAggValue>::try_from(agg)
+                .map_err(|error| format!("cannot access eBPF VFS aggregation map: {error}"))?;
+            let entries = agg
+                .iter()
+                .map(|entry| {
+                    entry
+                        .map_err(|error| format!("cannot read eBPF VFS aggregation entry: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Counts added after the read and before this removal are lost.
+            // This microsecond-scale unbiased loss replaces ring-full drops.
+            for (key, _) in &entries {
+                match agg.remove(key) {
+                    Ok(()) | Err(MapError::KeyNotFound) => {}
+                    Err(error) => {
+                        return Err(format!("cannot remove eBPF VFS aggregation entry: {error}"));
+                    }
                 }
             }
+            entries
+        };
+        for (key, value) in entries {
+            admitted = admitted
+                .saturating_add(value.read_ops)
+                .saturating_add(value.write_ops);
+            let file_key = VfsFileKey {
+                major: key.major,
+                minor: key.minor,
+                inode: key.inode,
+                tgid: key.tgid,
+                _padding: 0,
+            };
+            let mut effective_key = file_key;
+            let effective_cgroup_id = if value.origin_cgroup_id != 0 {
+                value.origin_cgroup_id
+            } else {
+                value.cgroup_id
+            };
+            let cgroup_is_container = effective_cgroup_id != 0
+                && *cgroup_container_cache
+                    .entry(effective_cgroup_id)
+                    .or_insert_with(|| cgroup_id_is_container(effective_cgroup_id));
+            let delegated_by_fuse_overlay = matches!(
+                key.origin_kind,
+                FUSE_ORIGIN_PROTOCOL | FUSE_ORIGIN_WRITEBACK | FUSE_ORIGIN_PID_ZERO
+            ) && bpf_string(&value.comm) == "fuse-overlayfs";
+            let (pid, comm, parent_tgid, parent_comm) = if key.origin_pid == FUSE_ORIGIN_UNKNOWN {
+                (value.pid, "fuse-overlayfs".to_string(), 0, String::new())
+            } else if key.origin_pid != 0 {
+                // A protocol header PID is relative to the requester's PID
+                // namespace. Only consult host /proc after a BPF hook has
+                // supplied the corresponding host identity.
+                if value.origin_tgid != 0 {
+                    let identity = delegated_processes
+                        .entry(key.origin_pid)
+                        .or_insert_with(|| delegated_process_identity(key.origin_pid));
+                    if let Some((tgid, comm)) = identity {
+                        effective_key.tgid = *tgid;
+                        (
+                            key.origin_pid,
+                            comm.clone(),
+                            value.origin_parent_tgid,
+                            bpf_string(&value.origin_parent_comm),
+                        )
+                    } else {
+                        effective_key.tgid = value.origin_tgid;
+                        let cached_comm = bpf_string(&value.origin_comm);
+                        let comm = if cached_comm.is_empty() {
+                            "process (exited)".to_string()
+                        } else {
+                            cached_comm
+                        };
+                        (
+                            key.origin_pid,
+                            comm,
+                            value.origin_parent_tgid,
+                            bpf_string(&value.origin_parent_comm),
+                        )
+                    }
+                } else {
+                    effective_key.tgid = key.origin_pid;
+                    (
+                        key.origin_pid,
+                        format!("pid {} (unresolved)", key.origin_pid),
+                        0,
+                        String::new(),
+                    )
+                }
+            } else {
+                (
+                    value.pid,
+                    bpf_string(&value.comm),
+                    value.parent_tgid,
+                    bpf_string(&value.parent_comm),
+                )
+            };
+            if effective_key.tgid == std::process::id() {
+                continue;
+            }
+            let observation_key = (effective_key, key.tgid, value.origin_tgid, key.origin_kind);
+            path_keys.entry(observation_key).or_insert(file_key);
+            let delta = deltas
+                .entry(observation_key)
+                .or_insert_with(|| VfsActivityDelta {
+                    device: BlockDeviceId {
+                        major: effective_key.major,
+                        minor: effective_key.minor,
+                    },
+                    inode: effective_key.inode,
+                    pid,
+                    tgid: effective_key.tgid,
+                    comm,
+                    executor_pid: value.pid,
+                    executor_tgid: key.tgid,
+                    executor_comm: bpf_string(&value.comm),
+                    executor_cgroup_id: value.cgroup_id,
+                    origin_pid: key.origin_pid,
+                    origin_tgid: value.origin_tgid,
+                    origin_comm: bpf_string(&value.origin_comm),
+                    origin_cgroup_id: value.origin_cgroup_id,
+                    attribution_kind: attribution_kind(key.origin_kind),
+                    parent_tgid,
+                    parent_comm: parent_comm.clone(),
+                    container_owned: delegated_by_fuse_overlay || cgroup_is_container,
+                    basename: bpf_string(&value.basename),
+                    path: String::new(),
+                    path_source: VfsPathSource::Unresolved,
+                    read_bytes: 0,
+                    write_bytes: 0,
+                    read_ops: 0,
+                    write_ops: 0,
+                });
+            if parent_tgid != 0 {
+                delta.parent_tgid = parent_tgid;
+                delta.parent_comm = parent_comm;
+            }
+            delta.container_owned |= delegated_by_fuse_overlay || cgroup_is_container;
+            delta.read_bytes = delta.read_bytes.saturating_add(value.read_bytes);
+            delta.read_ops = delta.read_ops.saturating_add(value.read_ops);
+            delta.write_bytes = delta.write_bytes.saturating_add(value.write_bytes);
+            delta.write_ops = delta.write_ops.saturating_add(value.write_ops);
         }
         self.pending_vfs_admitted = self.pending_vfs_admitted.saturating_add(admitted);
 
@@ -988,14 +1009,6 @@ fn cgroup_id_is_container_at(cgroup_id: u64, root: &std::path::Path) -> bool {
     false
 }
 
-fn decode_vfs_event(bytes: &[u8]) -> Option<VfsEvent> {
-    if bytes.len() != std::mem::size_of::<VfsEvent>() {
-        return None;
-    }
-    // Ring-buffer records are byte slices and do not promise Rust alignment.
-    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<VfsEvent>()) })
-}
-
 fn attribution_kind(origin_kind: u32) -> VfsAttributionKind {
     match origin_kind {
         0 => VfsAttributionKind::Direct,
@@ -1095,29 +1108,27 @@ mod tests {
         }
     }
 
-    fn vfs_event(bytes: u64, direction: u32) -> VfsEvent {
+    fn vfs_agg_value(read_bytes: u64, write_bytes: u64) -> VfsAggValue {
         let mut comm = [0; 16];
         comm[..4].copy_from_slice(b"test");
         let mut basename = [0; 64];
         basename[..8].copy_from_slice(b"data.log");
-        VfsEvent {
-            key: vfs_key(),
-            bytes,
+        VfsAggValue {
+            read_bytes,
+            write_bytes,
+            read_ops: u64::from(read_bytes != 0),
+            write_ops: u64::from(write_bytes != 0),
             pid: 1001,
-            direction,
-            origin_pid: 0,
             origin_tgid: 0,
-            comm,
-            origin_comm: [0; 16],
-            basename,
             cgroup_id: 0,
+            origin_cgroup_id: 0,
             parent_tgid: 0,
             origin_parent_tgid: 0,
+            comm,
+            origin_comm: [0; 16],
             parent_comm: [0; 16],
             origin_parent_comm: [0; 16],
-            origin_kind: 0,
-            _origin_padding: 0,
-            origin_cgroup_id: 0,
+            basename,
         }
     }
 
@@ -1140,22 +1151,57 @@ mod tests {
     }
 
     #[test]
-    fn vfs_ring_record_decodes_without_alignment_assumptions() {
-        let event = vfs_event(120, 0);
-        assert_eq!(std::mem::size_of::<VfsEvent>(), 208);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&event as *const VfsEvent).cast::<u8>(),
-                std::mem::size_of::<VfsEvent>(),
-            )
+    fn vfs_aggregation_layout_matches_bpf_c() {
+        macro_rules! offset_of {
+            ($ty:ty, $field:tt) => {{
+                let value = std::mem::MaybeUninit::<$ty>::uninit();
+                let base = value.as_ptr();
+                unsafe { std::ptr::addr_of!((*base).$field) as usize - base as usize }
+            }};
+        }
+
+        assert_eq!(std::mem::size_of::<VfsFileKey>(), 24);
+        assert_eq!(std::mem::size_of::<VfsAggKey>(), 32);
+        assert_eq!(std::mem::size_of::<VfsAggValue>(), 192);
+        assert_eq!(offset_of!(VfsAggKey, major), 0);
+        assert_eq!(offset_of!(VfsAggKey, minor), 4);
+        assert_eq!(offset_of!(VfsAggKey, inode), 8);
+        assert_eq!(offset_of!(VfsAggKey, tgid), 16);
+        assert_eq!(offset_of!(VfsAggKey, origin_pid), 20);
+        assert_eq!(offset_of!(VfsAggKey, origin_kind), 24);
+        assert_eq!(offset_of!(VfsAggKey, _padding), 28);
+        assert_eq!(offset_of!(VfsAggValue, read_bytes), 0);
+        assert_eq!(offset_of!(VfsAggValue, write_bytes), 8);
+        assert_eq!(offset_of!(VfsAggValue, read_ops), 16);
+        assert_eq!(offset_of!(VfsAggValue, write_ops), 24);
+        assert_eq!(offset_of!(VfsAggValue, pid), 32);
+        assert_eq!(offset_of!(VfsAggValue, origin_tgid), 36);
+        assert_eq!(offset_of!(VfsAggValue, cgroup_id), 40);
+        assert_eq!(offset_of!(VfsAggValue, origin_cgroup_id), 48);
+        assert_eq!(offset_of!(VfsAggValue, parent_tgid), 56);
+        assert_eq!(offset_of!(VfsAggValue, origin_parent_tgid), 60);
+        assert_eq!(offset_of!(VfsAggValue, comm), 64);
+        assert_eq!(offset_of!(VfsAggValue, origin_comm), 80);
+        assert_eq!(offset_of!(VfsAggValue, parent_comm), 96);
+        assert_eq!(offset_of!(VfsAggValue, origin_parent_comm), 112);
+        assert_eq!(offset_of!(VfsAggValue, basename), 128);
+
+        let key = VfsAggKey {
+            major: 8,
+            minor: 1,
+            inode: 42,
+            tgid: 1000,
+            origin_pid: 0,
+            origin_kind: 0,
+            _padding: 0,
         };
-        let decoded = decode_vfs_event(bytes).unwrap();
-        assert_eq!(decoded.key, vfs_key());
-        assert_eq!(decoded.bytes, 120);
-        assert_eq!(decoded.pid, 1001);
-        assert_eq!(bpf_string(&decoded.comm), "test");
-        assert_eq!(bpf_string(&decoded.basename), "data.log");
-        assert!(decode_vfs_event(&bytes[..bytes.len() - 1]).is_none());
+        let value = vfs_agg_value(120, 0);
+        assert_eq!(key.major, vfs_key().major);
+        assert_eq!(value.read_bytes, 120);
+        assert_eq!(value.read_ops, 1);
+        assert_eq!(value.pid, 1001);
+        assert_eq!(bpf_string(&value.comm), "test");
+        assert_eq!(bpf_string(&value.basename), "data.log");
     }
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
