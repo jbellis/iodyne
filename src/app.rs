@@ -38,6 +38,12 @@ pub enum LiveState {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailTab {
+    Disk,
+    Vfs,
+}
+
 pub struct App {
     pub live: LiveState,
     pub devices: Vec<collect::DeviceTick>,
@@ -49,6 +55,7 @@ pub struct App {
     pub show_settings: bool,
     pub smart: collect::SmartCollector,
     pub selected_io: usize,
+    pub detail_tab: DetailTab,
     pub sample_interval: Duration,
     pub cpu_usage: f64,
     pub cpu_history: VecDeque<f64>,
@@ -110,6 +117,7 @@ impl App {
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
             cpu_system,
             selected_io: 0,
+            detail_tab: DetailTab::Disk,
             devices,
             filesystems,
             volumes,
@@ -139,6 +147,13 @@ impl App {
         self.io_show_unmounted = !self.io_show_unmounted;
         self.selected_io = 0;
         self.persist_settings();
+    }
+
+    fn toggle_detail_tab(&mut self) {
+        self.detail_tab = match self.detail_tab {
+            DetailTab::Disk => DetailTab::Vfs,
+            DetailTab::Vfs => DetailTab::Disk,
+        };
     }
 
     fn decrease_sample_interval(&mut self) {
@@ -307,6 +322,7 @@ fn handle_key(app: &mut App, key: KeyCode) {
             };
         }
         KeyCode::Char('u') => app.toggle_io_unmounted(),
+        KeyCode::Tab => app.toggle_detail_tab(),
         KeyCode::Char('-') => app.decrease_sample_interval(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.increase_sample_interval(),
         KeyCode::Up | KeyCode::Char('k') if app.selected_io > 0 => app.selected_io -= 1,
@@ -329,7 +345,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),    // content
-            Constraint::Length(2), // footer (divider + text)
+            Constraint::Length(1), // footer
         ])
         .split(full);
 
@@ -561,6 +577,7 @@ mod tests {
             show_settings: false,
             smart,
             selected_io: 0,
+            detail_tab: DetailTab::Disk,
             background_snapshot: None,
             remaining_intervals: None,
             should_quit: false,
@@ -585,17 +602,8 @@ mod tests {
     fn assert_populated_screen(width: u16, height: u16) {
         let text = render_screen(&fixture_app(true), width, height);
         for expected in [
-            "Device",
-            "Free",
-            "B/s",
-            "IOPS",
-            "1 device",
-            "2000ms",
-            "CPU 37%",
-            "READ",
-            "WRITE",
-            "Await",
-            "VFS | 10s",
+            "Device", "Free", "B/s", "IOPS", "1 device", "2000ms", "CPU 37%", "READ", "WRITE",
+            "Await", "DISK",
         ] {
             assert!(
                 text.contains(expected),
@@ -638,8 +646,8 @@ mod tests {
         app.io_show_unmounted = true;
         app.selected_io = 8;
 
-        let screen = render_screen(&app, 130, 40);
-        assert!(screen.contains("DEVICES 2–8 of 8"));
+        let screen = render_screen(&app, 130, 28);
+        assert!(screen.contains("DEVICES 3–8 of 8"));
         assert!(screen.contains('↑'));
         assert!(screen.contains('↓'));
         let source_line = screen
@@ -653,6 +661,30 @@ mod tests {
                 .is_some_and(|x| x > 100),
             "source was not lower-right aligned: {source_line:?}"
         );
+    }
+
+    #[test]
+    fn detail_tabs_switch_and_remain_contiguous_with_footer() {
+        let mut app = fixture_app(true);
+        assert_eq!(app.detail_tab, DetailTab::Disk);
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.detail_tab, DetailTab::Vfs);
+
+        let screen = render_screen(&app, 130, 36);
+        let lines: Vec<_> = screen.lines().collect();
+        let vfs_y = lines
+            .iter()
+            .position(|line| line.contains(" VFS | 10s"))
+            .expect("VFS pane title");
+
+        assert!(lines[vfs_y].starts_with('┌'));
+        assert!(lines[vfs_y - 1].contains("DISK"));
+        assert!(lines[vfs_y - 1].contains("VFS"));
+        assert!(lines[lines.len() - 2].starts_with('└'));
+        assert!(lines.last().unwrap().contains("p:Pause"));
+
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.detail_tab, DetailTab::Disk);
     }
 
     #[test]

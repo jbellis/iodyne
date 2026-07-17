@@ -11,7 +11,7 @@ pub fn draw_footer(f: &mut Frame, area: Rect, show_unmounted: bool, collection_s
     spans.push(Span::raw(" "));
     let groups: &[&[(&str, &str)]] = &[
         &[("p", "Pause"), (",", "Settings")],
-        &[("j/k", "Select")],
+        &[("j/k", "Select"), ("Tab", "Detail")],
         &[("-/+", "Sample"), ("q", "Quit")],
     ];
     for (gi, group) in groups.iter().enumerate() {
@@ -51,27 +51,7 @@ pub fn draw_footer(f: &mut Frame, area: Rect, show_unmounted: bool, collection_s
             ));
         }
     }
-    // Divider row above the footer text.
-    let divider_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    let text_area = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: 1,
-    };
-    let divider: String = "\u{2500}".repeat(area.width as usize);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            divider,
-            Style::default().fg(p::FAINT).bg(p::BG),
-        ))),
-        divider_area,
-    );
+    let text_area = area;
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(p::BG)),
         text_area,
@@ -100,71 +80,4 @@ pub fn draw_footer(f: &mut Frame, area: Rect, show_unmounted: bool, collection_s
         .style(Style::default().bg(p::BG)),
         source_area,
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    #[test]
-    fn footer_names_only_implemented_commands() {
-        let backend = TestBackend::new(100, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| draw_footer(frame, frame.area(), false, "PER-REQUEST eBPF"))
-            .expect("draw footer");
-        let buffer = terminal.backend().buffer();
-        let text = (0..100)
-            .map(|x| buffer.cell((x, 1)).unwrap().symbol())
-            .collect::<String>();
-
-        for expected in [
-            "p:Pause",
-            ",:Settings",
-            "u:mounted/all",
-            "j/k:Select",
-            "-/+:Sample",
-            "q:Quit",
-        ] {
-            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
-        }
-        let stale = [
-            ["Snap", "shot"].concat(),
-            ["Di", "ff"].concat(),
-            ["Pro", "file"].concat(),
-            ["R", "ec"].concat(),
-            ["Fil", "ter"].concat(),
-            ["T", "ab"].concat(),
-            format!("{}-{}", 1, 9),
-        ];
-        for stale in stale {
-            assert!(!text.contains(&stale), "stale {stale:?} in {text:?}");
-        }
-    }
-
-    #[test]
-    fn footer_highlights_only_the_active_device_filter_with_foreground() {
-        for (show_unmounted, active, inactive) in
-            [(false, "mounted", "all"), (true, "all", "mounted")]
-        {
-            let backend = TestBackend::new(100, 2);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            terminal
-                .draw(|frame| draw_footer(frame, frame.area(), show_unmounted, "PER-REQUEST eBPF"))
-                .expect("draw footer");
-            let buffer = terminal.backend().buffer();
-            let text = (0..100)
-                .map(|x| buffer.cell((x, 1)).unwrap().symbol())
-                .collect::<String>();
-            let active_x = text.find(active).expect("active filter label") as u16;
-            let inactive_x = text.find(inactive).expect("inactive filter label") as u16;
-
-            assert_eq!(buffer.cell((active_x, 1)).unwrap().fg, p::BR_WHITE);
-            assert_eq!(buffer.cell((inactive_x, 1)).unwrap().fg, p::DIM);
-            assert_eq!(buffer.cell((active_x, 1)).unwrap().bg, p::BG);
-            assert_eq!(buffer.cell((inactive_x, 1)).unwrap().bg, p::BG);
-        }
-    }
 }

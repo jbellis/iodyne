@@ -16,12 +16,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
 };
 use ratatui::Frame;
 
-use crate::app::App;
-use crate::app::LiveState;
+use crate::app::{App, DetailTab, LiveState};
 use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
 use crate::collect::io::{DeviceHistory, VfsActivitySource, VfsFileActivity};
 use crate::collect::smart::{AtaAttr, SmartTick};
@@ -45,10 +44,10 @@ const HEAT_LABELS: [&str; 7] = [
     "64-256ms",
     ">=256ms",
 ];
-const WIDE_DETAIL_HEIGHT: u16 = 28;
-const COMPACT_DETAIL_HEIGHT: u16 = 23;
 const DIRECTION_DETAIL_HEIGHT: u16 = 13;
 const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
+// Tab row + pane borders + context rows + the full directional metric body.
+const TABBED_DETAIL_MIN_HEIGHT: u16 = 1 + 2 + MAX_DETAIL_CONTEXT_ROWS + DIRECTION_DETAIL_HEIGHT;
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if app.io.latest.is_empty() {
         draw_empty(f, area, app);
@@ -688,15 +687,8 @@ fn master_detail_heights(height: u16, device_count: usize) -> (u16, u16) {
     if height <= 3 {
         return (height, 0);
     }
-    let min_detail = if height >= 34 {
-        WIDE_DETAIL_HEIGHT
-    } else if height >= 26 {
-        COMPACT_DETAIL_HEIGHT
-    } else {
-        height.saturating_sub(4).min(WIDE_DETAIL_HEIGHT)
-    };
     let min_overview = height.min(4);
-    let min_detail = min_detail.min(height.saturating_sub(min_overview));
+    let min_detail = TABBED_DETAIL_MIN_HEIGHT.min(height.saturating_sub(min_overview));
     let max_overview = height.saturating_sub(min_detail).max(1);
     let devices = device_count.max(1).min(u16::MAX as usize) as u16;
     // Top and bottom borders plus the shared column/latency scale row.
@@ -1012,35 +1004,42 @@ fn draw_detail_data(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let available_inner = area.height.saturating_sub(2);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let selected_tab = match app.detail_tab {
+        DetailTab::Disk => 0,
+        DetailTab::Vfs => 1,
+    };
+    f.render_widget(
+        Tabs::new(["DISK", "VFS"])
+            .select(selected_tab)
+            .style(Style::default().fg(p::DIM).bg(p::BG))
+            .highlight_style(
+                Style::default()
+                    .fg(p::BR_WHITE)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(Span::styled(" │ ", Style::default().fg(p::FAINT))),
+        rows[0],
+    );
+    let panel_area = rows[1];
+    if app.detail_tab == DetailTab::Vfs {
+        draw_vfs_activity(f, panel_area, tick, app);
+        return;
+    }
+
+    let available_inner = panel_area.height.saturating_sub(2);
     let context_rows = detail_context_row_count(available_inner, context.len());
-    let device_content_height = context_rows
-        .saturating_add(DIRECTION_DETAIL_HEIGHT.min(available_inner.saturating_sub(context_rows)));
-    let minimum_device_height = device_content_height.saturating_add(2).min(area.height);
-    let has_vfs = area.height > minimum_device_height.saturating_add(2);
-    let device_area = Rect {
-        height: if has_vfs {
-            minimum_device_height
-        } else {
-            area.height
-        },
-        ..area
-    };
-    let vfs_area = Rect {
-        y: area.y + device_area.height + has_vfs as u16,
-        height: area
-            .height
-            .saturating_sub(device_area.height + has_vfs as u16),
-        ..area
-    };
     let block = pane_block(Span::styled(
         header,
         Style::default()
             .fg(p::BR_WHITE)
             .add_modifier(Modifier::BOLD),
     ));
-    let inner = block.inner(device_area);
-    f.render_widget(block, device_area);
+    let inner = block.inner(panel_area);
+    f.render_widget(block, panel_area);
     if inner.height == 0 {
         return;
     }
@@ -1063,17 +1062,7 @@ fn draw_detail_data(
         height: inner.height.saturating_sub(context_rows),
         ..inner
     };
-    let gutter = (body.width > 1) as u16;
-    let column_width = body.width.saturating_sub(gutter) / 2;
-    let read_area = Rect {
-        width: column_width,
-        ..body
-    };
-    let write_area = Rect {
-        x: body.x + column_width + gutter,
-        width: body.width.saturating_sub(column_width + gutter),
-        ..body
-    };
+    let (read_area, write_area) = directional_areas(body);
     let workload = history.map(|history| workload_view(&history.workload_samples));
     let await_view = history.map(|history| await_view(&history.await_samples));
     draw_direction_detail(
@@ -1092,7 +1081,6 @@ fn draw_detail_data(
         workload.as_ref(),
         await_view.as_ref(),
     );
-    draw_vfs_activity(f, vfs_area, tick, app);
 }
 
 fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
@@ -1101,30 +1089,19 @@ fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
         .min(detail_height.saturating_sub(DIRECTION_DETAIL_HEIGHT))
 }
 
-#[cfg(test)]
-fn detail_areas(body: Rect) -> (Rect, Rect, Rect) {
-    let directional_height = body.height.min(DIRECTION_DETAIL_HEIGHT);
-    let separator_height = (body.height > directional_height) as u16;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(directional_height),
-            Constraint::Length(separator_height),
-            Constraint::Min(0),
-        ])
-        .split(body);
-    let gutter = (rows[0].width > 1) as u16;
-    let column_width = rows[0].width.saturating_sub(gutter) / 2;
+fn directional_areas(body: Rect) -> (Rect, Rect) {
+    let gutter = (body.width > 1) as u16;
+    let column_width = body.width.saturating_sub(gutter) / 2;
     let read = Rect {
         width: column_width,
-        ..rows[0]
+        ..body
     };
     let write = Rect {
-        x: rows[0].x + column_width + gutter,
-        width: rows[0].width.saturating_sub(column_width + gutter),
-        ..rows[0]
+        x: body.x + column_width + gutter,
+        width: body.width.saturating_sub(column_width + gutter),
+        ..body
     };
-    (read, write, rows[2])
+    (read, write)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1603,12 +1580,7 @@ fn vfs_drop_percent(admitted: u64, dropped: u64) -> Option<u64> {
     (total > 0).then(|| (dropped.saturating_mul(100).saturating_add(total / 2)) / total)
 }
 
-fn vfs_activity_block<'a>(
-    visible: Option<usize>,
-    total: usize,
-    admitted: u64,
-    dropped: u64,
-) -> Block<'a> {
+fn vfs_activity_block<'a>(visible: Option<usize>, admitted: u64, dropped: u64) -> Block<'a> {
     let mut spans = vec![
         Span::styled(
             " VFS ",
@@ -1620,7 +1592,7 @@ fn vfs_activity_block<'a>(
     ];
     if let Some(visible) = visible {
         spans.push(Span::styled(
-            format!("| {visible} of {total} "),
+            format!("| top {visible} "),
             Style::default().fg(p::DIM),
         ));
     }
@@ -1639,7 +1611,6 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
     }
     let block = vfs_activity_block(
         None,
-        0,
         app.io.latest_vfs_admitted_events,
         app.io.latest_vfs_dropped_events,
     );
@@ -1693,7 +1664,6 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
     }
     let block = vfs_activity_block(
         Some(visible.len()),
-        entries.len(),
         app.io.latest_vfs_admitted_events,
         app.io.latest_vfs_dropped_events,
     );
@@ -3339,17 +3309,11 @@ mod tests {
     }
 
     #[test]
-    fn context_rows_preserve_directional_and_normal_vfs_bodies() {
+    fn context_rows_preserve_directional_body() {
         assert_eq!(detail_context_row_count(28, 2), 2);
-        let (_, _, tall_vfs) = detail_areas(Rect::new(0, 0, 130, 25));
-        assert_eq!(tall_vfs.height, 11);
-
         assert_eq!(detail_context_row_count(23, 2), 2);
-        let (_, _, compact_vfs) = detail_areas(Rect::new(0, 0, 110, 18));
-        assert_eq!(compact_vfs.height, 4);
-
         assert_eq!(detail_context_row_count(14, 2), 1);
-        let (read, write, _) = detail_areas(Rect::new(0, 0, 60, 13));
+        let (read, write) = directional_areas(Rect::new(0, 0, 60, 13));
         assert_eq!((read.height, write.height), (13, 13));
     }
 
@@ -3368,9 +3332,10 @@ mod tests {
     }
 
     #[test]
-    fn pane_layout_reserves_borders_and_one_separator_row() {
-        assert_eq!(master_detail_heights(28, 30), (5, 23));
-        assert_eq!(master_detail_heights(28, 8), (5, 23));
+    fn pane_layout_grows_devices_without_collapsing_disk_detail() {
+        assert_eq!(TABBED_DETAIL_MIN_HEIGHT, 18);
+        assert_eq!(master_detail_heights(28, 30), (10, 18));
+        assert_eq!(master_detail_heights(28, 8), (10, 18));
         assert_eq!(master_detail_heights(8, 8), (4, 4));
         assert_eq!(master_detail_heights(1, 8), (1, 0));
         let (overview, detail) = master_detail_heights(74, 8);
@@ -3627,41 +3592,33 @@ mod tests {
     #[test]
     fn detail_layout_is_responsive_and_bounded() {
         let wide = Rect::new(0, 0, 130, 18);
-        let (read, write, vfs) = detail_areas(wide);
-        assert_eq!((read.height, write.height), (13, 13));
+        let (read, write) = directional_areas(wide);
+        assert_eq!((read.height, write.height), (18, 18));
         assert_eq!((read.width, write.width), (64, 65));
         assert_eq!(write.x, read.x + read.width + 1);
-        assert_eq!(vfs.width, 130);
-        assert_eq!(vfs.height, 4);
-        assert_eq!(vfs.y, 14);
 
         let tall = Rect::new(0, 0, 130, 70);
-        let (read, write, vfs) = detail_areas(tall);
-        assert_eq!((read.height, write.height), (13, 13));
-        assert_eq!((vfs.y, vfs.height), (14, 56));
-        assert_eq!(vfs.height.saturating_sub(2), 54);
-        assert_eq!(vfs.y + vfs.height, tall.height);
+        let (read, write) = directional_areas(tall);
+        assert_eq!((read.height, write.height), (70, 70));
 
         let (overview, detail) = master_detail_heights(68, 5);
         assert_eq!((overview, detail), (8, 60));
         assert_eq!(overview + detail, 68);
 
         let narrow = Rect::new(0, 0, 72, 12);
-        let (read, write, vfs) = detail_areas(narrow);
+        let (read, write) = directional_areas(narrow);
         assert_eq!((read.width, write.width), (35, 36));
         assert_eq!((read.height, write.height), (12, 12));
-        assert_eq!(vfs.height, 0);
 
         let tiny = Rect::new(0, 0, 20, 3);
-        let (read, write, vfs) = detail_areas(tiny);
+        let (read, write) = directional_areas(tiny);
         assert_eq!((read.width, write.width), (9, 10));
         assert_eq!((read.height, write.height), (3, 3));
-        assert_eq!(vfs.height, 0);
     }
 
     #[test]
     fn directional_detail_columns_have_explicit_gutter() {
-        let (read, write, _) = detail_areas(Rect::new(3, 4, 57, 12));
+        let (read, write) = directional_areas(Rect::new(3, 4, 57, 12));
         assert_eq!(read.width + 1 + write.width, 57);
         assert_eq!(write.x, read.x + read.width + 1);
     }

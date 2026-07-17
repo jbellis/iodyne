@@ -12,11 +12,11 @@ The top of the screen is the device overview:
 - separate read and write latency-density lanes on one fixed logarithmic axis;
 - one selected device whose evidence fills the rest of the screen.
 
-The detail view splits reads from writes and shows rolling latency
+The tabbed detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
 merges, and await. Its header identifies the mount and backing-device topology,
 followed by available filesystem, device, mdraid, APFS, and SMART facts. On
-Linux, VFS tracing adds the processes and paths currently requesting the most
+Linux, the VFS tab shows the processes and paths currently requesting the most
 file IO.
 
 This is the view for answering "which device, which direction, and what kind of
@@ -147,6 +147,7 @@ as temperature, wear, spare, and power-on time. `smartmontools` is optional.
 | Key | Action |
 |---|---|
 | `j` / `k`, `Down` / `Up` | Select a device |
+| `Tab` | Switch between disk details and VFS activity |
 | `u` | Show mounted devices or all devices |
 | `p` | Freeze or resume the display (collection continues) |
 | `-` / `+` | Decrease or increase the sampling interval |
