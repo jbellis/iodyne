@@ -14,8 +14,8 @@ src/collect/ebpf/build-ebpf.sh
 
 This build step requires a Clang installation with the BPF target. It is not a
 normal Cargo, release, or `cargo publish` prerequisite because the generated
-object is checked in. Keeping this separate avoids imposing Aya's nightly Rust
-eBPF toolchain and `bpf-linker` on iodyne's Rust 1.75 build contract.
+object is checked in. Keeping this separate avoids imposing the eBPF compiler
+toolchain on iodyne's Rust 1.87 build contract.
 
 At runtime, iodyne requires Linux 5.11 or newer, BTF
 (`/sys/kernel/btf/vmlinux`), the `block_rq_issue` and `block_rq_complete` raw
@@ -41,14 +41,14 @@ current CO-RE field paths are `request.q.disk`, `request.cmd_flags`, and
 iodyne falls back to aggregate await statistics.
 
 Separate VFS objects contain `vfs_read`, `vfs_write`, `vfs_iter_read`, and
-`vfs_iter_write` kprobes. Their
-map creation, load, and attach status is independent: a kernel without the ring
-buffer map type or either VFS symbol can still provide block latency. Each
-successful operation emits its completed byte count as a compact record to a
-1 MiB ring buffer; userspace drains and groups a bounded number of received
-records once per display interval. A full ring drops VFS attribution rather
+`vfs_iter_write` kprobes. Their map creation, load, and attach status is
+independent: a kernel without either VFS symbol can still provide block
+latency. Each successful operation adds its completed byte count to a bounded
+kernel aggregation map. Userspace atomically retrieves and deletes at most
+8,192 entries on each main-loop pass. A full map drops VFS attribution rather
 than delaying the filesystem operation, and sustained producers cannot
-monopolize the UI thread.
+monopolize the UI thread. If the kernel rejects batch map operations, iodyne
+disables VFS attribution while retaining block latency collection.
 
 Classic `/dev/fuse` requests are correlated across the userspace-filesystem
 boundary. When the kernel exposes `fuse_copy_args`, a probe reads the requester
@@ -77,7 +77,7 @@ attribution active whenever the generic iter probes attach.
 
 The probe admits only regular files on filesystems with a nonzero block-device
 major. Device nodes, PTYs, pipes, sockets, and anonymous pseudo-filesystems are
-excluded before they can consume ring capacity or presentation rows.
+excluded before they can consume aggregation-map capacity or presentation rows.
 
 After both count kprobes attach, `security_file_permission` is attached
 independently as an fentry program and uses `bpf_d_path` to capture the first
@@ -90,8 +90,8 @@ an earlier object or map-creation failure disables the complete VFS collector
 An empty map value records a failed or overlong-path attempt so the helper is
 not retried for every operation. Userspace prefers an event-time path, then
 scans at most 256 descriptors for each unresolved candidate process, then shows
-basename and inode. It only polls paths for keys received from the ring during
-the current interval; it never installs recursive watches or walks filesystem
+basename and inode. It only polls paths for keys returned by the current
+aggregation-map drain; it never installs recursive watches or walks filesystem
 trees.
 
 VFS byte counts are successful return values from the probed VFS calls, not

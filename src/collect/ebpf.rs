@@ -4,13 +4,17 @@
 //! `ebpf` feature, non-Linux systems, and Linux systems which reject BPF loads
 //! all report an ordinary status and continue using `/proc/diskstats`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+mod batch;
 
 pub const LATENCY_BUCKETS: usize = 32;
 const FUSE_ORIGIN_UNKNOWN: u32 = u32::MAX;
 const FUSE_ORIGIN_PROTOCOL: u32 = 1;
 const FUSE_ORIGIN_WRITEBACK: u32 = 2;
 const FUSE_ORIGIN_PID_ZERO: u32 = 3;
+const CGROUP_CONTAINER_CACHE_CAPACITY: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlockDeviceId {
@@ -156,6 +160,28 @@ struct VfsAggValue {
     basename: [u8; 64],
 }
 
+impl Default for VfsAggValue {
+    fn default() -> Self {
+        Self {
+            read_bytes: 0,
+            write_bytes: 0,
+            read_ops: 0,
+            write_ops: 0,
+            pid: 0,
+            origin_tgid: 0,
+            cgroup_id: 0,
+            origin_cgroup_id: 0,
+            parent_tgid: 0,
+            origin_parent_tgid: 0,
+            comm: [0; 16],
+            origin_comm: [0; 16],
+            parent_comm: [0; 16],
+            origin_parent_comm: [0; 16],
+            basename: [0; 64],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct VfsFilePath {
@@ -220,14 +246,15 @@ pub struct EbpfLatencyCollector {
     vfs_fuse_writeback_status: EbpfStatus,
     vfs_overlay_status: EbpfStatus,
     cgroup_container_cache: HashMap<u64, bool>,
+    cgroup_container_order: VecDeque<u64>,
     previous: HashMap<HistogramKey, u64>,
     previous_vfs_drops: u64,
     pending_vfs_admitted: u64,
     pending_vfs_drops: u64,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    latency_bpf: Option<aya::Bpf>,
+    latency_bpf: Option<aya::Ebpf>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    vfs_bpf: Option<aya::Bpf>,
+    vfs_bpf: Option<aya::Ebpf>,
 }
 
 impl EbpfLatencyCollector {
@@ -248,6 +275,7 @@ impl EbpfLatencyCollector {
             vfs_fuse_writeback_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_overlay_status: EbpfStatus::Unavailable("test fixture".into()),
             cgroup_container_cache: HashMap::new(),
+            cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
             pending_vfs_admitted: 0,
@@ -401,6 +429,7 @@ impl EbpfLatencyCollector {
                     vfs_fuse_writeback_status,
                     vfs_overlay_status,
                     cgroup_container_cache: HashMap::new(),
+                    cgroup_container_order: VecDeque::new(),
                     previous: HashMap::new(),
                     previous_vfs_drops: 0,
                     pending_vfs_admitted: 0,
@@ -427,6 +456,7 @@ impl EbpfLatencyCollector {
                     "block probe initialization failed before OverlayFS attach: {error}"
                 )),
                 cgroup_container_cache: HashMap::new(),
+                cgroup_container_order: VecDeque::new(),
                 previous: HashMap::new(),
                 previous_vfs_drops: 0,
                 pending_vfs_admitted: 0,
@@ -447,6 +477,7 @@ impl EbpfLatencyCollector {
             vfs_fuse_writeback_status: EbpfStatus::DisabledAtBuild,
             vfs_overlay_status: EbpfStatus::DisabledAtBuild,
             cgroup_container_cache: HashMap::new(),
+            cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
             pending_vfs_admitted: 0,
@@ -464,6 +495,7 @@ impl EbpfLatencyCollector {
             vfs_fuse_writeback_status: EbpfStatus::UnsupportedPlatform,
             vfs_overlay_status: EbpfStatus::UnsupportedPlatform,
             cgroup_container_cache: HashMap::new(),
+            cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
             pending_vfs_admitted: 0,
@@ -495,9 +527,12 @@ impl EbpfLatencyCollector {
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     fn read_vfs_counts(&mut self) -> Result<Vec<VfsActivityDelta>, String> {
-        use aya::maps::{HashMap as AyaHashMap, MapError};
+        use std::os::fd::AsFd;
+
+        use aya::maps::{HashMap as AyaHashMap, IterableMap, MapError};
 
         let cgroup_container_cache = &mut self.cgroup_container_cache;
+        let cgroup_container_order = &mut self.cgroup_container_order;
         let bpf = self
             .vfs_bpf
             .as_mut()
@@ -511,26 +546,9 @@ impl EbpfLatencyCollector {
             let agg = bpf
                 .map_mut("VFS_AGG")
                 .ok_or_else(|| "eBPF VFS aggregation map is missing".to_string())?;
-            let mut agg = AyaHashMap::<_, VfsAggKey, VfsAggValue>::try_from(agg)
+            let agg = AyaHashMap::<_, VfsAggKey, VfsAggValue>::try_from(agg)
                 .map_err(|error| format!("cannot access eBPF VFS aggregation map: {error}"))?;
-            let entries = agg
-                .iter()
-                .map(|entry| {
-                    entry
-                        .map_err(|error| format!("cannot read eBPF VFS aggregation entry: {error}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Counts added after the read and before this removal are lost.
-            // This microsecond-scale unbiased loss replaces ring-full drops.
-            for (key, _) in &entries {
-                match agg.remove(key) {
-                    Ok(()) | Err(MapError::KeyNotFound) => {}
-                    Err(error) => {
-                        return Err(format!("cannot remove eBPF VFS aggregation entry: {error}"));
-                    }
-                }
-            }
-            entries
+            batch::drain(agg.map().fd().as_fd())?
         };
         for (key, value) in entries {
             admitted = admitted
@@ -550,9 +568,11 @@ impl EbpfLatencyCollector {
                 value.cgroup_id
             };
             let cgroup_is_container = effective_cgroup_id != 0
-                && *cgroup_container_cache
-                    .entry(effective_cgroup_id)
-                    .or_insert_with(|| cgroup_id_is_container(effective_cgroup_id));
+                && cached_cgroup_is_container(
+                    cgroup_container_cache,
+                    cgroup_container_order,
+                    effective_cgroup_id,
+                );
             let delegated_by_fuse_overlay = matches!(
                 key.origin_kind,
                 FUSE_ORIGIN_PROTOCOL | FUSE_ORIGIN_WRITEBACK | FUSE_ORIGIN_PID_ZERO
@@ -728,7 +748,7 @@ impl Default for EbpfLatencyCollector {
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn load_linux() -> Result<aya::Bpf, String> {
+fn load_linux() -> Result<aya::Ebpf, String> {
     use aya::programs::RawTracePoint;
 
     enforce_linux_trace_abi()?;
@@ -743,7 +763,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
     let bytes: &[u8] = {
         return Err("eBPF probes support only x86_64 and arm64".into());
     };
-    let mut bpf = aya::Bpf::load(bytes).map_err(|error| format!("cannot load eBPF: {error}"))?;
+    let mut bpf = aya::Ebpf::load(bytes).map_err(|error| format!("cannot load eBPF: {error}"))?;
 
     for (program_name, tracepoint_name) in [
         ("iodyne_block_issue", "block_rq_issue"),
@@ -765,7 +785,7 @@ fn load_linux() -> Result<aya::Bpf, String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, EbpfStatus), String> {
+fn load_vfs_linux() -> Result<(aya::Ebpf, EbpfStatus, EbpfStatus, EbpfStatus, EbpfStatus), String> {
     use aya::maps::Array;
     use aya::programs::KProbe;
 
@@ -778,7 +798,7 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, Ebp
         return Err("eBPF VFS attribution supports only x86_64 and arm64".into());
     };
     let mut bpf =
-        aya::Bpf::load(bytes).map_err(|error| format!("cannot load VFS eBPF object: {error}"))?;
+        aya::Ebpf::load(bytes).map_err(|error| format!("cannot load VFS eBPF object: {error}"))?;
     let self_tgid = bpf
         .map_mut("SELF_TGID")
         .ok_or_else(|| "eBPF self-TGID map is missing".to_string())?;
@@ -856,7 +876,7 @@ fn load_vfs_linux() -> Result<(aya::Bpf, EbpfStatus, EbpfStatus, EbpfStatus, Ebp
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn attach_optional_kprobe(
-    bpf: &mut aya::Bpf,
+    bpf: &mut aya::Ebpf,
     program_name: &str,
     function_name: &str,
 ) -> Result<(), String> {
@@ -878,7 +898,7 @@ fn attach_optional_kprobe(
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn attach_vfs_path_linux(bpf: &mut aya::Bpf) -> Result<(), String> {
+fn attach_vfs_path_linux(bpf: &mut aya::Ebpf) -> Result<(), String> {
     use aya::programs::FEntry;
     use aya::Btf;
 
@@ -974,6 +994,50 @@ fn delegated_process_identity_at(pid: u32, proc_root: &std::path::Path) -> Optio
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn cgroup_id_is_container(cgroup_id: u64) -> bool {
     cgroup_id_is_container_at(cgroup_id, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn cached_cgroup_is_container(
+    cache: &mut HashMap<u64, bool>,
+    order: &mut VecDeque<u64>,
+    cgroup_id: u64,
+) -> bool {
+    if let Some(container_owned) = cache.get(&cgroup_id) {
+        return *container_owned;
+    }
+
+    let container_owned = cgroup_id_is_container(cgroup_id);
+    insert_bounded_cache(
+        cache,
+        order,
+        cgroup_id,
+        container_owned,
+        CGROUP_CONTAINER_CACHE_CAPACITY,
+    );
+    container_owned
+}
+
+fn insert_bounded_cache(
+    cache: &mut HashMap<u64, bool>,
+    order: &mut VecDeque<u64>,
+    cgroup_id: u64,
+    container_owned: bool,
+    capacity: usize,
+) {
+    debug_assert!(capacity > 0);
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = cache.entry(cgroup_id) {
+        entry.insert(container_owned);
+        return;
+    }
+    while cache.len() >= capacity {
+        let Some(oldest) = order.pop_front() else {
+            cache.clear();
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(cgroup_id, container_owned);
+    order.push_back(cgroup_id);
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -1238,6 +1302,26 @@ mod tests {
         assert!(cgroup_id_is_container_at(cgroup_id, &root));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cgroup_container_cache_evicts_oldest_entries_at_capacity() {
+        let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
+        for cgroup_id in 1..=3 {
+            insert_bounded_cache(&mut cache, &mut order, cgroup_id, cgroup_id % 2 == 0, 3);
+        }
+        insert_bounded_cache(&mut cache, &mut order, 4, true, 3);
+
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains_key(&1));
+        assert_eq!(cache.get(&2), Some(&true));
+        assert_eq!(order, VecDeque::from([2, 3, 4]));
+
+        insert_bounded_cache(&mut cache, &mut order, 3, true, 3);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(order, VecDeque::from([2, 3, 4]));
+        assert_eq!(cache.get(&3), Some(&true));
     }
 
     #[test]

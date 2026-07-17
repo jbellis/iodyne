@@ -38,16 +38,16 @@ const RING_LEN: usize = 60;
 /// Sixty aligned latency observations.
 const LATENCY_WINDOW: usize = 60;
 
-/// Maximum host-wide VFS entries retained for presentation. Kernel event and
-/// path storage are separately bounded.
+/// Maximum host-wide VFS entries retained for presentation. Kernel aggregation
+/// and path storage are separately bounded.
 const HOT_FILE_LIMIT: usize = 64;
 /// Smooth VFS activity over ten seconds so short collector intervals do not
 /// make the hottest-file ranking flicker. Samples remain bounded by the
-/// kernel event ring and this finite time window.
+/// kernel aggregation map and this finite time window.
 const VFS_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
-/// Maximum wall-clock gap that a single VFS ring drain is allowed to age the
-/// hot-file window. Longer stalls are treated as a brief blind spot: new
-/// events are scaled back to their observed rate while retained history ages
+/// Maximum wall-clock gap that a single VFS aggregation drain is allowed to age
+/// the hot-file window. Longer stalls are treated as a brief blind spot: new
+/// entries are scaled back to their observed rate while retained history ages
 /// by at most ten normal 100 ms drains.
 const MAX_DRAIN_AGE_SECS: f64 = 1.0;
 #[cfg(target_os = "linux")]
@@ -452,10 +452,10 @@ pub struct IoCollector {
     pub latest_elapsed: Duration,
     /// Bounded, host-wide VFS completed-byte activity sorted hottest first.
     pub hot_files: Vec<VfsFileActivity>,
-    /// Ring-buffer events are drained on every main-loop pass, independently
+    /// Aggregated VFS entries are drained on every main-loop pass, independently
     /// of the slower user-selected display cadence.
     pending_vfs: HashMap<VfsActivityKey, VfsActivityDelta>,
-    /// VFS activity ages from the frequent ring-buffer drain, not from the
+    /// VFS activity ages from the frequent aggregation-map drain, not from the
     /// slower display sample that publishes the latest ranked view.
     last_vfs_window_update: Instant,
     vfs_activity_window: VfsActivityWindow,
