@@ -307,7 +307,17 @@ struct AggregateIo {
 }
 
 fn aggregate_io(visible: &[&IoTick], app: &App) -> AggregateIo {
-    let histories: Vec<&DeviceHistory> = visible
+    // `/proc/diskstats` reports IO at every block layer. For an md array that
+    // means the same logical operation is charged to both the array and its
+    // backing member, so blindly summing every visible row double-counts it.
+    // Prefer the visible array for workload totals and omit only its members.
+    //
+    // Keep traced latency sourced from every visible device: block request
+    // tracepoints are generally emitted by the physical request queues rather
+    // than the md logical device, and filtering those members would make the
+    // aggregate latency lane disappear.
+    let workload_devices = aggregate_workload_devices(visible, &app.volumes);
+    let histories: Vec<&DeviceHistory> = workload_devices
         .iter()
         .filter_map(|tick| app.io.history.get(&tick.device))
         .collect();
@@ -316,6 +326,28 @@ fn aggregate_io(visible: &[&IoTick], app: &App) -> AggregateIo {
         .filter_map(|tick| app.io.traced_history.get(&tick.device))
         .collect();
     aggregate_histories(&histories, &traced_histories, visible.len())
+}
+
+fn aggregate_workload_devices<'a>(visible: &[&'a IoTick], volumes: &VolumeTick) -> Vec<&'a IoTick> {
+    let visible_arrays: Vec<&MdRaidArray> = volumes
+        .mdraid
+        .iter()
+        .filter(|array| {
+            visible
+                .iter()
+                .any(|tick| disk_name(&tick.device) == disk_name(&array.name))
+        })
+        .collect();
+
+    visible
+        .iter()
+        .copied()
+        .filter(|tick| {
+            !visible_arrays
+                .iter()
+                .any(|array| md_array_contains_device(array, &tick.device))
+        })
+        .collect()
 }
 
 fn aggregate_histories(
@@ -3930,6 +3962,72 @@ mod tests {
             ..WorkloadSample::default()
         }]);
         assert_eq!(workload_view(&samples).merges, None);
+    }
+
+    #[test]
+    fn aggregate_workload_uses_md_array_without_counting_members_again() {
+        let ticks = ["md0", "sdc", "sde", "sdf"].map(|device| IoTick {
+            device: device.into(),
+            ..IoTick::default()
+        });
+        let visible: Vec<&IoTick> = ticks.iter().collect();
+        let volumes = VolumeTick {
+            mdraid: vec![MdRaidArray {
+                name: "md0".into(),
+                members: vec![
+                    MdRaidMember {
+                        device: "sdc".into(),
+                        ..MdRaidMember::default()
+                    },
+                    MdRaidMember {
+                        device: "sde".into(),
+                        ..MdRaidMember::default()
+                    },
+                ],
+                ..MdRaidArray::default()
+            }],
+            ..VolumeTick::default()
+        };
+
+        let selected: Vec<&str> = aggregate_workload_devices(&visible, &volumes)
+            .iter()
+            .map(|tick| tick.device.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["md0", "sdf"]);
+    }
+
+    #[test]
+    fn aggregate_workload_keeps_members_when_array_row_is_not_visible() {
+        let ticks = ["sdc", "sde"].map(|device| IoTick {
+            device: device.into(),
+            ..IoTick::default()
+        });
+        let visible: Vec<&IoTick> = ticks.iter().collect();
+        let volumes = VolumeTick {
+            mdraid: vec![MdRaidArray {
+                name: "md0".into(),
+                members: vec![
+                    MdRaidMember {
+                        device: "sdc".into(),
+                        ..MdRaidMember::default()
+                    },
+                    MdRaidMember {
+                        device: "sde".into(),
+                        ..MdRaidMember::default()
+                    },
+                ],
+                ..MdRaidArray::default()
+            }],
+            ..VolumeTick::default()
+        };
+
+        let selected: Vec<&str> = aggregate_workload_devices(&visible, &volumes)
+            .iter()
+            .map(|tick| tick.device.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["sdc", "sde"]);
     }
 
     #[test]

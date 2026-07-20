@@ -7,6 +7,7 @@ use aya_obj::generated::{bpf_attr, bpf_cmd};
 use super::{VfsAggKey, VfsAggValue};
 
 pub(super) const MAX_VFS_AGG_ENTRIES: usize = 8_192;
+const BUSY_RETRIES: usize = 8;
 
 #[derive(Debug)]
 struct BatchPage {
@@ -51,6 +52,28 @@ fn drain_with(
 }
 
 fn lookup_and_delete(
+    fd: BorrowedFd<'_>,
+    cursor: Option<VfsAggKey>,
+    capacity: usize,
+) -> io::Result<BatchPage> {
+    retry_busy(|| lookup_and_delete_once(fd, cursor, capacity))
+}
+
+fn retry_busy(mut lookup: impl FnMut() -> io::Result<BatchPage>) -> io::Result<BatchPage> {
+    for attempt in 0..=BUSY_RETRIES {
+        match lookup() {
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) && attempt < BUSY_RETRIES => {
+                // Hash-map batch operations can collide with a BPF-side map
+                // update and return EBUSY before processing an entry. The
+                // kernel contract explicitly leaves retrying to userspace.
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded eBPF batch retry loop always returns")
+}
+
+fn lookup_and_delete_once(
     fd: BorrowedFd<'_>,
     cursor: Option<VfsAggKey>,
     capacity: usize,
@@ -100,14 +123,21 @@ fn lookup_and_delete(
     }
 
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENOENT) {
-        Ok(BatchPage {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(BatchPage {
             entries,
             next_cursor,
             exhausted: true,
-        })
-    } else {
-        Err(error)
+        }),
+        // For non-EFAULT errors the kernel reports successfully processed
+        // entries through count. Preserve those entries and continue from the
+        // returned cursor instead of discarding data and disabling collection.
+        Some(libc::EBUSY) | Some(libc::ENOSPC) if !entries.is_empty() => Ok(BatchPage {
+            entries,
+            next_cursor,
+            exhausted: false,
+        }),
+        _ => Err(error),
     }
 }
 
@@ -194,6 +224,27 @@ mod tests {
 
         let failed = drain_with(|_, _| Err(io::Error::from_raw_os_error(libc::EINVAL)));
         assert!(failed.unwrap_err().contains("Invalid argument"));
+    }
+
+    #[test]
+    fn retries_transient_busy_batch_operations() {
+        let mut calls = 0;
+        let page = retry_busy(|| {
+            calls += 1;
+            if calls <= BUSY_RETRIES {
+                Err(io::Error::from_raw_os_error(libc::EBUSY))
+            } else {
+                Ok(BatchPage {
+                    entries: vec![entry(1)],
+                    next_cursor: entry(2).0,
+                    exhausted: true,
+                })
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls, BUSY_RETRIES + 1);
+        assert_eq!(page.entries.len(), 1);
     }
 
     #[test]

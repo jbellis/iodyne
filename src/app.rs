@@ -264,7 +264,14 @@ pub fn run(sample_interval: Duration, intervals: Option<u64>) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    res
+    res?;
+
+    // Aya tears down each attached program during Drop, which can make an
+    // otherwise successful interactive quit take several seconds. The kernel
+    // releases those process-owned BPF resources when the process exits, so
+    // after restoring the terminal there is no useful userspace teardown left
+    // to await. `process::exit` deliberately skips Rust destructors.
+    std::process::exit(0)
 }
 
 fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
@@ -282,8 +289,8 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
                     handle_key(app, k.code);
                     if app.should_quit {
                         // Skip the final collector/metadata tick. Returning
-                        // still restores the terminal; process teardown can
-                        // reclaim collector and eBPF resources.
+                        // lets `run` restore the terminal before it terminates
+                        // without dropping the collectors.
                         return Ok(());
                     }
                     redraw = true;
