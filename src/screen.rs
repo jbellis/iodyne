@@ -1663,7 +1663,8 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         return;
     }
 
-    let fs_devices = tick.map(|tick| filesystem_device_ids_for_io(&tick.device, &app.filesystems));
+    let fs_devices =
+        tick.map(|tick| filesystem_device_ids_for_io(&tick.device, &app.filesystems, &app.volumes));
     let entries: Vec<_> = match &fs_devices {
         Some(ids) => hot_files_for_fs_devices(&app.io.hot_files, ids),
         None => app.io.hot_files.iter().collect(),
@@ -2007,13 +2008,6 @@ fn hot_files_for_fs_devices<'a>(
     filtered
 }
 
-fn filesystems_for_io_device<'a>(device: &str, filesystems: &'a [FsTick]) -> Vec<&'a FsTick> {
-    filesystems
-        .iter()
-        .filter(|fs| mount_label_for_device(fs, device).is_some())
-        .collect()
-}
-
 fn filesystem_free_pct(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> Option<u32> {
     attributable_filesystems(device, filesystems, volumes)
         .into_iter()
@@ -2028,8 +2022,12 @@ fn filesystem_free_pct(device: &str, filesystems: &[FsTick], volumes: &VolumeTic
 }
 
 #[cfg(target_os = "linux")]
-fn filesystem_device_ids_for_io(device: &str, filesystems: &[FsTick]) -> HashSet<(u32, u32)> {
-    filesystems_for_io_device(device, filesystems)
+fn filesystem_device_ids_for_io(
+    device: &str,
+    filesystems: &[FsTick],
+    volumes: &VolumeTick,
+) -> HashSet<(u32, u32)> {
+    attributable_filesystems(device, filesystems, volumes)
         .into_iter()
         .filter_map(|fs| std::fs::metadata(&fs.mount).ok())
         .map(|metadata| {
@@ -2040,7 +2038,11 @@ fn filesystem_device_ids_for_io(device: &str, filesystems: &[FsTick]) -> HashSet
 }
 
 #[cfg(not(target_os = "linux"))]
-fn filesystem_device_ids_for_io(_device: &str, _filesystems: &[FsTick]) -> HashSet<(u32, u32)> {
+fn filesystem_device_ids_for_io(
+    _device: &str,
+    _filesystems: &[FsTick],
+    _volumes: &VolumeTick,
+) -> HashSet<(u32, u32)> {
     HashSet::new()
 }
 
@@ -2361,6 +2363,21 @@ fn detail_header(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> 
 }
 
 fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
+    if fs.fs_type == "zfs" {
+        if let Some(pool) = volumes.zfs_pool_for_source(&fs.device) {
+            return format!(
+                "{} → {} (ZFS {}) → {{{}}}",
+                fs.mount,
+                fs.device,
+                pool.state,
+                pool.members
+                    .iter()
+                    .map(|m| disk_name(m))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+    }
     let source = disk_name(&fs.device);
     if let Some(array) = md_array_for_source(source, &volumes.mdraid) {
         let array_label = if array.level.is_empty() {
@@ -2453,7 +2470,13 @@ fn attributable_filesystems<'a>(
     filesystems
         .iter()
         .filter(|fs| {
-            direct_mount_label_for_device(fs, device).is_some()
+            (fs.fs_type == "zfs"
+                && volumes.zfs_pool_for_source(&fs.device).is_some_and(|pool| {
+                    pool.members
+                        .iter()
+                        .any(|member| whole_disk_name(disk_name(member)) == disk_name(device))
+                }))
+                || direct_mount_label_for_device(fs, device).is_some()
                 || md_array_for_source(disk_name(&fs.device), &volumes.mdraid).is_some_and(
                     |array| {
                         disk_name(&array.name) == disk_name(device)
@@ -2534,7 +2557,7 @@ fn device_and_filesystem_facts(
     let mut seen = HashSet::new();
     let (free, total) = filesystems
         .iter()
-        .filter(|fs| fs.size_bytes > 0)
+        .filter(|fs| fs.size_bytes > 0 && fs.fs_type != "zfs")
         .filter(|fs| {
             seen.insert(format!(
                 "{}:{}:{}",
@@ -3092,6 +3115,36 @@ mod tests {
             mounts_for_device("sdb", &filesystems),
             Some("/a, /b +1".to_string())
         );
+    }
+
+    #[test]
+    fn zfs_members_show_dataset_mounts_and_vfs_identities() {
+        let mut dataset = fs("tank/Projects", "/");
+        dataset.fs_type = "zfs".into();
+        let filesystems = vec![dataset];
+        let volumes = VolumeTick {
+            zfs: vec![crate::collect::volumes::ZfsPool {
+                name: "tank".into(),
+                state: "ONLINE".into(),
+                members: vec!["/dev/sdb1".into(), "/dev/nvme1n1p1".into()],
+            }],
+            ..Default::default()
+        };
+        for device in ["sdb", "nvme1n1"] {
+            assert!(io_device_is_mounted(device, &filesystems, &volumes));
+            assert!(detail_header(device, &filesystems, &volumes)
+                .contains("tank/Projects (ZFS ONLINE)"));
+            #[cfg(target_os = "linux")]
+            assert!(!filesystem_device_ids_for_io(device, &filesystems, &volumes).is_empty());
+        }
+        assert!(!io_device_is_mounted("sdc", &filesystems, &volumes));
+        let edges = crate::collect::topology::relationships(&filesystems, &volumes);
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "zfs_dataset_of" && e.from == "tank/Projects" && e.to == "tank"));
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "zfs_member_of" && e.from == "sdb1" && e.to == "tank"));
     }
 
     #[test]

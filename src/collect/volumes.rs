@@ -1,13 +1,83 @@
-//! Volumes collector — APFS containers (macOS), parsed from
-//! `diskutil apfs list` text output.
-//!
-//! Linux mdraid / ZFS / LVM collection is deferred. On non-macOS this
-//! returns an empty list; the tab renders an explanatory banner.
+//! Volume topology: APFS containers, Linux mdraid arrays, and ZFS pools.
 
 #[derive(Debug, Clone, Default)]
 pub struct VolumeTick {
     pub containers: Vec<ApfsContainer>,
     pub mdraid: Vec<MdRaidArray>,
+    pub zfs: Vec<ZfsPool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ZfsPool {
+    pub name: String,
+    pub state: String,
+    /// Resolved block-device paths, including log/cache/spare devices.
+    pub members: Vec<String>,
+}
+
+impl VolumeTick {
+    pub fn zfs_pool_for_source(&self, source: &str) -> Option<&ZfsPool> {
+        let name = source.split('/').next()?;
+        self.zfs.iter().find(|pool| pool.name == name)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_zfs() -> Vec<ZfsPool> {
+    use std::process::Command;
+    // -L resolves persistent aliases; -P retains full partition paths.
+    let output = Command::new("zpool")
+        .args(["status", "-LP"])
+        .env("LC_ALL", "C")
+        .output()
+        .or_else(|_| {
+            Command::new("/usr/sbin/zpool")
+                .args(["status", "-LP"])
+                .env("LC_ALL", "C")
+                .output()
+        });
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_zpool_status(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_zpool_status(text: &str) -> Vec<ZfsPool> {
+    let mut pools: Vec<ZfsPool> = Vec::new();
+    let mut in_config = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix("pool:") {
+            pools.push(ZfsPool {
+                name: name.trim().into(),
+                ..Default::default()
+            });
+            in_config = false;
+        } else if let Some(pool) = pools.last_mut() {
+            if let Some(state) = line.strip_prefix("state:") {
+                pool.state = state.trim().into();
+            } else if line == "config:" {
+                in_config = true;
+            } else if line.starts_with("errors:") {
+                in_config = false;
+            } else if in_config {
+                if let Some(path) = line
+                    .split_whitespace()
+                    .next()
+                    .filter(|p| p.starts_with("/dev/"))
+                {
+                    pool.members.push(path.into());
+                }
+            }
+        }
+    }
+    for pool in &mut pools {
+        pool.members.sort();
+        pool.members.dedup();
+    }
+    pools
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +152,7 @@ pub fn collect() -> VolumeTick {
     {
         let mut out = VolumeTick::default();
         out.mdraid = linux_mdraid();
+        out.zfs = linux_zfs();
         return out;
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -432,6 +503,30 @@ fn first_byte_count(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_zfs_pools_with_nested_and_auxiliary_devices() {
+        let pools = parse_zpool_status("pool: tank\n state: DEGRADED\nconfig:\n NAME STATE READ WRITE CKSUM\n tank DEGRADED 0 0 0\n mirror-0 DEGRADED 0 0 0\n /dev/sdb1 ONLINE 0 0 0\n /dev/sdc1 FAULTED 0 0 0\n logs\n /dev/nvme1n1p1 ONLINE 0 0 0\n cache\n /dev/sdd ONLINE 0 0 0\nerrors: /dev/not-a-member\npool: backup\n state: ONLINE\nconfig:\n /dev/sde1 ONLINE 0 0 0\nerrors: No known data errors\n");
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0].state, "DEGRADED");
+        assert_eq!(
+            pools[0].members,
+            ["/dev/nvme1n1p1", "/dev/sdb1", "/dev/sdc1", "/dev/sdd"]
+        );
+        let volumes = VolumeTick {
+            zfs: pools,
+            ..Default::default()
+        };
+        assert_eq!(
+            volumes
+                .zfs_pool_for_source("tank/child/nested")
+                .unwrap()
+                .name,
+            "tank"
+        );
+        assert!(volumes.zfs_pool_for_source("tank-other/child").is_none());
+        assert!(parse_zpool_status("no pools available").is_empty());
+    }
 
     #[test]
     fn parses_two_active_arrays() {

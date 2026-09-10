@@ -18,12 +18,27 @@ pub fn relationships(filesystems: &[FsTick], volumes: &VolumeTick) -> Vec<Topolo
     for fs in filesystems {
         let source = device_name(&fs.device).to_string();
         edges.insert(("mount_backed_by", fs.mount.clone(), source.clone()));
+        if fs.fs_type == "zfs" {
+            if let Some(pool) = volumes.zfs_pool_for_source(&fs.device) {
+                edges.insert(("zfs_dataset_of", fs.device.clone(), pool.name.clone()));
+            }
+            continue;
+        }
         if let Some(parent) = partition_parent(&source) {
             edges.insert(("partition_of", source.clone(), parent));
         }
         #[cfg(target_os = "linux")]
         for slave in stacked_members(&source) {
             edges.insert(("block_device_backed_by", source.clone(), slave));
+        }
+    }
+    for pool in &volumes.zfs {
+        for member in &pool.members {
+            let member = device_name(member).to_string();
+            if let Some(parent) = partition_parent(&member) {
+                edges.insert(("partition_of", member.clone(), parent));
+            }
+            edges.insert(("zfs_member_of", member, pool.name.clone()));
         }
     }
     for array in &volumes.mdraid {

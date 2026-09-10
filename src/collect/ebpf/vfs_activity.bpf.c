@@ -32,6 +32,7 @@ typedef unsigned long long __u64;
 
 struct super_block {
     __u32 s_dev;
+    unsigned long s_magic;
     void *s_fs_info;
 } __attribute__((preserve_access_index));
 struct inode {
@@ -324,8 +325,16 @@ static __inline __attribute__((always_inline)) int vfs_key_for_file(
 
     // Keep the storage view about storage: reject device nodes, PTYs, pipes,
     // sockets, and regular-looking files on anonymous/pseudo filesystems.
-    if ((mode & S_IFMT) != S_IFREG || (dev >> 20) == 0)
+    if ((mode & S_IFMT) != S_IFREG)
         return -1;
+    // ZFS datasets use anonymous dev_t identities, but are real storage.
+    if ((dev >> 20) == 0) {
+        unsigned long magic;
+        if (bpf_probe_read_kernel(&magic, sizeof(magic),
+                                  __builtin_preserve_access_index(&sb->s_magic)) ||
+            magic != 0x2fc12fc1UL) /* ZFS_SUPER_MAGIC */
+            return -1;
+    }
 
     key->major = dev >> 20;
     key->minor = dev & ((1U << 20) - 1);
