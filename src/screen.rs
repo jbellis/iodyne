@@ -248,6 +248,7 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
     let (throughput_scale, iops_scale) =
         overview_workload_scales(&visible, Some(&aggregate.history), app);
     let overview_inner = pane_block("").inner(sections[0]);
+    let overview_geometry = device_overview_geometry(overview_inner.width);
     let device_area = Rect {
         y: overview_inner.y.saturating_add(1),
         height: overview_inner.height.saturating_sub(1),
@@ -269,6 +270,7 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
                 ..overview_inner
             },
             "Device",
+            overview_geometry,
         );
     }
     for (slot, index) in (start..start + count).enumerate() {
@@ -285,8 +287,11 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
                 &aggregate,
                 app,
                 selected == 0,
-                throughput_scale,
-                iops_scale,
+                OverviewScales {
+                    throughput: throughput_scale,
+                    iops: iops_scale,
+                },
+                overview_geometry,
             );
         } else {
             draw_overview_row(
@@ -309,6 +314,7 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
                     throughput: throughput_scale,
                     iops: iops_scale,
                 },
+                overview_geometry,
             );
         }
     }
@@ -363,9 +369,15 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
     let selected = app.selected_volumes.min(row_count - 1);
+    let longest_label = volumes
+        .iter()
+        .map(|volume| volume.label.chars().count())
+        .max()
+        .unwrap_or(10);
     let (throughput_scale, iops_scale) =
         volume_workload_scales(volumes, Some(&aggregate.history), app);
     let overview_inner = pane_block("").inner(sections[0]);
+    let overview_geometry = volume_overview_geometry(overview_inner.width, longest_label);
     let row_area = Rect {
         y: overview_inner.y.saturating_add(1),
         height: overview_inner.height.saturating_sub(1),
@@ -387,6 +399,7 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
                 ..overview_inner
             },
             "Volume",
+            overview_geometry,
         );
     }
     for (slot, index) in (start..start + count).enumerate() {
@@ -403,8 +416,11 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
                 &aggregate,
                 app,
                 selected == 0,
-                throughput_scale,
-                iops_scale,
+                OverviewScales {
+                    throughput: throughput_scale,
+                    iops: iops_scale,
+                },
+                overview_geometry,
             );
         } else {
             let volume = &volumes[index - 1];
@@ -427,6 +443,7 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
                     throughput: throughput_scale,
                     iops: iops_scale,
                 },
+                overview_geometry,
             );
         }
     }
@@ -805,16 +822,15 @@ fn md_failure_flag(flag: &str) -> bool {
     flag.trim_matches(['(', ')']).eq_ignore_ascii_case("f")
 }
 
-fn draw_scale_legend(f: &mut Frame, area: Rect, name: &str) {
+fn draw_scale_legend(f: &mut Frame, area: Rect, name: &str, geometry: OverviewGeometry) {
     if area.height == 0 {
         return;
     }
-    let geometry = row_geometry(area.width);
     let mut line = vec![Span::styled(
-        overview_prefix_header_for(geometry.label, name),
+        overview_prefix_header_for_geometry(geometry.prefix, name),
         Style::default().fg(p::DIM),
     )];
-    let lanes = latency_plot_geometry(geometry.plot);
+    let lanes = latency_plot_geometry(geometry.row.plot);
     line.push(Span::styled(
         "R ",
         Style::default().fg(p::GREEN).add_modifier(Modifier::BOLD),
@@ -847,6 +863,12 @@ struct RowGeometry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverviewGeometry {
+    row: RowGeometry,
+    prefix: OverviewPrefixGeometry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OverviewPrefixGeometry {
     device: u16,
     free: u16,
@@ -866,6 +888,16 @@ struct OverviewRow<'a> {
     history: Option<&'a DeviceHistory>,
     traced: Option<&'a VecDeque<TracedLatencySample>>,
     use_traced: bool,
+}
+
+struct OverviewPrefixRow<'a> {
+    label: &'a str,
+    free: Option<u32>,
+    throughput: &'a [f64],
+    throughput_scale: f64,
+    iops: &'a [f64],
+    iops_scale: f64,
+    selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,13 +945,64 @@ fn overview_prefix_geometry(width: u16) -> OverviewPrefixGeometry {
     }
 }
 
+fn device_overview_geometry(width: u16) -> OverviewGeometry {
+    let row = row_geometry(width);
+    OverviewGeometry {
+        row,
+        prefix: overview_prefix_geometry(row.label),
+    }
+}
+
+fn volume_overview_geometry(width: u16, longest_label: usize) -> OverviewGeometry {
+    let base = device_overview_geometry(width);
+    if width < 24 {
+        return base;
+    }
+
+    let name_width = longest_label.clamp(10, 24) as u16;
+    let min_plot_width = 5;
+    let baseline = base.prefix;
+    let prefix_fixed = 1 + (baseline.free > 0) as u16 * (1 + baseline.free + 1) + 2;
+    let max_prefix_width = width.saturating_sub(min_plot_width);
+    let name_width = (10..=name_width)
+        .rev()
+        .find(|name_width| {
+            prefix_fixed
+                .saturating_add(*name_width)
+                .saturating_add(baseline.throughput)
+                .saturating_add(baseline.iops)
+                <= max_prefix_width
+        })
+        .unwrap_or(baseline.device.min(name_width));
+    let prefix_width = prefix_fixed
+        .saturating_add(name_width)
+        .saturating_add(baseline.throughput)
+        .saturating_add(baseline.iops)
+        .min(width);
+    let row = RowGeometry {
+        label: prefix_width,
+        plot: width.saturating_sub(prefix_width),
+    };
+    OverviewGeometry {
+        row,
+        prefix: OverviewPrefixGeometry {
+            device: name_width,
+            ..baseline
+        },
+    }
+}
+
 #[cfg(test)]
 fn overview_prefix_header(width: u16) -> String {
     overview_prefix_header_for(width, "Device")
 }
 
+#[cfg(test)]
 fn overview_prefix_header_for(width: u16, name: &str) -> String {
-    let geometry = overview_prefix_geometry(width);
+    overview_prefix_header_for_geometry(overview_prefix_geometry(width), name)
+}
+
+fn overview_prefix_header_for_geometry(geometry: OverviewPrefixGeometry, name: &str) -> String {
     let name = fit_overview_device(name, geometry.device as usize);
     let mut header = format!(" {name:<width$}", width = geometry.device as usize);
     if geometry.free > 0 {
@@ -976,6 +1059,7 @@ fn draw_overview_row(
     row: OverviewRow<'_>,
     selected: bool,
     scales: OverviewScales,
+    geometry: OverviewGeometry,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -989,26 +1073,29 @@ fn draw_overview_row(
         use_traced,
     } = row;
     let label = label.unwrap_or(&tick.device);
-    let g = row_geometry(area.width);
+    let g = geometry.row;
     let throughput = history
         .map(|history| combined_throughput(&history.workload_samples))
         .unwrap_or_default();
     let iops = history
         .map(|history| combined_iops(&history.workload_samples))
         .unwrap_or_default();
-    draw_overview_prefix(
+    draw_overview_prefix_with_geometry(
         f,
         Rect {
             width: g.label,
             ..area
         },
-        label,
-        free,
-        &throughput,
-        scales.throughput,
-        &iops,
-        scales.iops,
-        selected,
+        OverviewPrefixRow {
+            label,
+            free,
+            throughput: &throughput,
+            throughput_scale: scales.throughput,
+            iops: &iops,
+            iops_scale: scales.iops,
+            selected,
+        },
+        geometry.prefix,
     );
 
     let (read_visual, write_visual) = if use_traced {
@@ -1058,28 +1145,31 @@ fn draw_overview_aggregate_row(
     aggregate: &AggregateIo,
     app: &App,
     selected: bool,
-    throughput_scale: f64,
-    iops_scale: f64,
+    scales: OverviewScales,
+    overview_geometry: OverviewGeometry,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let geometry = row_geometry(area.width);
+    let geometry = overview_geometry.row;
     let throughput = combined_throughput(&aggregate.history.workload_samples);
     let iops = combined_iops(&aggregate.history.workload_samples);
-    draw_overview_prefix(
+    draw_overview_prefix_with_geometry(
         f,
         Rect {
             width: geometry.label,
             ..area
         },
-        "all",
-        None,
-        &throughput,
-        throughput_scale,
-        &iops,
-        iops_scale,
-        selected,
+        OverviewPrefixRow {
+            label: "all",
+            free: None,
+            throughput: &throughput,
+            throughput_scale: scales.throughput,
+            iops: &iops,
+            iops_scale: scales.iops,
+            selected,
+        },
+        overview_geometry.prefix,
     );
 
     let lanes = latency_plot_geometry(geometry.plot);
@@ -1121,23 +1211,26 @@ fn draw_overview_aggregate_row(
     );
 }
 
-fn draw_overview_prefix(
+fn draw_overview_prefix_with_geometry(
     f: &mut Frame,
     area: Rect,
-    device: &str,
-    free: Option<u32>,
-    throughput: &[f64],
-    throughput_scale: f64,
-    iops: &[f64],
-    iops_scale: f64,
-    selected: bool,
+    row: OverviewPrefixRow<'_>,
+    geometry: OverviewPrefixGeometry,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let geometry = overview_prefix_geometry(area.width);
+    let OverviewPrefixRow {
+        label,
+        free,
+        throughput,
+        throughput_scale,
+        iops,
+        iops_scale,
+        selected,
+    } = row;
     let marker = if selected { "▌" } else { " " };
-    let device = fit_overview_device(device, geometry.device as usize);
+    let device = fit_overview_device(label, geometry.device as usize);
     let mut spans = vec![Span::styled(
         format!("{marker}{device:<width$}", width = geometry.device as usize),
         Style::default().fg(if selected { p::BR_WHITE } else { p::DIM }),
@@ -4453,20 +4546,24 @@ mod tests {
         assert_eq!(overview_prefix_header(30).chars().count(), 30);
         assert_eq!(overview_prefix_header(43).chars().count(), 43);
         let lanes = latency_plot_geometry(geometry.plot);
+        let prefix_geometry = overview_prefix_geometry(geometry.label);
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
-                draw_overview_prefix(
+                draw_overview_prefix_with_geometry(
                     frame,
                     Rect::new(0, 0, geometry.label, 1),
-                    "nvme0n1",
-                    Some(85),
-                    &[100.0],
-                    100.0,
-                    &[10.0],
-                    10.0,
-                    true,
+                    OverviewPrefixRow {
+                        label: "nvme0n1",
+                        free: Some(85),
+                        throughput: &[100.0],
+                        throughput_scale: 100.0,
+                        iops: &[10.0],
+                        iops_scale: 10.0,
+                        selected: true,
+                    },
+                    prefix_geometry,
                 );
                 draw_latency_plot(
                     frame,
@@ -4484,6 +4581,46 @@ mod tests {
         assert!(line.starts_with("▌nvm~  85%"));
         assert_eq!(buffer.cell((geometry.label - 1, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((geometry.label, 0)).unwrap().symbol(), "R");
+    }
+
+    #[test]
+    fn volume_overview_expands_names_without_narrowing_workload_sparklines() {
+        let devices = device_overview_geometry(198);
+        assert_eq!(devices.row.label, 43);
+        assert_eq!(devices.prefix.device, 10);
+        assert_eq!(devices.prefix.throughput, 12);
+        assert_eq!(devices.prefix.iops, 12);
+
+        let volumes = volume_overview_geometry(198, "/home/jonathan".chars().count());
+        assert_eq!(volumes.row.label, 47);
+        assert_eq!(volumes.prefix.device, 14);
+        assert_eq!(volumes.prefix.throughput, devices.prefix.throughput);
+        assert_eq!(volumes.prefix.iops, devices.prefix.iops);
+        assert_eq!(volumes.row.plot, 198 - volumes.row.label);
+        let header = overview_prefix_header_for_geometry(volumes.prefix, "Volume");
+        assert_eq!(header.chars().count(), volumes.row.label as usize);
+        assert!(header.starts_with(" Volume"));
+        assert_eq!(volume_overview_geometry(198, 100).prefix.device, 24);
+        assert_eq!(volume_overview_geometry(198, 0).prefix.device, 10);
+
+        let narrow = volume_overview_geometry(24, 24);
+        assert_eq!(narrow.prefix.device, 10);
+        assert_eq!(narrow.prefix.throughput, 0);
+        assert_eq!(narrow.prefix.iops, 0);
+        assert_eq!(narrow.row.label, 19);
+        assert_eq!(narrow.row.plot, 5);
+    }
+
+    #[test]
+    fn device_overview_geometry_keeps_existing_layout_at_common_widths() {
+        for width in [60, 100, 198] {
+            let geometry = device_overview_geometry(width);
+            assert_eq!(geometry.row, row_geometry(width));
+            assert_eq!(
+                geometry.prefix,
+                overview_prefix_geometry(row_geometry(width).label)
+            );
+        }
     }
 
     #[test]
@@ -4527,6 +4664,7 @@ mod tests {
                       use_traced: bool| {
             let backend = TestBackend::new(120, 1);
             let mut terminal = Terminal::new(backend).expect("terminal");
+            let geometry = volume_overview_geometry(120, "/mnt/volume".chars().count());
             terminal
                 .draw(|frame| {
                     draw_overview_row(
@@ -4545,6 +4683,7 @@ mod tests {
                             throughput: 20_000_000.0,
                             iops: 40.0,
                         },
+                        geometry,
                     )
                 })
                 .expect("draw volume row");
@@ -4556,7 +4695,7 @@ mod tests {
         let with_history = render(Some(&history), None, false);
         let without_history = render(None, None, false);
         let with_traces = render(Some(&history), Some(&traced), true);
-        assert!(with_history.contains("/mnt/volu"));
+        assert!(with_history.contains("/mnt/volume"));
         assert!(with_history.contains("25%"));
         assert_ne!(with_history, without_history);
         assert_ne!(with_history, with_traces);
@@ -4569,16 +4708,19 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
-                draw_overview_prefix(
+                draw_overview_prefix_with_geometry(
                     frame,
                     Rect::new(0, 0, 43, 1),
-                    "nvme0n1",
-                    Some(85),
-                    &[100.0],
-                    100.0,
-                    &[10.0],
-                    10.0,
-                    true,
+                    OverviewPrefixRow {
+                        label: "nvme0n1",
+                        free: Some(85),
+                        throughput: &[100.0],
+                        throughput_scale: 100.0,
+                        iops: &[10.0],
+                        iops_scale: 10.0,
+                        selected: true,
+                    },
+                    overview_prefix_geometry(43),
                 );
                 frame.render_widget(Paragraph::new("R"), Rect::new(43, 0, 1, 1));
             })

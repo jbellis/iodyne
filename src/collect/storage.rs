@@ -69,6 +69,17 @@ pub fn resolve_detailed(filesystems: &[FsTick], volumes: &VolumeTick) -> Storage
 /// The row whose `member_disks` contains `device`. When several rows share a
 /// disk, the one with the largest size wins.
 #[allow(dead_code)] // Public selection mapping used by the Volumes UI worktree.
+/// Label a pool row by its root dataset's mount path, falling back to the
+/// shortest mounted dataset path, then the pool name.
+fn zfs_label(pool: &str, filesystems: &[FsTick], indices: &[usize]) -> String {
+    let mounted = || indices.iter().map(|index| &filesystems[*index]);
+    mounted()
+        .find(|fs| fs.device == pool)
+        .or_else(|| mounted().min_by_key(|fs| fs.mount.len()))
+        .map(|fs| fs.mount.clone())
+        .unwrap_or_else(|| pool.to_string())
+}
+
 pub fn volume_for_device<'a>(rows: &'a [VolumeRow], device: &str) -> Option<&'a VolumeRow> {
     rows.iter()
         .filter(|row| row.member_disks.iter().any(|disk| disk == device))
@@ -317,7 +328,7 @@ fn resolve_with_inputs(
             let backing_members = sorted_braced(&leaf_names);
             rows.push(VolumeRow {
                 id: format!("zfs:{}", pool.name),
-                label: format!("zfs:{}", pool.name),
+                label: zfs_label(&pool.name, filesystems, &indices),
                 kind: VolumeKind::ZfsPool,
                 fs_type: "zfs".into(),
                 mounts,
@@ -374,7 +385,7 @@ fn resolve_with_inputs(
             }
             rows.push(VolumeRow {
                 id: format!("zfs:{pool}"),
-                label: format!("zfs:{pool}"),
+                label: zfs_label(&pool, filesystems, &indices),
                 kind: VolumeKind::ZfsPool,
                 fs_type: "zfs".into(),
                 mounts,
@@ -1264,6 +1275,7 @@ mod tests {
         let resolution = resolve_with_inputs(&filesystems, &VolumeTick::default(), &inputs);
         assert_eq!(resolution.rows.len(), 1);
         assert_eq!(resolution.rows[0].id, "zfs:tank");
+        assert_eq!(resolution.rows[0].label, "/tank");
         assert_eq!(resolution.rows[0].mounts, vec!["/tank"]);
         assert_eq!(resolution.rows[0].kind, VolumeKind::ZfsPool);
         assert!(resolution.rows[0]
