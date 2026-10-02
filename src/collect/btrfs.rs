@@ -5,7 +5,13 @@ use std::path::Path;
 
 /// Return every sysfs device name for the btrfs filesystem containing `source`.
 pub fn members(source: &str) -> Option<Vec<String>> {
-    members_in(Path::new("/sys/fs/btrfs"), source)
+    filesystem(source).map(|(_, members)| members)
+}
+
+/// Return the filesystem UUID and every sysfs device name for the filesystem
+/// containing `source`.
+pub fn filesystem(source: &str) -> Option<(String, Vec<String>)> {
+    filesystem_in(Path::new("/sys/fs/btrfs"), source)
 }
 
 /// Resolve a mount source to the kernel block name used by sysfs.
@@ -25,11 +31,11 @@ pub fn kernel_name(device: &str) -> String {
     }
 }
 
-fn members_in(root: &Path, source: &str) -> Option<Vec<String>> {
+fn filesystem_in(root: &Path, source: &str) -> Option<(String, Vec<String>)> {
     let filesystems = std::fs::read_dir(root).ok()?;
-    let mut found = BTreeSet::new();
 
     for filesystem in filesystems.flatten() {
+        let uuid = filesystem.file_name().to_string_lossy().into_owned();
         let devices_path = filesystem.path().join("devices");
         let Ok(entries) = std::fs::read_dir(devices_path) else {
             continue;
@@ -42,11 +48,16 @@ fn members_in(root: &Path, source: &str) -> Option<Vec<String>> {
             })
             .collect();
         if names.iter().any(|name| name == source) {
-            found.extend(names);
+            let members = names
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            return Some((uuid, members));
         }
     }
 
-    (!found.is_empty()).then(|| found.into_iter().collect())
+    None
 }
 
 #[cfg(test)]
@@ -73,14 +84,13 @@ mod tests {
         fs::write(devices.join("sdd"), "").unwrap();
 
         assert_eq!(
-            members_in(&root, "sdc"),
-            Some(vec![
-                "sdc".to_string(),
-                "sdd".to_string(),
-                "sde2".to_string(),
-            ])
+            filesystem_in(&root, "sdc"),
+            Some((
+                "uuid-a".to_string(),
+                vec!["sdc".to_string(), "sdd".to_string(), "sde2".to_string()],
+            ))
         );
-        assert_eq!(members_in(&root, "missing"), None);
+        assert_eq!(filesystem_in(&root, "missing"), None);
 
         fs::remove_dir_all(root).unwrap();
     }

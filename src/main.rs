@@ -211,6 +211,33 @@ fn run_diag() -> Result<()> {
             d.name, d.kind, d.size_bytes, d.used_bytes, d.model, d.smart_ok
         )?;
     }
+    let storage = collect::storage::resolve_detailed(&filesystems, &volumes);
+    writeln!(out, "\n=== Volumes ({}) ===", storage.rows.len())?;
+    for row in &storage.rows {
+        let latency = if row.latency_sources.is_empty() {
+            format!("note={}", row.latency_note.as_deref().unwrap_or("—"))
+        } else {
+            format!("sources={:?}", row.latency_sources)
+        };
+        writeln!(
+            out,
+            "  {} kind={:?} label={:?} mounts={:?} size={} free={} backing={:?} member_disks={:?} counter_sources={:?} latency={} warnings={:?}",
+            row.id,
+            row.kind,
+            row.label,
+            row.mounts,
+            row.size_bytes,
+            row.free_bytes,
+            row.backing,
+            row.member_disks,
+            row.counter_sources,
+            latency,
+            row.warnings
+        )?;
+    }
+    for note in &storage.notes {
+        writeln!(out, "  note: {note}")?;
+    }
     let total: u64 = devices.iter().map(|d| d.size_bytes).sum();
     let used: u64 = devices.iter().map(|d| d.used_bytes).sum();
     let pct = if total > 0 {

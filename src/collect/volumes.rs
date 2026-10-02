@@ -5,6 +5,19 @@ pub struct VolumeTick {
     pub containers: Vec<ApfsContainer>,
     pub mdraid: Vec<MdRaidArray>,
     pub zfs: Vec<ZfsPool>,
+    /// LVM logical volume metadata, sampled on the slow metadata cadence.
+    /// Empty for unprivileged users and hosts without LVM tools.
+    pub lvm: Vec<LvmLogicalVolume>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LvmLogicalVolume {
+    pub vg_name: String,
+    pub lv_name: String,
+    pub pool_lv: Option<String>,
+    pub size_bytes: u64,
+    pub data_percent: Option<f64>,
+    pub metadata_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,6 +220,7 @@ pub fn collect() -> VolumeTick {
         VolumeTick {
             mdraid: linux_mdraid(),
             zfs: linux_zfs(),
+            lvm: linux_lvm(),
             ..VolumeTick::default()
         }
     }
@@ -214,6 +228,86 @@ pub fn collect() -> VolumeTick {
     {
         VolumeTick::default()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_lvm() -> Vec<LvmLogicalVolume> {
+    use std::process::Command;
+
+    if !effective_root() {
+        return Vec::new();
+    }
+    let Ok(output) = Command::new("lvs")
+        .args([
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "vg_name,lv_name,lv_size,pool_lv,data_percent,metadata_percent",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_lvs_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn effective_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let mut values = line.strip_prefix("Uid:")?.split_whitespace();
+                values.nth(1)?.parse::<u32>().ok()
+            })
+        })
+        == Some(0)
+}
+
+fn parse_lvs_json(text: &str) -> Vec<LvmLogicalVolume> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    value
+        .get("report")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|report| report.get("lv").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|lv| {
+            let text = |name: &str| {
+                lv.get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let vg_name = text("vg_name");
+            let lv_name = text("lv_name");
+            if vg_name.is_empty() || lv_name.is_empty() {
+                return None;
+            }
+            let number = |name: &str| text(name).parse::<f64>().ok();
+            Some(LvmLogicalVolume {
+                vg_name,
+                lv_name,
+                size_bytes: number("lv_size").unwrap_or(0.0).max(0.0) as u64,
+                pool_lv: match text("pool_lv") {
+                    value if value.is_empty() => None,
+                    value => Some(value),
+                },
+                data_percent: number("data_percent"),
+                metadata_percent: number("metadata_percent"),
+            })
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -1187,5 +1281,20 @@ optane       3367254360064  84713775104  3282540584960        -         -      0
             "optane"
         );
         assert!(pool_for_dataset("optane-old/Projects", &pools).is_none());
+    }
+
+    #[test]
+    fn parses_lvm_lv_size_and_thin_pool_fill() {
+        let json = r#"{"report":[{"lv":[
+            {"vg_name":"iodynetestvg","lv_name":"root","lv_size":"1073741824.00","pool_lv":"","data_percent":"","metadata_percent":""},
+            {"vg_name":"iodynetestvg","lv_name":"thinpool","lv_size":"2147483648.00","pool_lv":"","data_percent":"81.25","metadata_percent":"79.50"},
+            {"vg_name":"iodynetestvg","lv_name":"thin","lv_size":"4294967296.00","pool_lv":"thinpool","data_percent":"","metadata_percent":""}
+        ]}]}"#;
+        let lvs = parse_lvs_json(json);
+        assert_eq!(lvs.len(), 3);
+        assert_eq!(lvs[0].size_bytes, 1_073_741_824);
+        assert_eq!(lvs[1].data_percent, Some(81.25));
+        assert_eq!(lvs[1].metadata_percent, Some(79.5));
+        assert_eq!(lvs[2].pool_lv.as_deref(), Some("thinpool"));
     }
 }

@@ -290,8 +290,6 @@ fn interval_metrics(
     let time_wrap_modulus_ns = current.time_wrap_modulus_ns;
     let read_bytes_raw = current.bytes_read.saturating_sub(previous.bytes_read);
     let write_bytes_raw = current.bytes_written.saturating_sub(previous.bytes_written);
-    let read_bytes = read_bytes_raw as f64;
-    let write_bytes = write_bytes_raw as f64;
     let read_ops = current.ops_read.saturating_sub(previous.ops_read);
     let write_ops = current.ops_written.saturating_sub(previous.ops_written);
     let read_time = wrapping_time_delta(
@@ -304,38 +302,6 @@ fn interval_metrics(
         previous.total_time_write_ns,
         time_wrap_modulus_ns,
     );
-    let total_ops = read_ops.saturating_add(write_ops);
-
-    let read_request_bytes = if read_ops > 0 {
-        Some(read_bytes / read_ops as f64)
-    } else {
-        None
-    };
-    let write_request_bytes = if write_ops > 0 {
-        Some(write_bytes / write_ops as f64)
-    } else {
-        None
-    };
-    let merge_rates = match (current.merges, previous.merges) {
-        (Some((current_read, current_write)), Some((previous_read, previous_write))) => {
-            MergeRates::Available {
-                read_per_sec: current_read.saturating_sub(previous_read) as f64 / elapsed,
-                write_per_sec: current_write.saturating_sub(previous_write) as f64 / elapsed,
-            }
-        }
-        _ => MergeRates::Unavailable,
-    };
-
-    let queue_depth = match (current.weighted_io_time_ns, previous.weighted_io_time_ns) {
-        (Some(current), Some(previous)) => {
-            let weighted_seconds = wrapping_time_delta(current, previous, time_wrap_modulus_ns)
-                as f64
-                / 1_000_000_000.0;
-            Some(weighted_seconds / elapsed)
-        }
-        _ => None,
-    };
-
     let (read_merges, write_merges) = match (current.merges, previous.merges) {
         (Some((current_read, current_write)), Some((previous_read, previous_write))) => (
             Some(current_read.saturating_sub(previous_read)),
@@ -375,8 +341,8 @@ fn interval_metrics(
         _ => (None, None),
     };
 
-    IntervalMetrics {
-        raw: DeviceIntervalRaw {
+    interval_metrics_from_raw(
+        DeviceIntervalRaw {
             read_bytes: read_bytes_raw,
             write_bytes: write_bytes_raw,
             read_ops,
@@ -393,37 +359,83 @@ fn interval_metrics(
             flush_ops,
             flush_time_ns,
         },
-        read_bps: read_bytes / elapsed,
-        write_bps: write_bytes / elapsed,
-        read_iops: read_ops as f64 / elapsed,
-        write_iops: write_ops as f64 / elapsed,
-        avg_request_bytes: if total_ops > 0 {
-            Some((read_bytes + write_bytes) / total_ops as f64)
-        } else {
-            None
+        elapsed,
+    )
+}
+
+fn interval_metrics_from_raw(raw: DeviceIntervalRaw, elapsed: f64) -> IntervalMetrics {
+    let elapsed = elapsed.max(0.001);
+    let read_bytes = raw.read_bytes as f64;
+    let write_bytes = raw.write_bytes as f64;
+    let read_ops = raw.read_ops;
+    let write_ops = raw.write_ops;
+    let total_ops = read_ops.saturating_add(write_ops);
+    let read_iops = read_ops as f64 / elapsed;
+    let write_iops = write_ops as f64 / elapsed;
+    let read_bps = read_bytes / elapsed;
+    let write_bps = write_bytes / elapsed;
+    let read_request_bytes = (read_ops > 0).then(|| read_bytes / read_ops as f64);
+    let write_request_bytes = (write_ops > 0).then(|| write_bytes / write_ops as f64);
+    let merge_rates = match (raw.read_merges, raw.write_merges) {
+        (Some(read), Some(write)) => MergeRates::Available {
+            read_per_sec: read as f64 / elapsed,
+            write_per_sec: write as f64 / elapsed,
         },
+        _ => MergeRates::Unavailable,
+    };
+    let queue_depth = raw
+        .weighted_io_time_ns
+        .map(|weighted| weighted as f64 / 1_000_000_000.0 / elapsed);
+
+    IntervalMetrics {
+        raw,
+        read_bps,
+        write_bps,
+        read_iops,
+        write_iops,
+        avg_request_bytes: (total_ops > 0).then(|| (read_bytes + write_bytes) / total_ops as f64),
         workload: WorkloadSample {
-            read_iops: read_ops as f64 / elapsed,
-            write_iops: write_ops as f64 / elapsed,
-            read_bps: read_bytes / elapsed,
-            write_bps: write_bytes / elapsed,
+            read_iops,
+            write_iops,
+            read_bps,
+            write_bps,
             read_request_bytes,
             write_request_bytes,
             merge_rates,
         },
         queue_depth,
         await_sample: AwaitSample {
-            read_us: if read_ops > 0 {
-                Some((read_time as f64 / read_ops as f64) / 1_000.0)
-            } else {
-                None
-            },
-            write_us: if write_ops > 0 {
-                Some((write_time as f64 / write_ops as f64) / 1_000.0)
-            } else {
-                None
-            },
+            read_us: (read_ops > 0).then(|| (raw.read_time_ns as f64 / read_ops as f64) / 1_000.0),
+            write_us: (write_ops > 0)
+                .then(|| (raw.write_time_ns as f64 / write_ops as f64) / 1_000.0),
         },
+    }
+}
+
+fn add_interval_raw(total: &mut DeviceIntervalRaw, sample: DeviceIntervalRaw) {
+    total.read_bytes = total.read_bytes.saturating_add(sample.read_bytes);
+    total.write_bytes = total.write_bytes.saturating_add(sample.write_bytes);
+    total.read_ops = total.read_ops.saturating_add(sample.read_ops);
+    total.write_ops = total.write_ops.saturating_add(sample.write_ops);
+    total.read_merges = add_optional(total.read_merges, sample.read_merges);
+    total.write_merges = add_optional(total.write_merges, sample.write_merges);
+    total.read_time_ns = total.read_time_ns.saturating_add(sample.read_time_ns);
+    total.write_time_ns = total.write_time_ns.saturating_add(sample.write_time_ns);
+    total.weighted_io_time_ns = add_optional(total.weighted_io_time_ns, sample.weighted_io_time_ns);
+    total.discard_ops = add_optional(total.discard_ops, sample.discard_ops);
+    total.discard_merges = add_optional(total.discard_merges, sample.discard_merges);
+    total.discard_bytes = add_optional(total.discard_bytes, sample.discard_bytes);
+    total.discard_time_ns = add_optional(total.discard_time_ns, sample.discard_time_ns);
+    total.flush_ops = add_optional(total.flush_ops, sample.flush_ops);
+    total.flush_time_ns = add_optional(total.flush_time_ns, sample.flush_time_ns);
+}
+
+fn add_optional(total: Option<u64>, sample: Option<u64>) -> Option<u64> {
+    match (total, sample) {
+        (Some(total), Some(sample)) => Some(total.saturating_add(sample)),
+        (Some(total), None) => Some(total),
+        (None, Some(sample)) => Some(sample),
+        (None, None) => None,
     }
 }
 
@@ -558,17 +570,65 @@ impl IoCollector {
     }
 
     pub fn sampled_device_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.prev_totals.keys().cloned().collect();
+        let mut names: Vec<_> = self
+            .prev_totals
+            .keys()
+            .filter(|name| is_display_disk(name))
+            .cloned()
+            .collect();
         names.sort();
         names
     }
 
     /// Called from the main loop and rate-limited to the selected cadence.
     /// Replace the Volumes rows whose IO series are maintained.
+    #[allow(dead_code)] // The Volumes view installs rows from its filesystem snapshot.
     pub fn set_volume_rows(&mut self, rows: Vec<super::storage::VolumeRow>) {
+        let previous: HashMap<_, _> = self
+            .volume_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    (row.counter_sources.clone(), row.latency_sources.clone()),
+                )
+            })
+            .collect();
+        let current: HashMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    (row.counter_sources.clone(), row.latency_sources.clone()),
+                )
+            })
+            .collect();
+        for (id, sources) in &current {
+            if previous.get(id) != Some(sources) {
+                self.volume_io.history.remove(id);
+                self.volume_io.traced_history.remove(id);
+                self.volume_io.members.remove(id);
+            }
+            if sources.1.is_empty() {
+                self.volume_io.traced_history.remove(id);
+            }
+        }
+        self.volume_io
+            .history
+            .retain(|id, _| current.contains_key(id));
+        self.volume_io
+            .traced_history
+            .retain(|id, _| current.get(id).is_some_and(|sources| !sources.1.is_empty()));
+        self.volume_io
+            .members
+            .retain(|id, _| current.contains_key(id));
+        self.volume_io
+            .latest
+            .retain(|tick| current.contains_key(&tick.device));
         self.volume_rows = rows;
     }
 
+    #[allow(dead_code)] // UI-facing accessor retained for the separate view worktree.
     pub fn volume_rows(&self) -> &[super::storage::VolumeRow] {
         &self.volume_rows
     }
@@ -585,9 +645,13 @@ impl IoCollector {
         self.last_sample = now;
 
         let totals = self.read_totals();
+        let previous_totals = self.prev_totals.clone();
         let mut new_latest: Vec<IoTick> = Vec::new();
         let mut new_intervals: Vec<DeviceInterval> = Vec::new();
         for (device, t) in &totals {
+            if !is_display_disk(device) {
+                continue;
+            }
             let Some(prev) = self.prev_totals.get(device).copied() else {
                 // Cumulative kernel counters need one baseline observation.
                 // Treating zero as the previous value would render all I/O
@@ -652,6 +716,7 @@ impl IoCollector {
         self.latest_intervals = new_intervals;
         self.prev_totals = totals;
         self.sample_traced_latency();
+        self.sample_volume_io(&previous_totals, elapsed);
         self.sample_hot_files();
         true
     }
@@ -786,6 +851,60 @@ impl IoCollector {
         }
     }
 
+    fn sample_volume_io(&mut self, previous: &HashMap<String, DeviceTotals>, elapsed: f64) {
+        let mut latest = Vec::with_capacity(self.volume_rows.len());
+        let mut members = HashMap::with_capacity(self.volume_rows.len());
+        for row in &self.volume_rows {
+            let mut combined = DeviceIntervalRaw::default();
+            let mut member_ticks = Vec::with_capacity(row.counter_sources.len());
+            for source in &row.counter_sources {
+                let raw = match (self.prev_totals.get(source), previous.get(source)) {
+                    (Some(current), Some(previous)) => {
+                        interval_metrics(*current, *previous, elapsed).raw
+                    }
+                    _ => DeviceIntervalRaw::default(),
+                };
+                add_interval_raw(&mut combined, raw);
+                let metrics = interval_metrics_from_raw(raw, elapsed);
+                member_ticks.push(tick_from_metrics(source.clone(), metrics, None));
+            }
+            let metrics = interval_metrics_from_raw(combined, elapsed);
+            let history = self.volume_io.history.entry(row.id.clone()).or_default();
+            record_history(history, metrics.workload, metrics.await_sample);
+            let tick = tick_from_metrics(row.id.clone(), metrics, Some(history));
+            latest.push(tick);
+            members.insert(row.id.clone(), member_ticks);
+
+            if row.latency_sources.is_empty() {
+                self.volume_io.traced_history.remove(&row.id);
+            } else {
+                let mut sample = TracedLatencySample::default();
+                for source in &row.latency_sources {
+                    if let Some(member) = self
+                        .traced_history
+                        .get(source)
+                        .and_then(|history| history.back())
+                    {
+                        for (total, count) in sample.read.iter_mut().zip(member.read) {
+                            *total = total.saturating_add(count);
+                        }
+                        for (total, count) in sample.write.iter_mut().zip(member.write) {
+                            *total = total.saturating_add(count);
+                        }
+                    }
+                }
+                let history = self
+                    .volume_io
+                    .traced_history
+                    .entry(row.id.clone())
+                    .or_default();
+                push_ring(history, sample, LATENCY_WINDOW);
+            }
+        }
+        self.volume_io.latest = latest;
+        self.volume_io.members = members;
+    }
+
     fn read_totals(&self) -> HashMap<String, DeviceTotals> {
         #[cfg(target_os = "macos")]
         {
@@ -793,7 +912,7 @@ impl IoCollector {
         }
         #[cfg(target_os = "linux")]
         {
-            diskstats_totals_linux()
+            diskstats_totals_linux(&self.volume_rows)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -1365,6 +1484,68 @@ fn block_device_name(device: BlockDeviceId) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
+fn tick_from_metrics(
+    device: String,
+    metrics: IntervalMetrics,
+    history: Option<&DeviceHistory>,
+) -> IoTick {
+    let latency_pct = history.and_then(|history| {
+        (!history.read_us.is_empty() || !history.write_us.is_empty()).then(|| {
+            let (p50_r, p99_r, p999_r) = percentiles(&history.read_us);
+            let (p50_w, p99_w, p999_w) = percentiles(&history.write_us);
+            LatencyPct {
+                p50_r,
+                p99_r,
+                p999_r,
+                p50_w,
+                p99_w,
+                p999_w,
+            }
+        })
+    });
+    let await_sample = metrics.await_sample;
+    let latency_avg = if await_sample.read_us.is_some() || await_sample.write_us.is_some() {
+        Some((
+            await_sample.read_us.unwrap_or(0.0),
+            await_sample.write_us.unwrap_or(0.0),
+        ))
+    } else {
+        None
+    };
+    IoTick {
+        device,
+        bps: metrics.read_bps + metrics.write_bps,
+        split: Some((metrics.read_bps, metrics.write_bps)),
+        iops: metrics.read_iops + metrics.write_iops,
+        iops_split: Some((metrics.read_iops, metrics.write_iops)),
+        avg_request_bytes: metrics.avg_request_bytes,
+        queue_depth: metrics.queue_depth,
+        await_sample,
+        latency_avg,
+        latency_pct,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_display_disk(name: &str) -> bool {
+    let sys_block = std::path::Path::new("/sys/block");
+    if sys_block.is_dir() {
+        sys_block.join(name).exists()
+    } else {
+        !is_partition_name(name)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_display_disk(_name: &str) -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_display_disk(_name: &str) -> bool {
+    true
+}
+
 #[cfg(not(target_os = "linux"))]
 fn block_device_name(_device: BlockDeviceId) -> Option<String> {
     None
@@ -1396,7 +1577,7 @@ fn totals_macos() -> HashMap<String, DeviceTotals> {
 }
 
 #[cfg(target_os = "linux")]
-fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
+fn diskstats_totals_linux(rows: &[super::storage::VolumeRow]) -> HashMap<String, DeviceTotals> {
     let Ok(text) = std::fs::read_to_string("/proc/diskstats") else {
         return HashMap::new();
     };
@@ -1406,17 +1587,30 @@ fn diskstats_totals_linux() -> HashMap<String, DeviceTotals> {
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect::<HashSet<_>>()
     });
-    parse_diskstats_linux(&text, whole_disks.as_ref())
+    let extra_sources: HashSet<String> = rows
+        .iter()
+        .flat_map(|row| row.counter_sources.iter().cloned())
+        .collect();
+    parse_diskstats_linux_with_sources(&text, whole_disks.as_ref(), &extra_sources)
 }
 
 /// Parses Linux `/proc/diskstats`, using `/sys/block` membership as the
 /// authoritative whole-disk rule when available. Partitions appear under their
 /// parent in sysfs, not as top-level `/sys/block` entries; the name heuristic is
 /// retained only as a fallback for environments where sysfs cannot be read.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn parse_diskstats_linux(
     text: &str,
     whole_disks: Option<&HashSet<String>>,
+) -> HashMap<String, DeviceTotals> {
+    parse_diskstats_linux_with_sources(text, whole_disks, &HashSet::new())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_diskstats_linux_with_sources(
+    text: &str,
+    whole_disks: Option<&HashSet<String>>,
+    extra_sources: &HashSet<String>,
 ) -> HashMap<String, DeviceTotals> {
     const SECTOR_BYTES: u64 = 512;
     const MS_TO_NS: u64 = 1_000_000;
@@ -1431,8 +1625,8 @@ fn parse_diskstats_linux(
             continue;
         }
         match whole_disks {
-            Some(disks) if !disks.contains(name) => continue,
-            None if is_partition_name(name) => continue,
+            Some(disks) if !disks.contains(name) && !extra_sources.contains(name) => continue,
+            None if is_partition_name(name) && !extra_sources.contains(name) => continue,
             _ => {}
         }
         let Ok(reads) = fields[3].parse::<u64>() else {
@@ -1590,6 +1784,35 @@ mod tests {
             discards: None,
             flushes: None,
             time_wrap_modulus_ns: None,
+        }
+    }
+
+    fn volume_row(
+        id: &str,
+        counter_sources: &[&str],
+        latency_sources: &[&str],
+    ) -> super::super::storage::VolumeRow {
+        super::super::storage::VolumeRow {
+            id: id.into(),
+            label: id.into(),
+            kind: super::super::storage::VolumeKind::Filesystem,
+            fs_type: "ext4".into(),
+            mounts: vec![format!("/{id}")],
+            size_bytes: 1_000,
+            free_bytes: 500,
+            backing: "test".into(),
+            member_disks: Vec::new(),
+            counter_sources: counter_sources
+                .iter()
+                .map(|source| (*source).into())
+                .collect(),
+            latency_sources: latency_sources
+                .iter()
+                .map(|source| (*source).into())
+                .collect(),
+            latency_note: None,
+            fs_device_ids: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1917,10 +2140,7 @@ mod tests {
     #[test]
     fn userspace_dev_t_decodes_major_and_minor() {
         // glibc makedev(259, 65537)
-        let dev = ((259_u64 & 0xffff_f000) << 32)
-            | ((259_u64 & 0xfff) << 8)
-            | ((65537_u64 & 0xffff_ff00) << 12)
-            | (65537_u64 & 0xff);
+        let dev = ((259_u64 & 0xfff) << 8) | ((65537_u64 & 0xffff_ff00) << 12) | (65537_u64 & 0xff);
         assert_eq!(linux_dev_major(dev), 259);
         assert_eq!(linux_dev_minor(dev), 65537);
     }
@@ -2198,6 +2418,91 @@ mod tests {
     }
 
     #[test]
+    fn volume_io_sums_sources_weights_await_and_keeps_idle_ticks_aligned() {
+        let mut collector = IoCollector::new_for_test();
+        collector.set_volume_rows(vec![volume_row("fs:8:1", &["sda", "sdb"], &["sda", "sdb"])]);
+        let previous = HashMap::from([
+            (
+                "sda".into(),
+                totals(100, 0, 1, 0, 10_000, 0, Some(100_000_000)),
+            ),
+            (
+                "sdb".into(),
+                totals(200, 0, 4, 0, 40_000, 0, Some(200_000_000)),
+            ),
+        ]);
+        collector.prev_totals = HashMap::from([
+            (
+                "sda".into(),
+                totals(200, 0, 3, 0, 30_000, 0, Some(200_000_000)),
+            ),
+            (
+                "sdb".into(),
+                totals(500, 0, 7, 0, 130_000, 0, Some(400_000_000)),
+            ),
+        ]);
+        let mut first_a = TracedLatencySample::default();
+        first_a.read[2] = 3;
+        first_a.write[3] = 4;
+        let mut first_b = TracedLatencySample::default();
+        first_b.read[2] = 5;
+        first_b.write[3] = 6;
+        collector
+            .traced_history
+            .insert("sda".into(), VecDeque::from([first_a]));
+        collector
+            .traced_history
+            .insert("sdb".into(), VecDeque::from([first_b]));
+
+        collector.sample_volume_io(&previous, 2.0);
+        let tick = &collector.volume_io.latest[0];
+        assert_near(tick.bps, 200.0);
+        assert_near(tick.iops, 2.5);
+        assert_near(tick.await_sample.read_us.unwrap(), 22.0);
+        assert_near(tick.queue_depth.unwrap(), 0.15);
+        assert_eq!(collector.volume_io.members["fs:8:1"].len(), 2);
+        assert_near(collector.volume_io.members["fs:8:1"][0].bps, 50.0);
+        assert_eq!(collector.volume_io.traced_history["fs:8:1"][0].read[2], 8);
+        assert_eq!(collector.volume_io.traced_history["fs:8:1"][0].write[3], 10);
+
+        let idle_previous = collector.prev_totals.clone();
+        collector.traced_history.insert(
+            "sda".into(),
+            VecDeque::from([TracedLatencySample::default()]),
+        );
+        collector.traced_history.insert(
+            "sdb".into(),
+            VecDeque::from([TracedLatencySample::default()]),
+        );
+        collector.sample_volume_io(&idle_previous, 2.0);
+        let history = &collector.volume_io.history["fs:8:1"];
+        assert_eq!(history.combined.len(), 2);
+        assert_eq!(history.combined[1], 0.0);
+        assert_eq!(history.await_samples[1], AwaitSample::default());
+        assert_eq!(collector.volume_io.traced_history["fs:8:1"][1].read[2], 0);
+    }
+
+    #[test]
+    fn volume_series_reset_for_new_rows_and_removed_when_rows_disappear() {
+        let mut collector = IoCollector::new_for_test();
+        collector.set_volume_rows(vec![volume_row("old", &["sda"], &[])]);
+        collector.prev_totals = HashMap::from([("sda".into(), totals(10, 0, 1, 0, 10, 0, None))]);
+        let previous = collector.prev_totals.clone();
+        collector.sample_volume_io(&previous, 1.0);
+        assert_eq!(collector.volume_io.history["old"].combined.len(), 1);
+
+        collector.set_volume_rows(Vec::new());
+        assert!(collector.volume_io.history.is_empty());
+        assert!(collector.volume_io.latest.is_empty());
+
+        collector.set_volume_rows(vec![volume_row("new", &["sdb"], &[])]);
+        collector.sample_volume_io(&previous, 1.0);
+        assert!(!collector.volume_io.history.contains_key("old"));
+        assert_eq!(collector.volume_io.history["new"].combined.len(), 1);
+        assert_eq!(collector.volume_io.history["new"].combined[0], 0.0);
+    }
+
+    #[test]
     fn directional_merge_rates_preserve_available_zero() {
         let previous = DeviceTotals {
             merges: Some((10, 20)),
@@ -2326,6 +2631,22 @@ mod tests {
                 "nbd0".to_string(),
             ])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn volume_diskstats_admits_only_requested_partitions() {
+        let whole_disks = HashSet::from(["sda".to_string()]);
+        let extra_sources = HashSet::from(["sda1".to_string()]);
+        let input = concat!(
+            "   8 0 sda 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0\n",
+            "   8 1 sda1 2 0 4 6 8 0 10 12 0 14 16 0 0 0 0\n",
+            "   8 2 sda2 3 0 6 9 12 0 15 18 0 21 24 0 0 0 0\n",
+        );
+        let parsed = parse_diskstats_linux_with_sources(input, Some(&whole_disks), &extra_sources);
+        assert!(parsed.contains_key("sda"));
+        assert!(parsed.contains_key("sda1"));
+        assert!(!parsed.contains_key("sda2"));
     }
 
     #[cfg(target_os = "linux")]
