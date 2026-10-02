@@ -325,9 +325,9 @@ static __inline __attribute__((always_inline)) int vfs_key_for_file(
 
     // Keep the storage view about storage: reject device nodes, PTYs, pipes,
     // sockets, and regular-looking files on anonymous/pseudo filesystems.
+    // ZFS datasets use anonymous dev_t identities, but are real storage.
     if ((mode & S_IFMT) != S_IFREG)
         return -1;
-    // ZFS datasets use anonymous dev_t identities, but are real storage.
     if ((dev >> 20) == 0) {
         unsigned long magic;
         if (bpf_probe_read_kernel(&magic, sizeof(magic),

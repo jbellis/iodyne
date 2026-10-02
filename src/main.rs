@@ -200,7 +200,9 @@ fn run_diag() -> Result<()> {
         latency.vfs_overlay_status()
     )?;
 
-    let devices = collect::devices::collect();
+    let filesystems = collect::filesystems::collect();
+    let volumes = collect::volumes::collect();
+    let devices = collect::devices::collect_with_volumes(&volumes);
     writeln!(out, "\n=== Devices ({}) ===", devices.len())?;
     for d in &devices {
         writeln!(
@@ -218,6 +220,15 @@ fn run_diag() -> Result<()> {
     };
     writeln!(out, "  TOTAL: size={}  used={}  pct={}%", total, used, pct)?;
 
+    writeln!(out, "\n=== ZFS Pools ({}) ===", volumes.zfs.len())?;
+    for pool in &volumes.zfs {
+        writeln!(
+            out,
+            "  {}  health={}  size={}  alloc={}  free={}",
+            pool.name, pool.health, pool.size_bytes, pool.alloc_bytes, pool.free_bytes
+        )?;
+    }
+
     #[cfg(target_os = "macos")]
     {
         writeln!(out, "\n=== container_to_physical map ===")?;
@@ -230,17 +241,18 @@ fn run_diag() -> Result<()> {
         }
     }
 
-    writeln!(
-        out,
-        "\n=== Filesystems ({}) ===",
-        collect::filesystems::collect().len()
-    )?;
-    for m in collect::filesystems::collect() {
+    writeln!(out, "\n=== Filesystems ({}) ===", filesystems.len())?;
+    for m in &filesystems {
         writeln!(
             out,
             "  {} -> {}  ({})  size={}  used={}",
             m.device, m.mount, m.fs_type, m.size_bytes, m.used_bytes
         )?;
+    }
+
+    writeln!(out, "\n=== Topology ===")?;
+    for edge in collect::topology::relationships(&filesystems, &volumes) {
+        writeln!(out, "  {}: {} -> {}", edge.kind, edge.from, edge.to)?;
     }
 
     Ok(())

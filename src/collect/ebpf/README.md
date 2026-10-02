@@ -75,8 +75,9 @@ covering vectored callers that bypass scalar `vfs_read`/`vfs_write`. This does
 not depend on optional internal OverlayFS symbols. `--diag` reports backing
 attribution active whenever the generic iter probes attach.
 
-The probe admits only regular files on filesystems with a nonzero block-device
-major or the ZFS superblock magic (ZFS datasets use anonymous device IDs). Device nodes, PTYs, pipes, sockets, and anonymous pseudo-filesystems are
+The probe admits regular files on filesystems with a nonzero block-device
+major or the ZFS superblock magic (ZFS datasets use anonymous device IDs).
+Device nodes, PTYs, pipes, sockets, and other anonymous pseudo-filesystems are
 excluded before they can consume aggregation-map capacity or presentation rows.
 
 After both count kprobes attach, `security_file_permission` is attached

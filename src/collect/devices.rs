@@ -65,7 +65,16 @@ pub struct DeviceTick {
     pub idle: bool,
 }
 
+#[allow(dead_code)] // Compatibility wrapper for callers without volume metadata.
 pub fn collect() -> Vec<DeviceTick> {
+    collect_with_volumes(&super::VolumeTick::default())
+}
+
+/// Collect devices using the caller's cached volume snapshot for usage
+/// attribution. The TUI refreshes this snapshot at metadata cadence, so a
+/// ZFS CLI process is never spawned on the faster usage refresh.
+pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
+    let _ = volumes;
     #[cfg(not(target_os = "linux"))]
     let mounts_used = sysinfo_mount_used();
 
@@ -118,7 +127,7 @@ pub fn collect() -> Vec<DeviceTick> {
 
     #[cfg(target_os = "linux")]
     {
-        let used_by_device = linux_used_by_device();
+        let used_by_device = linux_used_by_device(volumes);
         let mut out: Vec<DeviceTick> = linux::collect()
             .into_iter()
             .map(|l| {
@@ -156,8 +165,8 @@ pub fn collect() -> Vec<DeviceTick> {
                 }
             })
             .collect();
-        out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-        return out;
+        out.sort_by_key(|device| std::cmp::Reverse(device.size_bytes));
+        out
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -202,14 +211,21 @@ pub fn collect() -> Vec<DeviceTick> {
 ///
 /// On macOS we re-use the cached container→physical map. If the topology
 /// changed (drive plugged in / out) the next full `collect()` picks it up.
+#[allow(dead_code)] // Kept for callers that do not have a cached volume snapshot.
 pub fn refresh_usage(devices: &mut [DeviceTick]) {
+    refresh_usage_with_volumes(devices, &super::VolumeTick::default());
+}
+
+/// Fast usage refresh using the already collected volume state.
+pub fn refresh_usage_with_volumes(devices: &mut [DeviceTick], volumes: &super::VolumeTick) {
+    let _ = volumes;
     // Linux: shared attribution with collect() — a mount's usage lands
     // only on the device(s) it actually lives on. (v0.1.1 summed every
     // mount into every device here, so an 8-disk bcachefs box showed
     // each disk at 266% — issue #4.)
     #[cfg(target_os = "linux")]
     {
-        let used = linux_used_by_device();
+        let used = linux_used_by_device(volumes);
         for d in devices.iter_mut() {
             d.used_bytes = used.get(&d.name).copied().unwrap_or(0);
         }
@@ -245,7 +261,7 @@ pub fn refresh_usage(devices: &mut [DeviceTick]) {
 /// Linux: map whole-disk device names to used bytes, attributing each
 /// mounted filesystem to the device(s) backing it.
 #[cfg(target_os = "linux")]
-fn linux_used_by_device() -> HashMap<String, u64> {
+fn linux_used_by_device(volumes: &super::VolumeTick) -> HashMap<String, u64> {
     let disks = Disks::new_with_refreshed_list();
     // Dedupe by raw mount source first: the same source mounted at
     // several points (bind mounts, btrfs subvolumes, `/` + `/nix/store`)
@@ -262,7 +278,68 @@ fn linux_used_by_device() -> HashMap<String, u64> {
             *entry = used;
         }
     }
-    attribute_sources(&by_source, &sysfs_slaves)
+    let mut out = attribute_sources(&by_source, &sysfs_source_members);
+    for (device, used) in zfs_allocations_by_device(&volumes.zfs) {
+        let entry = out.entry(device).or_insert(0);
+        *entry = entry.saturating_add(used);
+    }
+    out
+}
+
+/// Per-leaf allocation by whole-disk name. Data, log, special, and dedup
+/// allocations count as occupied storage; cache and spare allocations do not.
+fn zfs_allocations_by_device(pools: &[super::volumes::ZfsPool]) -> HashMap<String, u64> {
+    zfs_allocations_by_device_with_members(pools, &stacked_device_members)
+}
+
+fn zfs_allocations_by_device_with_members(
+    pools: &[super::volumes::ZfsPool],
+    stacked_members: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    for pool in pools {
+        for (leaf, allocated) in pool.leaf_allocations() {
+            if matches!(
+                leaf.section,
+                super::volumes::ZfsVdevSection::Cache | super::volumes::ZfsVdevSection::Spare
+            ) {
+                continue;
+            }
+            let members = zfs_leaf_disk_names_with(&leaf.name, stacked_members);
+            let share = allocated / members.len() as u64;
+            let remainder = allocated % members.len() as u64;
+            for (index, member) in members.into_iter().enumerate() {
+                let entry = out.entry(member).or_insert(0u64);
+                *entry = entry.saturating_add(share + u64::from((index as u64) < remainder));
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn zfs_leaf_disk_names(name: &str) -> Vec<String> {
+    zfs_leaf_disk_names_with(name, &stacked_device_members)
+}
+
+fn zfs_leaf_disk_names_with(
+    name: &str,
+    stacked_members: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Vec<String> {
+    let path = if name.starts_with("/dev/") {
+        name.to_string()
+    } else {
+        format!("/dev/{name}")
+    };
+    let mut members = stacked_members(&path)
+        .filter(|members| !members.is_empty())
+        .unwrap_or_else(|| vec![short_name(name)]);
+    members = members
+        .into_iter()
+        .map(|member| short_name(&member))
+        .collect();
+    members.sort();
+    members.dedup();
+    members
 }
 
 /// Attribute per-mount-source used bytes to whole-disk device names.
@@ -272,8 +349,10 @@ fn linux_used_by_device() -> HashMap<String, u64> {
 /// - `/dev/sda:/dev/sdb:...` — bcachefs multi-device → split across members.
 /// - `/dev/md0`, `/dev/mapper/vg-lv` — stacked devices → resolved to their
 ///   member disks via `slaves`.
+/// - Btrfs sources — statfs usage split across all member whole disks.
 /// - `overlay`, `tmpfs`, ZFS datasets — no `/dev/` source → attributed to
-///   nothing rather than to everything.
+///   nothing rather than to everything. ZFS leaf allocation comes from the
+///   separately cached `zpool list` snapshot.
 ///
 /// statfs totals are filesystem-wide, so a filesystem spanning N disks is
 /// split evenly — per-member truth isn't knowable from statfs alone.
@@ -296,6 +375,7 @@ fn attribute_sources(
                 Some(m) if !m.is_empty() => m,
                 _ => vec![short_name(piece)],
             })
+            .map(|member| short_name(&member))
             .collect();
         members.sort();
         members.dedup();
@@ -348,6 +428,43 @@ fn sysfs_slaves(dev_path: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     expand(&kernel_name, 4, &mut out);
     Some(out)
+}
+
+pub(crate) fn stacked_device_members(name: &str) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = if name.starts_with("/dev/") {
+            name.to_string()
+        } else {
+            format!("/dev/{name}")
+        };
+        sysfs_slaves(&path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Resolve btrfs peers first, then expand any stacked peer through its slaves.
+#[cfg(target_os = "linux")]
+fn sysfs_source_members(dev_path: &str) -> Option<Vec<String>> {
+    let source = super::btrfs::kernel_name(dev_path);
+    if let Some(members) = super::btrfs::members(&source) {
+        let mut out = Vec::new();
+        for member in members {
+            if let Some(slaves) = sysfs_slaves(&format!("/dev/{member}")) {
+                out.extend(slaves);
+            } else {
+                out.push(member);
+            }
+        }
+        out.sort();
+        out.dedup();
+        return Some(out);
+    }
+    sysfs_slaves(dev_path)
 }
 
 /// Returns (physical-or-container-disk, used_bytes) per sysinfo mount,
@@ -492,6 +609,140 @@ mod tests {
         assert_eq!(out.get("sdc"), Some(&1_000_000));
         assert_eq!(out.get("nvme0n1"), Some(&5_000));
         assert_eq!(out.get("md0"), None);
+    }
+
+    #[test]
+    fn btrfs_usage_splits_across_member_whole_disks() {
+        let btrfs_members = |dev: &str| -> Option<Vec<String>> {
+            (dev == "/dev/sdc").then(|| vec!["sdc".into(), "sdd".into(), "sde2".into()])
+        };
+        let by_source = sources(&[("/dev/sdc", 3_000)]);
+        let out = attribute_sources(&by_source, &btrfs_members);
+
+        assert_eq!(out.get("sdc"), Some(&1_000));
+        assert_eq!(out.get("sdd"), Some(&1_000));
+        assert_eq!(out.get("sde"), Some(&1_000));
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn zfs_allocations_sum_leaf_usage_and_skip_cache_and_spares() {
+        use super::super::volumes::{ZfsPool, ZfsVdev, ZfsVdevSection};
+
+        let pool = ZfsPool {
+            name: "tank".into(),
+            vdevs: vec![
+                ZfsVdev {
+                    name: "sdc1".into(),
+                    alloc_bytes: Some(100),
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "sdc2".into(),
+                    alloc_bytes: Some(200),
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "log0".into(),
+                    alloc_bytes: Some(10),
+                    section: ZfsVdevSection::Log,
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "special0".into(),
+                    alloc_bytes: Some(20),
+                    section: ZfsVdevSection::Special,
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "dedup0".into(),
+                    alloc_bytes: Some(30),
+                    section: ZfsVdevSection::Dedup,
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "cache0".into(),
+                    alloc_bytes: Some(300),
+                    section: ZfsVdevSection::Cache,
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "spare0".into(),
+                    alloc_bytes: Some(400),
+                    section: ZfsVdevSection::Spare,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = zfs_allocations_by_device(&[pool]);
+        assert_eq!(out.get("sdc"), Some(&300));
+        assert_eq!(out.get("log0"), Some(&10));
+        assert_eq!(out.get("special0"), Some(&20));
+        assert_eq!(out.get("dedup0"), Some(&30));
+        assert_eq!(out.get("cache0"), None);
+        assert_eq!(out.get("spare0"), None);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn zfs_group_allocations_are_assigned_to_leaves_and_stacked_disks() {
+        use super::super::volumes::{ZfsPool, ZfsVdev};
+
+        let pool = ZfsPool {
+            name: "tank".into(),
+            vdevs: vec![
+                ZfsVdev {
+                    name: "mirror-0".into(),
+                    vdev_type: "mirror".into(),
+                    alloc_bytes: Some(120),
+                    children: vec![
+                        ZfsVdev {
+                            name: "dm-0".into(),
+                            ..Default::default()
+                        },
+                        ZfsVdev {
+                            name: "sdd1".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ZfsVdev {
+                    name: "raidz1-0".into(),
+                    vdev_type: "raidz".into(),
+                    alloc_bytes: Some(302),
+                    children: vec![
+                        ZfsVdev {
+                            name: "sde1".into(),
+                            ..Default::default()
+                        },
+                        ZfsVdev {
+                            name: "sdf1".into(),
+                            ..Default::default()
+                        },
+                        ZfsVdev {
+                            name: "sdg1".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let members = |path: &str| (path == "/dev/dm-0").then(|| vec!["sdc".into(), "sdb".into()]);
+        let out = zfs_allocations_by_device_with_members(&[pool], &members);
+
+        // A mirror group's 120 bytes apply to each leaf; the dm leaf's bytes
+        // are split across its underlying physical members.
+        assert_eq!(out.get("sdb"), Some(&60));
+        assert_eq!(out.get("sdc"), Some(&60));
+        assert_eq!(out.get("sdd"), Some(&120));
+        // RAIDZ's raw 302 bytes are distributed evenly, including remainder.
+        assert_eq!(out.get("sde"), Some(&101));
+        assert_eq!(out.get("sdf"), Some(&101));
+        assert_eq!(out.get("sdg"), Some(&100));
     }
 
     #[test]

@@ -24,7 +24,9 @@ use crate::app::{App, DetailTab, LiveState};
 use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
 use crate::collect::io::{DeviceHistory, VfsActivitySource, VfsFileActivity};
 use crate::collect::smart::{AtaAttr, SmartTick};
-use crate::collect::volumes::{ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick};
+use crate::collect::volumes::{
+    ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick, ZfsPool, ZfsVdev, ZfsVdevSection,
+};
 use crate::collect::{
     AwaitSample, DeviceTick, FsTick, IoTick, MergeRates, TracedLatencySample, WorkloadSample,
 };
@@ -54,17 +56,17 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let md_state = md_exception_summary(&app.volumes.mdraid);
+    let volume_state = volume_exception_summary(&app.volumes);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(md_state.is_some() as u16),
+            Constraint::Length(volume_state.is_some() as u16),
             Constraint::Min(1),
         ])
         .split(area);
 
-    if let Some(state) = md_state {
-        draw_md_exception(f, rows[0], &state);
+    if let Some(state) = volume_state {
+        draw_volume_exception(f, rows[0], &state);
     }
     draw_master_detail(f, rows[1], app);
 }
@@ -483,7 +485,7 @@ fn draw_no_mounted_io(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_md_exception(f: &mut Frame, area: Rect, summary: &str) {
+fn draw_volume_exception(f: &mut Frame, area: Rect, summary: &str) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -494,6 +496,33 @@ fn draw_md_exception(f: &mut Frame, area: Rect, summary: &str) {
         )),
         area,
     );
+}
+
+fn volume_exception_summary(volumes: &VolumeTick) -> Option<String> {
+    let summaries: Vec<_> = [
+        md_exception_summary(&volumes.mdraid),
+        zfs_exception_summary(&volumes.zfs),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!summaries.is_empty()).then(|| summaries.join(" · "))
+}
+
+fn zfs_exception_summary(pools: &[ZfsPool]) -> Option<String> {
+    let exceptions: Vec<_> = pools
+        .iter()
+        .filter(|pool| !pool.health.eq_ignore_ascii_case("ONLINE"))
+        .map(|pool| {
+            let health = if pool.health.is_empty() {
+                "UNKNOWN"
+            } else {
+                &pool.health
+            };
+            format!("ZFS {} {health}", pool.name)
+        })
+        .collect();
+    (!exceptions.is_empty()).then(|| exceptions.join(" · "))
 }
 
 fn md_exception_summary(arrays: &[MdRaidArray]) -> Option<String> {
@@ -2008,6 +2037,17 @@ fn hot_files_for_fs_devices<'a>(
     filtered
 }
 
+fn filesystems_for_io_device<'a>(
+    device: &str,
+    filesystems: &'a [FsTick],
+    volumes: &VolumeTick,
+) -> Vec<&'a FsTick> {
+    filesystems
+        .iter()
+        .filter(|fs| mount_label_for_device_with_volumes(fs, device, volumes).is_some())
+        .collect()
+}
+
 fn filesystem_free_pct(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> Option<u32> {
     attributable_filesystems(device, filesystems, volumes)
         .into_iter()
@@ -2027,7 +2067,7 @@ fn filesystem_device_ids_for_io(
     filesystems: &[FsTick],
     volumes: &VolumeTick,
 ) -> HashSet<(u32, u32)> {
-    attributable_filesystems(device, filesystems, volumes)
+    filesystems_for_io_device(device, filesystems, volumes)
         .into_iter()
         .filter_map(|fs| std::fs::metadata(&fs.mount).ok())
         .map(|metadata| {
@@ -2363,21 +2403,125 @@ fn detail_header(device: &str, filesystems: &[FsTick], volumes: &VolumeTick) -> 
 }
 
 fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
-    if fs.fs_type == "zfs" {
-        if let Some(pool) = volumes.zfs_pool_for_source(&fs.device) {
-            return format!(
-                "{} → {} (ZFS {}) → {{{}}}",
-                fs.mount,
-                fs.device,
-                pool.state,
-                pool.members
-                    .iter()
-                    .map(|m| disk_name(m))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+    if fs.fs_type.eq_ignore_ascii_case("zfs") {
+        if let Some(pool) = crate::collect::volumes::pool_for_dataset(&fs.device, &volumes.zfs) {
+            return topology_chain_with_zfs_pool(device, fs, pool);
         }
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        let source = resolved_block_name(&fs.device);
+        if let Some(members) = crate::collect::btrfs::members(&source) {
+            let members = expand_btrfs_members(&members, &sysfs_stacked_members);
+            return topology_chain_with_btrfs_members(device, fs, volumes, Some(&members));
+        }
+    }
+    topology_chain_with_btrfs_members(device, fs, volumes, None)
+}
+
+fn topology_chain_with_zfs_pool(device: &str, fs: &FsTick, pool: &ZfsPool) -> String {
+    topology_chain_with_zfs_pool_and_members(
+        device,
+        fs,
+        pool,
+        &crate::collect::devices::zfs_leaf_disk_names,
+    )
+}
+
+fn topology_chain_with_zfs_pool_and_members(
+    device: &str,
+    fs: &FsTick,
+    pool: &ZfsPool,
+    zfs_member_disks: &dyn Fn(&str) -> Vec<String>,
+) -> String {
+    let health = if pool.health.is_empty() || pool.health.eq_ignore_ascii_case("ONLINE") {
+        String::new()
+    } else {
+        format!(" [{}]", pool.health)
+    };
+    let vdevs = pool
+        .vdevs
+        .iter()
+        .map(|vdev| {
+            let section = match vdev.section {
+                ZfsVdevSection::Data => "",
+                ZfsVdevSection::Log => "log ",
+                ZfsVdevSection::Cache => "cache ",
+                ZfsVdevSection::Spare => "spare ",
+                ZfsVdevSection::Special => "special ",
+                ZfsVdevSection::Dedup => "dedup ",
+            };
+            format!(
+                "{section}{}",
+                format_zfs_vdev(vdev, device, zfs_member_disks)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if vdevs.is_empty() {
+        format!("{} → zfs {}{}", fs.mount, pool.name, health)
+    } else {
+        format!("{} → zfs {}{} {{{vdevs}}}", fs.mount, pool.name, health)
+    }
+}
+
+fn format_zfs_vdev(
+    vdev: &ZfsVdev,
+    selected: &str,
+    zfs_member_disks: &dyn Fn(&str) -> Vec<String>,
+) -> String {
+    let state = if vdev.health.is_empty() || vdev.health.eq_ignore_ascii_case("ONLINE") {
+        String::new()
+    } else {
+        format!(" [{}]", vdev.health)
+    };
+    if vdev.children.is_empty() {
+        let physical_members = zfs_member_disks(&vdev.name);
+        let stacked = physical_members
+            .iter()
+            .any(|member| whole_disk_name(member) != whole_disk_name(&vdev.name));
+        if stacked {
+            let members = physical_members
+                .iter()
+                .map(|member| {
+                    let marker = if whole_disk_name(member) == disk_name(selected) {
+                        " (selected)"
+                    } else {
+                        ""
+                    };
+                    format!("{member}{marker}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            return format!("{} {{{members}}}{state}", vdev.name);
+        }
+        let marker = if physical_members
+            .iter()
+            .any(|member| whole_disk_name(member) == disk_name(selected))
+        {
+            " (selected)"
+        } else {
+            ""
+        };
+        return format!("{}{marker}{state}", vdev.name);
+    }
+
+    let children = vdev
+        .children
+        .iter()
+        .map(|child| format_zfs_vdev(child, selected, zfs_member_disks))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{} {{{children}}}{state}", vdev.name)
+}
+
+fn topology_chain_with_btrfs_members(
+    device: &str,
+    fs: &FsTick,
+    volumes: &VolumeTick,
+    btrfs_members: Option<&[String]>,
+) -> String {
     let source = disk_name(&fs.device);
     if let Some(array) = md_array_for_source(source, &volumes.mdraid) {
         let array_label = if array.level.is_empty() {
@@ -2405,6 +2549,14 @@ fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
         return nodes.join(" → ");
     }
 
+    if let Some(members) = btrfs_members {
+        return format!(
+            "{} → btrfs {{{}}}",
+            fs.mount,
+            format_btrfs_members(members, device)
+        );
+    }
+
     let mut nodes = vec![fs.mount.clone(), source.to_string()];
     let resolved = resolved_block_name(&fs.device);
     if resolved != source {
@@ -2416,6 +2568,41 @@ fn topology_chain(device: &str, fs: &FsTick, volumes: &VolumeTick) -> String {
     }
     nodes.dedup();
     nodes.join(" → ")
+}
+
+fn format_btrfs_members(members: &[String], selected: &str) -> String {
+    let mut members = members.to_vec();
+    members.sort();
+    members.dedup();
+    members
+        .iter()
+        .map(|member| {
+            let name = disk_name(member);
+            let marker = if whole_disk_name(name) == disk_name(selected) {
+                " (selected)"
+            } else {
+                ""
+            };
+            format!("{name}{marker}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn expand_btrfs_members(
+    members: &[String],
+    stacked_members: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for member in members {
+        match stacked_members(member) {
+            Some(stacked) if !stacked.is_empty() => expanded.extend(stacked),
+            _ => expanded.push(member.clone()),
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    expanded
 }
 
 fn format_md_members(members: &[MdRaidMember], selected: &str) -> String {
@@ -2467,16 +2654,21 @@ fn attributable_filesystems<'a>(
     filesystems: &'a [FsTick],
     volumes: &VolumeTick,
 ) -> Vec<&'a FsTick> {
+    attributable_filesystems_with_mount_label(device, filesystems, volumes, &|fs, io_device| {
+        mount_label_for_device_with_volumes(fs, io_device, volumes)
+    })
+}
+
+fn attributable_filesystems_with_mount_label<'a>(
+    device: &str,
+    filesystems: &'a [FsTick],
+    volumes: &VolumeTick,
+    mount_label: &dyn Fn(&FsTick, &str) -> Option<String>,
+) -> Vec<&'a FsTick> {
     filesystems
         .iter()
         .filter(|fs| {
-            (fs.fs_type == "zfs"
-                && volumes.zfs_pool_for_source(&fs.device).is_some_and(|pool| {
-                    pool.members
-                        .iter()
-                        .any(|member| whole_disk_name(disk_name(member)) == disk_name(device))
-                }))
-                || direct_mount_label_for_device(fs, device).is_some()
+            direct_mount_label_for_device(fs, device).is_some()
                 || md_array_for_source(disk_name(&fs.device), &volumes.mdraid).is_some_and(
                     |array| {
                         disk_name(&array.name) == disk_name(device)
@@ -2485,7 +2677,7 @@ fn attributable_filesystems<'a>(
                 )
                 || apfs_container_for_source(disk_name(&fs.device), &volumes.containers)
                     .is_some_and(|container| apfs_container_contains_device(container, device))
-                || mount_label_for_device(fs, device).is_some()
+                || mount_label(fs, device).is_some()
         })
         .collect()
 }
@@ -2557,7 +2749,7 @@ fn device_and_filesystem_facts(
     let mut seen = HashSet::new();
     let (free, total) = filesystems
         .iter()
-        .filter(|fs| fs.size_bytes > 0 && fs.fs_type != "zfs")
+        .filter(|fs| fs.size_bytes > 0 && !fs.fs_type.eq_ignore_ascii_case("zfs"))
         .filter(|fs| {
             seen.insert(format!(
                 "{}:{}:{}",
@@ -2656,8 +2848,84 @@ fn mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
         return Some(label);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let source = resolved_block_name(&fs.device);
+        if let Some(members) = crate::collect::btrfs::members(&source) {
+            if let Some(label) = mount_label_for_btrfs_members(fs, io_device, &members) {
+                return Some(label);
+            }
+            if let Some(label) = mount_label_for_btrfs_stacked_member(fs, io_device, &members) {
+                return Some(label);
+            }
+        }
+    }
+
     let stacked = stacked_members(&fs.device)?;
     mount_label_for_device_with_members(fs, io_device, &stacked)
+}
+
+fn mount_label_for_device_with_volumes(
+    fs: &FsTick,
+    io_device: &str,
+    volumes: &VolumeTick,
+) -> Option<String> {
+    mount_label_for_device_with_volumes_and_zfs_members(
+        fs,
+        io_device,
+        volumes,
+        &crate::collect::devices::zfs_leaf_disk_names,
+    )
+}
+
+fn mount_label_for_device_with_volumes_and_zfs_members(
+    fs: &FsTick,
+    io_device: &str,
+    volumes: &VolumeTick,
+    zfs_member_disks: &dyn Fn(&str) -> Vec<String>,
+) -> Option<String> {
+    if fs.fs_type.eq_ignore_ascii_case("zfs") {
+        let pool = crate::collect::volumes::pool_for_dataset(&fs.device, &volumes.zfs)?;
+        let io = whole_disk_name(disk_name(io_device));
+        return pool
+            .leaf_vdevs()
+            .iter()
+            .any(|(leaf, _)| {
+                zfs_member_disks(&leaf.name)
+                    .iter()
+                    .any(|member| whole_disk_name(member) == io)
+            })
+            .then(|| fs.mount.clone());
+    }
+    mount_label_for_device(fs, io_device)
+}
+
+fn mount_label_for_btrfs_members(
+    fs: &FsTick,
+    io_device: &str,
+    members: &[String],
+) -> Option<String> {
+    let io = whole_disk_name(disk_name(io_device));
+    members
+        .iter()
+        .any(|member| whole_disk_name(disk_name(member)) == io)
+        .then(|| fs.mount.clone())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_label_for_btrfs_stacked_member(
+    fs: &FsTick,
+    io_device: &str,
+    members: &[String],
+) -> Option<String> {
+    let io = whole_disk_name(disk_name(io_device));
+    members.iter().find_map(|member| {
+        let stacked = sysfs_stacked_members(member)?;
+        stacked
+            .iter()
+            .any(|name| whole_disk_name(name) == io)
+            .then(|| format!("{} via {}", fs.mount, disk_name(member)))
+    })
 }
 
 fn direct_mount_label_for_device(fs: &FsTick, io_device: &str) -> Option<String> {
@@ -2820,6 +3088,7 @@ fn whole_disk_name(device: &str) -> &str {
 mod tests {
     use super::*;
     use crate::collect::ebpf::BlockDeviceId;
+    use crate::collect::volumes::{ZfsPool, ZfsVdev};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2934,6 +3203,166 @@ mod tests {
             .collect();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].mount, "/mnt/optane");
+    }
+
+    #[test]
+    fn btrfs_member_mount_is_plain_and_header_lists_all_members() {
+        let filesystems = vec![fs("/dev/sdc", "/mnt/optane")];
+        let volumes = VolumeTick::default();
+        let members = vec!["sdc".into(), "sdd".into(), "sde2".into()];
+
+        assert_eq!(
+            mount_label_for_btrfs_members(&filesystems[0], "sdd", &members),
+            Some("/mnt/optane".to_string())
+        );
+        let attributed = attributable_filesystems_with_mount_label(
+            "sdd",
+            &filesystems,
+            &volumes,
+            &|fs, device| mount_label_for_btrfs_members(fs, device, &members),
+        );
+        assert_eq!(attributed.len(), 1);
+
+        let members = vec!["sdc".into(), "sdd".into(), "sde2".into(), "dm-0".into()];
+        let expanded = expand_btrfs_members(&members, &|member| {
+            (member == "dm-0").then(|| vec!["sdf".into()])
+        });
+        assert_eq!(
+            topology_chain_with_btrfs_members("sde", &filesystems[0], &volumes, Some(&expanded)),
+            "/mnt/optane → btrfs {sdc,sdd,sde2 (selected),sdf}"
+        );
+    }
+
+    fn zfs_test_pool(health: &str) -> ZfsPool {
+        ZfsPool {
+            name: "optane".into(),
+            health: health.into(),
+            vdevs: vec![ZfsVdev {
+                name: "mirror-0".into(),
+                children: vec![
+                    ZfsVdev {
+                        name: "sdc1".into(),
+                        ..Default::default()
+                    },
+                    ZfsVdev {
+                        name: "sdd1".into(),
+                        ..Default::default()
+                    },
+                    ZfsVdev {
+                        name: "sde2".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zfs_pool_mounts_are_attributed_and_header_keeps_vdev_groups() {
+        let filesystems = vec![FsTick {
+            fs_type: "zfs".into(),
+            ..fs("optane/Projects", "/mnt/optane")
+        }];
+        let volumes = VolumeTick {
+            zfs: vec![zfs_test_pool("ONLINE")],
+            ..VolumeTick::default()
+        };
+
+        assert_eq!(
+            mount_label_for_device_with_volumes(&filesystems[0], "sdc", &volumes),
+            Some("/mnt/optane".into())
+        );
+        assert_eq!(
+            mount_label_for_device_with_volumes(&filesystems[0], "sde", &volumes),
+            Some("/mnt/optane".into())
+        );
+        assert_eq!(
+            detail_header("sdd", &filesystems, &volumes),
+            " sdd | /mnt/optane → zfs optane {mirror-0 {sdc1,sdd1 (selected),sde2}} "
+        );
+        assert_eq!(zfs_exception_summary(&volumes.zfs), None);
+
+        let degraded = vec![zfs_test_pool("DEGRADED")];
+        assert_eq!(
+            zfs_exception_summary(&degraded),
+            Some("ZFS optane DEGRADED".into())
+        );
+    }
+
+    #[test]
+    fn zfs_stacked_leaf_attributes_and_renders_physical_members() {
+        let fs = FsTick {
+            fs_type: "zfs".into(),
+            ..fs("tank/Projects", "/mnt/tank")
+        };
+        let pool = ZfsPool {
+            name: "tank".into(),
+            health: "ONLINE".into(),
+            vdevs: vec![ZfsVdev {
+                name: "mirror-0".into(),
+                children: vec![
+                    ZfsVdev {
+                        name: "dm-0".into(),
+                        ..Default::default()
+                    },
+                    ZfsVdev {
+                        name: "sdb1".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let volumes = VolumeTick {
+            zfs: vec![pool.clone()],
+            ..VolumeTick::default()
+        };
+        let members = |name: &str| match name {
+            "dm-0" => vec!["sdc".into(), "sdd".into()],
+            "sdb1" => vec!["sdb".into()],
+            _ => Vec::new(),
+        };
+
+        assert_eq!(
+            mount_label_for_device_with_volumes_and_zfs_members(&fs, "sdc", &volumes, &members,),
+            Some("/mnt/tank".into())
+        );
+        assert_eq!(
+            topology_chain_with_zfs_pool_and_members("sdc", &fs, &pool, &members),
+            "/mnt/tank → zfs tank {mirror-0 {dm-0 {sdc (selected),sdd},sdb1}}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zfs_pool_member_vfs_filter_includes_dataset_device_id() {
+        let mount = std::env::temp_dir();
+        let metadata = std::fs::metadata(&mount).expect("temporary directory metadata");
+        let dev = metadata.dev();
+        let (major, minor) = (linux_dev_major(dev), linux_dev_minor(dev));
+        let filesystems = vec![FsTick {
+            mount: mount.to_string_lossy().into_owned(),
+            device: "optane/Projects".into(),
+            fs_type: "zfs".into(),
+            size_bytes: 0,
+            used_bytes: 0,
+            avail_bytes: 0,
+            inode_pct: None,
+            is_removable: false,
+            is_system: false,
+        }];
+        let volumes = VolumeTick {
+            zfs: vec![zfs_test_pool("ONLINE")],
+            ..VolumeTick::default()
+        };
+        let device_ids = filesystem_device_ids_for_io("sdc", &filesystems, &volumes);
+        let event = hot_file(major, minor, 100.0, 0.0);
+
+        assert!(device_ids.contains(&(major, minor)));
+        assert_eq!(hot_files_for_fs_devices(&[event], &device_ids).len(), 1);
     }
 
     #[test]
@@ -3118,36 +3547,6 @@ mod tests {
     }
 
     #[test]
-    fn zfs_members_show_dataset_mounts_and_vfs_identities() {
-        let mut dataset = fs("tank/Projects", "/");
-        dataset.fs_type = "zfs".into();
-        let filesystems = vec![dataset];
-        let volumes = VolumeTick {
-            zfs: vec![crate::collect::volumes::ZfsPool {
-                name: "tank".into(),
-                state: "ONLINE".into(),
-                members: vec!["/dev/sdb1".into(), "/dev/nvme1n1p1".into()],
-            }],
-            ..Default::default()
-        };
-        for device in ["sdb", "nvme1n1"] {
-            assert!(io_device_is_mounted(device, &filesystems, &volumes));
-            assert!(detail_header(device, &filesystems, &volumes)
-                .contains("tank/Projects (ZFS ONLINE)"));
-            #[cfg(target_os = "linux")]
-            assert!(!filesystem_device_ids_for_io(device, &filesystems, &volumes).is_empty());
-        }
-        assert!(!io_device_is_mounted("sdc", &filesystems, &volumes));
-        let edges = crate::collect::topology::relationships(&filesystems, &volumes);
-        assert!(edges
-            .iter()
-            .any(|e| e.kind == "zfs_dataset_of" && e.from == "tank/Projects" && e.to == "tank"));
-        assert!(edges
-            .iter()
-            .any(|e| e.kind == "zfs_member_of" && e.from == "sdb1" && e.to == "tank"));
-    }
-
-    #[test]
     fn free_space_uses_least_free_attributable_mounted_filesystem() {
         let filesystems = vec![
             fs_usage("/dev/sda1", "/", 40, 100),
@@ -3160,6 +3559,30 @@ mod tests {
         assert_eq!(filesystem_free_pct("sda", &filesystems, &volumes), Some(15));
         assert_eq!(filesystem_free_pct("sdb", &filesystems, &volumes), Some(1));
         assert_eq!(filesystem_free_pct("sdc", &filesystems, &volumes), None);
+    }
+
+    #[test]
+    fn zfs_free_space_uses_least_free_dataset_without_summing_shared_capacity() {
+        let filesystems = vec![
+            FsTick {
+                fs_type: "zfs".into(),
+                ..fs_usage("optane/Projects", "/mnt/projects", 200, 1_000)
+            },
+            FsTick {
+                fs_type: "zfs".into(),
+                ..fs_usage("optane/Archive", "/mnt/archive", 900, 1_000)
+            },
+        ];
+        let volumes = VolumeTick {
+            zfs: vec![zfs_test_pool("ONLINE")],
+            ..VolumeTick::default()
+        };
+
+        assert_eq!(filesystem_free_pct("sdc", &filesystems, &volumes), Some(10));
+        let dataset_refs: Vec<_> = filesystems.iter().collect();
+        let facts = device_and_filesystem_facts(None, &dataset_refs).unwrap();
+        assert_eq!(facts, " zfs");
+        assert!(!facts.contains("free /"));
     }
 
     #[test]

@@ -193,7 +193,9 @@ struct BucketBounds {
 }
 
 fn collect_inventory(interval: Duration, collector: &IoCollector) -> Inventory {
-    let mut devices: Vec<_> = collect::devices::collect()
+    let filesystems = collect::filesystems::collect();
+    let volumes = collect::volumes::collect();
+    let mut devices: Vec<_> = collect::devices::collect_with_volumes(&volumes)
         .into_iter()
         .map(device_inventory)
         .collect();
@@ -218,8 +220,6 @@ fn collect_inventory(interval: Duration, collector: &IoCollector) -> Inventory {
         });
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
-    let filesystems = collect::filesystems::collect();
-    let volumes = collect::volumes::collect();
     let mut mounts: Vec<_> = filesystems.iter().map(mount_inventory).collect();
     mounts.sort_by(|a, b| a.path.cmp(&b.path).then(a.source.cmp(&b.source)));
     Inventory {
@@ -810,6 +810,25 @@ mod tests {
         assert_eq!(inventory.latency_bucket_bounds_us[0].lower_us, 0);
         assert_eq!(inventory.latency_bucket_bounds_us[0].upper_us, Some(2));
         assert_eq!(inventory.latency_bucket_bounds_us[31].upper_us, None);
+    }
+
+    #[test]
+    fn inventory_keeps_schema_version_one_without_device_usage() {
+        let device = DeviceInventory {
+            id: "8:0".into(),
+            name: "sda".into(),
+            major: Some(8),
+            minor: Some(0),
+            kind: "ssd",
+            model: None,
+            bus: None,
+            size_bytes: 1_000,
+            removable: false,
+        };
+
+        let encoded = serde_json::to_value(device).unwrap();
+        assert_eq!(SCHEMA_VERSION, 1);
+        assert!(encoded.get("used_bytes").is_none());
     }
 
     #[test]

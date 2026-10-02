@@ -95,9 +95,9 @@ impl App {
     fn new(sample_interval: Duration, remaining_intervals: Option<u64>) -> Self {
         let settings = Settings::load();
         set_unit_mode(settings.unit_mode);
-        let devices = collect::devices::collect();
         let filesystems = collect::filesystems::collect();
         let volumes = collect::volumes::collect();
+        let devices = collect::devices::collect_with_volumes(&volumes);
         let mut io = collect::IoCollector::new();
         io.prime();
         let mut cpu_system = System::new();
@@ -225,13 +225,13 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
         let mut last_metadata_refresh = Instant::now();
         loop {
             if last_usage_refresh.elapsed() >= USAGE_REFRESH_INTERVAL {
-                collect::devices::refresh_usage(&mut devices);
+                collect::devices::refresh_usage_with_volumes(&mut devices, &volumes);
                 filesystems = collect::filesystems::collect();
                 last_usage_refresh = Instant::now();
             }
             if last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
-                devices = collect::devices::collect();
                 volumes = collect::volumes::collect();
+                devices = collect::devices::collect_with_volumes(&volumes);
                 last_metadata_refresh = Instant::now();
             }
             smart.refresh_if_due(&devices);

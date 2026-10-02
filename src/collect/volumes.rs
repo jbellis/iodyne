@@ -1,4 +1,4 @@
-//! Volume topology: APFS containers, Linux mdraid arrays, and ZFS pools.
+//! Volumes collector — APFS containers (macOS), mdraid and ZFS on Linux.
 
 #[derive(Debug, Clone, Default)]
 pub struct VolumeTick {
@@ -10,74 +10,128 @@ pub struct VolumeTick {
 #[derive(Debug, Clone, Default)]
 pub struct ZfsPool {
     pub name: String,
-    pub state: String,
-    /// Resolved block-device paths, including log/cache/spare devices.
-    pub members: Vec<String>,
+    pub health: String,
+    pub size_bytes: u64,
+    pub alloc_bytes: u64,
+    pub free_bytes: u64,
+    pub vdevs: Vec<ZfsVdev>,
 }
 
-impl VolumeTick {
-    pub fn zfs_pool_for_source(&self, source: &str) -> Option<&ZfsPool> {
-        let name = source.split('/').next()?;
-        self.zfs.iter().find(|pool| pool.name == name)
-    }
+#[derive(Debug, Clone, Default)]
+pub struct ZfsVdev {
+    /// Vdev group name, or a leaf's kernel device name (for example `sdc1`).
+    pub name: String,
+    pub vdev_type: String,
+    #[allow(dead_code)]
+    pub size_bytes: u64,
+    /// Missing when OpenZFS prints `-` for a child vdev allocation.
+    pub alloc_bytes: Option<u64>,
+    #[allow(dead_code)]
+    pub free_bytes: u64,
+    #[allow(dead_code)]
+    pub health: String,
+    pub section: ZfsVdevSection,
+    pub children: Vec<ZfsVdev>,
 }
 
-#[cfg(target_os = "linux")]
-fn linux_zfs() -> Vec<ZfsPool> {
-    use std::process::Command;
-    // -L resolves persistent aliases; -P retains full partition paths.
-    let output = Command::new("zpool")
-        .args(["status", "-LP"])
-        .env("LC_ALL", "C")
-        .output()
-        .or_else(|_| {
-            Command::new("/usr/sbin/zpool")
-                .args(["status", "-LP"])
-                .env("LC_ALL", "C")
-                .output()
-        });
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_zpool_status(&String::from_utf8_lossy(&output.stdout))
-        }
-        _ => Vec::new(),
-    }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ZfsVdevSection {
+    #[default]
+    Data,
+    Log,
+    Cache,
+    Spare,
+    Special,
+    Dedup,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_zpool_status(text: &str) -> Vec<ZfsPool> {
-    let mut pools: Vec<ZfsPool> = Vec::new();
-    let mut in_config = false;
-    for line in text.lines().map(str::trim) {
-        if let Some(name) = line.strip_prefix("pool:") {
-            pools.push(ZfsPool {
-                name: name.trim().into(),
-                ..Default::default()
-            });
-            in_config = false;
-        } else if let Some(pool) = pools.last_mut() {
-            if let Some(state) = line.strip_prefix("state:") {
-                pool.state = state.trim().into();
-            } else if line == "config:" {
-                in_config = true;
-            } else if line.starts_with("errors:") {
-                in_config = false;
-            } else if in_config {
-                if let Some(path) = line
-                    .split_whitespace()
-                    .next()
-                    .filter(|p| p.starts_with("/dev/"))
-                {
-                    pool.members.push(path.into());
+impl ZfsPool {
+    /// Return each leaf and its containing vdev groups, from outermost in.
+    pub fn leaf_vdevs(&self) -> Vec<(&ZfsVdev, Vec<&ZfsVdev>)> {
+        fn visit<'a>(
+            nodes: &'a [ZfsVdev],
+            groups: &mut Vec<&'a ZfsVdev>,
+            out: &mut Vec<(&'a ZfsVdev, Vec<&'a ZfsVdev>)>,
+        ) {
+            for node in nodes {
+                if node.children.is_empty() {
+                    out.push((node, groups.clone()));
+                } else {
+                    groups.push(node);
+                    visit(&node.children, groups, out);
+                    groups.pop();
                 }
             }
         }
+
+        let mut out = Vec::new();
+        visit(&self.vdevs, &mut Vec::new(), &mut out);
+        out
     }
-    for pool in &mut pools {
-        pool.members.sort();
-        pool.members.dedup();
+
+    /// Return each leaf with its effective allocation. OpenZFS reports the
+    /// allocation on a mirror/RAIDZ group rather than on its children.
+    pub fn leaf_allocations(&self) -> Vec<(&ZfsVdev, u64)> {
+        struct AllocationGroup<'a> {
+            vdev: &'a ZfsVdev,
+            allocated: u64,
+            leaf_count: usize,
+            leaves_seen: usize,
+        }
+
+        fn leaf_count(vdev: &ZfsVdev) -> usize {
+            if vdev.children.is_empty() {
+                1
+            } else {
+                vdev.children.iter().map(leaf_count).sum()
+            }
+        }
+
+        fn visit<'a>(
+            nodes: &'a [ZfsVdev],
+            groups: &mut Vec<AllocationGroup<'a>>,
+            out: &mut Vec<(&'a ZfsVdev, u64)>,
+        ) {
+            for vdev in nodes {
+                if vdev.children.is_empty() {
+                    let inherited = groups.last().map(|group| {
+                        let type_name = group.vdev.vdev_type.to_ascii_lowercase();
+                        let mirror = matches!(type_name.as_str(), "mirror" | "replacing" | "spare");
+                        if mirror {
+                            group.allocated
+                        } else {
+                            let count = group.leaf_count.max(1) as u64;
+                            let quotient = group.allocated / count;
+                            let remainder = group.allocated % count;
+                            quotient + u64::from((group.leaves_seen as u64) < remainder)
+                        }
+                    });
+                    let allocated = vdev.alloc_bytes.or(inherited).unwrap_or(0);
+                    out.push((vdev, allocated));
+                    for group in groups.iter_mut() {
+                        group.leaves_seen += 1;
+                    }
+                } else {
+                    if let Some(allocated) = vdev.alloc_bytes {
+                        groups.push(AllocationGroup {
+                            vdev,
+                            allocated,
+                            leaf_count: leaf_count(vdev),
+                            leaves_seen: 0,
+                        });
+                    }
+                    visit(&vdev.children, groups, out);
+                    if vdev.alloc_bytes.is_some() {
+                        groups.pop();
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        visit(&self.vdevs, &mut Vec::new(), &mut out);
+        out
     }
-    pools
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,10 +204,11 @@ pub fn collect() -> VolumeTick {
     }
     #[cfg(target_os = "linux")]
     {
-        let mut out = VolumeTick::default();
-        out.mdraid = linux_mdraid();
-        out.zfs = linux_zfs();
-        return out;
+        VolumeTick {
+            mdraid: linux_mdraid(),
+            zfs: linux_zfs(),
+            ..VolumeTick::default()
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -302,6 +357,301 @@ fn linux_mdraid() -> Vec<MdRaidArray> {
         return Vec::new();
     };
     parse_mdstat(&text)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_zfs() -> Vec<ZfsPool> {
+    if let Ok(output) = zpool_command(&["list", "-j", "-v", "-p", "-P", "-L"]) {
+        if output.status.success() {
+            if let Some(pools) = parse_zpool_json(&String::from_utf8_lossy(&output.stdout)) {
+                return pools;
+            }
+        }
+    }
+
+    let Ok(output) = zpool_command(&["list", "-v", "-P", "-L", "-p"]) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_zpool_text(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn zpool_command(args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::io::ErrorKind;
+    use std::process::Command;
+
+    match Command::new("zpool").args(args).env("LC_ALL", "C").output() {
+        Err(error) if error.kind() == ErrorKind::NotFound => Command::new("/usr/sbin/zpool")
+            .args(args)
+            .env("LC_ALL", "C")
+            .output(),
+        result => result,
+    }
+}
+
+/// Parse the JSON emitted by `zpool list -j -v -p -P -L`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_zpool_json(text: &str) -> Option<Vec<ZfsPool>> {
+    use serde_json::{Map, Value};
+
+    fn parse_vdev_map(
+        entries: &Map<String, Value>,
+        inherited_section: ZfsVdevSection,
+        out: &mut Vec<ZfsVdev>,
+    ) {
+        for (name, value) in entries {
+            let section = parse_zfs_section(name);
+            if let (Some(section), Some(children)) = (section, value.as_object()) {
+                if value.get("vdev_type").is_none() {
+                    parse_vdev_map(children, section, out);
+                    continue;
+                }
+            }
+            out.push(parse_json_vdev(name, value, inherited_section));
+        }
+    }
+
+    fn parse_json_vdev(name: &str, value: &Value, inherited: ZfsVdevSection) -> ZfsVdev {
+        let explicit_name = value.get("name").and_then(Value::as_str).unwrap_or(name);
+        let base_name = std::path::Path::new(explicit_name)
+            .file_name()
+            .map(|part| part.to_string_lossy().into_owned())
+            .unwrap_or_else(|| explicit_name.to_string());
+        let class_section = value
+            .get("class")
+            .and_then(Value::as_str)
+            .and_then(parse_zfs_section)
+            .filter(|section| *section != ZfsVdevSection::Data);
+        let section = class_section.unwrap_or(inherited);
+        let mut vdev = ZfsVdev {
+            name: base_name,
+            vdev_type: value
+                .get("vdev_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            size_bytes: json_property_u64(value, "size").unwrap_or(0),
+            alloc_bytes: json_property_u64(value, "allocated"),
+            free_bytes: json_property_u64(value, "free").unwrap_or(0),
+            health: json_property_string(value, "health")
+                .or_else(|| {
+                    value
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+            section,
+            ..Default::default()
+        };
+        if let Some(children) = value.get("vdevs").and_then(Value::as_object) {
+            parse_vdev_map(children, section, &mut vdev.children);
+        }
+        vdev
+    }
+
+    let root: Value = serde_json::from_str(text).ok()?;
+    let entries = root.get("pools")?.as_object()?;
+    let mut pools = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "POOL")
+        {
+            continue;
+        }
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let mut pool = ZfsPool {
+            health: json_property_string(value, "health")
+                .or_else(|| {
+                    value
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+            size_bytes: json_property_u64(value, "size").unwrap_or(0),
+            alloc_bytes: json_property_u64(value, "allocated").unwrap_or(0),
+            free_bytes: json_property_u64(value, "free").unwrap_or(0),
+            name,
+            ..Default::default()
+        };
+        if let Some(vdevs) = value.get("vdevs").and_then(Value::as_object) {
+            parse_vdev_map(vdevs, ZfsVdevSection::Data, &mut pool.vdevs);
+        }
+        pools.push(pool);
+    }
+    Some(pools)
+}
+
+fn json_property_string(value: &serde_json::Value, property: &str) -> Option<String> {
+    value
+        .get("properties")?
+        .get(property)?
+        .get("value")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn json_property_u64(value: &serde_json::Value, property: &str) -> Option<u64> {
+    let value = value.get("properties")?.get(property)?.get("value")?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse::<u64>().ok())
+}
+
+/// Parse `zpool list -vPLp` for OpenZFS releases without JSON output. In this
+/// format indentation is two spaces per vdev depth and class headers occupy a
+/// padded, column-zero row whose value columns are all `-`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_zpool_text(text: &str) -> Vec<ZfsPool> {
+    let mut pools = Vec::new();
+    let mut current: Option<ZfsPool> = None;
+    let mut section = ZfsVdevSection::Data;
+    let mut path = Vec::new();
+
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let indentation = line.chars().take_while(|ch| *ch == ' ').count();
+        if indentation % 2 != 0 {
+            continue;
+        }
+        let row = &line[indentation..];
+        let fields: Vec<_> = row.split_whitespace().collect();
+        let Some(name) = fields.first().filter(|name| !name.is_empty()).copied() else {
+            continue;
+        };
+
+        if name.eq_ignore_ascii_case("NAME") && fields.get(1) == Some(&"SIZE") {
+            continue;
+        }
+
+        if indentation == 0 && fields.len() > 1 && fields[1..].iter().all(|field| *field == "-") {
+            if let Some(next_section) = parse_zfs_section(name) {
+                section = next_section;
+                path.clear();
+                continue;
+            }
+        }
+
+        if indentation == 0 {
+            if let Some(pool) = current.take() {
+                pools.push(pool);
+            }
+            section = ZfsVdevSection::Data;
+            path.clear();
+            current = Some(ZfsPool {
+                name: name.to_string(),
+                health: field(&fields, 9).to_string(),
+                size_bytes: number_field(&fields, 1),
+                alloc_bytes: number_field(&fields, 2),
+                free_bytes: number_field(&fields, 3),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let Some(pool) = current.as_mut() else {
+            continue;
+        };
+        let vdev_depth = indentation / 2 - 1;
+        let vdev = ZfsVdev {
+            name: std::path::Path::new(name)
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_string()),
+            vdev_type: infer_text_vdev_type(name).to_string(),
+            health: field(&fields, 9).to_string(),
+            size_bytes: number_field(&fields, 1),
+            alloc_bytes: field(&fields, 2).parse().ok(),
+            free_bytes: number_field(&fields, 3),
+            section,
+            ..Default::default()
+        };
+        insert_zfs_vdev(&mut pool.vdevs, &mut path, vdev_depth, vdev);
+    }
+
+    if let Some(pool) = current {
+        pools.push(pool);
+    }
+    pools
+}
+
+fn infer_text_vdev_type(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if name == "mirror" || name.starts_with("mirror-") {
+        "mirror"
+    } else if name.starts_with("raidz") {
+        "raidz"
+    } else if name.starts_with("draid") {
+        "draid"
+    } else if name == "replacing" || name.starts_with("replacing-") {
+        "replacing"
+    } else if name == "spare" || name.starts_with("spare-") {
+        "spare"
+    } else {
+        ""
+    }
+}
+
+fn insert_zfs_vdev(roots: &mut Vec<ZfsVdev>, path: &mut Vec<usize>, depth: usize, vdev: ZfsVdev) {
+    if depth > path.len() {
+        return;
+    }
+    path.truncate(depth);
+    if depth == 0 {
+        roots.push(vdev);
+        path.push(roots.len() - 1);
+        return;
+    }
+
+    let Some(parent) = zfs_vdev_at_mut(roots, &path[..depth]) else {
+        return;
+    };
+    parent.children.push(vdev);
+    path.push(parent.children.len() - 1);
+}
+
+fn zfs_vdev_at_mut<'a>(nodes: &'a mut [ZfsVdev], path: &[usize]) -> Option<&'a mut ZfsVdev> {
+    let (index, rest) = path.split_first()?;
+    let node = nodes.get_mut(*index)?;
+    if rest.is_empty() {
+        Some(node)
+    } else {
+        zfs_vdev_at_mut(&mut node.children, rest)
+    }
+}
+
+fn parse_zfs_section(value: &str) -> Option<ZfsVdevSection> {
+    match value.to_ascii_lowercase().as_str() {
+        "logs" | "log" => Some(ZfsVdevSection::Log),
+        "cache" | "l2cache" => Some(ZfsVdevSection::Cache),
+        "spares" | "spare" => Some(ZfsVdevSection::Spare),
+        "special" => Some(ZfsVdevSection::Special),
+        "dedup" => Some(ZfsVdevSection::Dedup),
+        _ => None,
+    }
+}
+
+fn field<'a>(fields: &[&'a str], index: usize) -> &'a str {
+    fields.get(index).copied().unwrap_or("")
+}
+
+fn number_field(fields: &[&str], index: usize) -> u64 {
+    field(fields, index).parse().unwrap_or(0)
+}
+
+/// Match a ZFS dataset source to its imported pool using the first path part.
+pub fn pool_for_dataset<'a>(source: &str, pools: &'a [ZfsPool]) -> Option<&'a ZfsPool> {
+    let pool_name = source.split('/').next()?;
+    pools.iter().find(|pool| pool.name == pool_name)
 }
 
 /// Pure parser for `/proc/mdstat` content. Kept cfg-free so it can be
@@ -505,30 +855,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_zfs_pools_with_nested_and_auxiliary_devices() {
-        let pools = parse_zpool_status("pool: tank\n state: DEGRADED\nconfig:\n NAME STATE READ WRITE CKSUM\n tank DEGRADED 0 0 0\n mirror-0 DEGRADED 0 0 0\n /dev/sdb1 ONLINE 0 0 0\n /dev/sdc1 FAULTED 0 0 0\n logs\n /dev/nvme1n1p1 ONLINE 0 0 0\n cache\n /dev/sdd ONLINE 0 0 0\nerrors: /dev/not-a-member\npool: backup\n state: ONLINE\nconfig:\n /dev/sde1 ONLINE 0 0 0\nerrors: No known data errors\n");
-        assert_eq!(pools.len(), 2);
-        assert_eq!(pools[0].state, "DEGRADED");
-        assert_eq!(
-            pools[0].members,
-            ["/dev/nvme1n1p1", "/dev/sdb1", "/dev/sdc1", "/dev/sdd"]
-        );
-        let volumes = VolumeTick {
-            zfs: pools,
-            ..Default::default()
-        };
-        assert_eq!(
-            volumes
-                .zfs_pool_for_source("tank/child/nested")
-                .unwrap()
-                .name,
-            "tank"
-        );
-        assert!(volumes.zfs_pool_for_source("tank-other/child").is_none());
-        assert!(parse_zpool_status("no pools available").is_empty());
-    }
-
-    #[test]
     fn parses_two_active_arrays() {
         // Real `/proc/mdstat` shape from a healthy host.
         let text = "\
@@ -596,5 +922,270 @@ unused devices: <none>
         let text = "Personalities : [raid1]\n\nunused devices: <none>\n";
         let arrays = parse_mdstat(text);
         assert!(arrays.is_empty());
+    }
+
+    const REAL_ZPOOL_TEXT_FIXTURE: &str = "\
+NAME                            SIZE   ALLOC       FREE  CKPOINT  EXPANDSZ   FRAG    CAP  DEDUP    HEALTH  ALTROOT
+iodynetestm                251658240  267264  251390976        -         -     13      0   1.00    ONLINE  -
+  mirror-0                 251658240  267264  251390976        -         -     13      0      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/a  268435456      -      -        -         -      -      -      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/b  268435456      -      -        -         -      -      -      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/i  268435456      -      -        -         -      -      -      -    ONLINE        -
+cache                              -       -          -        -         -      -      -      -         -        -
+  /tmp/iodyne-zt.8N9B/g    268435456      0  263716352        -         -      0      0      -    ONLINE        -
+spare                              -       -          -        -         -      -      -      -         -        -
+  /tmp/iodyne-zt.8N9B/h    268435456      -      -        -         -      -      -      -     AVAIL        -
+iodynetestr                738197504  334848  737862656        -         -      9      0   1.00    ONLINE  -
+  raidz1-0                 738197504  334848  737862656        -         -      9      0      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/c  268435456      -      -        -         -      -      -      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/d  268435456      -      -        -         -      -      -      -    ONLINE        -
+    /tmp/iodyne-zt.8N9B/e  268435456      -      -        -         -      -      -      -    ONLINE        -
+logs                               -       -          -        -         -      -      -      -         -        -
+  /tmp/iodyne-zt.8N9B/f    268435456      0  251658240        -         -      0      0      -    ONLINE        -
+";
+
+    const REAL_ZPOOL_JSON_FIXTURE: &str = r#"{
+      "pools": {
+        "iodynetestm": {
+          "name":"iodynetestm", "type":"POOL", "state":"ONLINE",
+          "properties":{"size":{"value":"251658240"},"allocated":{"value":"267264"},"free":{"value":"251390976"},"health":{"value":"ONLINE"}},
+          "vdevs": {
+            "mirror-0": {
+              "name":"mirror-0", "vdev_type":"mirror", "class":"normal", "state":"ONLINE",
+              "properties":{"allocated":{"value":"267264"}},
+              "vdevs": {
+                "/tmp/iodyne-zt.8N9B/a":{"name":"/tmp/iodyne-zt.8N9B/a","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"size":{"value":"268435456"},"allocated":{"value":"-"}}},
+                "/tmp/iodyne-zt.8N9B/b":{"name":"/tmp/iodyne-zt.8N9B/b","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"size":{"value":"268435456"},"allocated":{"value":"-"}}},
+                "/tmp/iodyne-zt.8N9B/i":{"name":"/tmp/iodyne-zt.8N9B/i","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"size":{"value":"268435456"},"allocated":{"value":"-"}}}
+              }
+            },
+            "l2cache": {"/tmp/iodyne-zt.8N9B/g":{"name":"/tmp/iodyne-zt.8N9B/g","vdev_type":"file","class":"l2cache","state":"ONLINE","properties":{"allocated":{"value":"0"}}}},
+            "spares": {"/tmp/iodyne-zt.8N9B/h":{"name":"/tmp/iodyne-zt.8N9B/h","vdev_type":"file","class":"spare","state":"AVAIL","properties":{"allocated":{"value":"-"}}}}
+          }
+        },
+        "iodynetestr": {
+          "name":"iodynetestr", "type":"POOL", "state":"ONLINE",
+          "properties":{"size":{"value":"738197504"},"allocated":{"value":"334848"},"free":{"value":"737862656"},"health":{"value":"ONLINE"}},
+          "vdevs": {
+            "raidz1-0": {
+              "name":"raidz1-0", "vdev_type":"raidz", "class":"normal", "state":"ONLINE",
+              "properties":{"allocated":{"value":"334848"}},
+              "vdevs": {
+                "/tmp/iodyne-zt.8N9B/c":{"name":"/tmp/iodyne-zt.8N9B/c","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"allocated":{"value":"-"}}},
+                "/tmp/iodyne-zt.8N9B/d":{"name":"/tmp/iodyne-zt.8N9B/d","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"allocated":{"value":"-"}}},
+                "/tmp/iodyne-zt.8N9B/e":{"name":"/tmp/iodyne-zt.8N9B/e","vdev_type":"file","class":"normal","state":"ONLINE","properties":{"allocated":{"value":"-"}}}
+              }
+            },
+            "logs": {"/tmp/iodyne-zt.8N9B/f":{"name":"/tmp/iodyne-zt.8N9B/f","vdev_type":"file","class":"log","state":"ONLINE","properties":{"allocated":{"value":"0"}}}}
+          }
+        }
+      }
+    }"#;
+
+    const OPTANE_TEXT_FIXTURE: &str = "\
+NAME                  SIZE        ALLOC           FREE  CKPOINT  EXPANDSZ   FRAG    CAP  DEDUP    HEALTH  ALTROOT
+optane       3367254360064  84713775104  3282540584960        -         -      0      2   1.00    ONLINE  -
+  /dev/sdc1  960187334656  24127934464  929354805248        -         -      0      2      -    ONLINE        -
+  /dev/sdd1  960187334656  24019652608  929463087104        -         -      0      2      -    ONLINE        -
+  /dev/sde2  1462881222656  36566188032  1423722692608        -         -      0      2      -    ONLINE        -
+";
+
+    const OPTANE_JSON_FIXTURE: &str = r#"{
+      "pools": {"optane": {
+        "name":"optane", "type":"POOL", "state":"ONLINE",
+        "properties":{"size":{"value":"3367254360064"},"allocated":{"value":"84715307008"},"free":{"value":"3282539053056"},"health":{"value":"ONLINE"}},
+        "vdevs": {
+          "/dev/sdc1":{"name":"/dev/sdc1","properties":{"size":{"value":"960187334656"},"allocated":{"value":"24128602112"},"free":{"value":"929354137600"},"health":{"value":"ONLINE"}}},
+          "/dev/sdd1":{"name":"/dev/sdd1","properties":{"size":{"value":"960187334656"},"allocated":{"value":"24020709376"},"free":{"value":"929462030336"},"health":{"value":"ONLINE"}}},
+          "/dev/sde2":{"name":"/dev/sde2","properties":{"size":{"value":"1462881222656"},"allocated":{"value":"36565995520"},"free":{"value":"1423722885120"},"health":{"value":"ONLINE"}}}
+        }
+      }}
+    }"#;
+
+    fn leaf_allocations_named(pool: &ZfsPool) -> std::collections::HashMap<&str, u64> {
+        pool.leaf_allocations()
+            .into_iter()
+            .map(|(leaf, allocation)| (leaf.name.as_str(), allocation))
+            .collect()
+    }
+
+    #[test]
+    fn parses_real_json_mirror_raidz_and_auxiliary_sections() {
+        let pools = parse_zpool_json(REAL_ZPOOL_JSON_FIXTURE).expect("valid zpool JSON");
+        assert_eq!(pools.len(), 2);
+        let mirror = pools
+            .iter()
+            .find(|pool| pool.name == "iodynetestm")
+            .unwrap();
+        assert_eq!(mirror.health, "ONLINE");
+        assert_eq!(mirror.vdevs.len(), 3);
+        let group = mirror
+            .vdevs
+            .iter()
+            .find(|vdev| vdev.name == "mirror-0")
+            .unwrap();
+        assert_eq!(group.vdev_type, "mirror");
+        assert_eq!(group.children.len(), 3);
+        assert_eq!(
+            leaf_allocations_named(mirror),
+            [
+                ("a", 267264),
+                ("b", 267264),
+                ("g", 0),
+                ("h", 0),
+                ("i", 267264)
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            mirror
+                .leaf_vdevs()
+                .into_iter()
+                .map(|(leaf, _)| (leaf.name.as_str(), leaf.section))
+                .collect::<std::collections::HashMap<_, _>>()["g"],
+            ZfsVdevSection::Cache
+        );
+        assert_eq!(
+            mirror
+                .leaf_vdevs()
+                .into_iter()
+                .map(|(leaf, _)| (leaf.name.as_str(), leaf.section))
+                .collect::<std::collections::HashMap<_, _>>()["h"],
+            ZfsVdevSection::Spare
+        );
+        let raidz = pools
+            .iter()
+            .find(|pool| pool.name == "iodynetestr")
+            .unwrap();
+        let group = raidz
+            .vdevs
+            .iter()
+            .find(|vdev| vdev.name == "raidz1-0")
+            .unwrap();
+        assert_eq!(group.vdev_type, "raidz");
+        assert_eq!(
+            leaf_allocations_named(raidz),
+            [("c", 111616), ("d", 111616), ("e", 111616), ("f", 0)]
+                .into_iter()
+                .collect()
+        );
+        assert!(raidz
+            .leaf_vdevs()
+            .iter()
+            .any(|(leaf, _)| leaf.name == "f" && leaf.section == ZfsVdevSection::Log));
+        assert!(parse_zpool_json("not json").is_none());
+    }
+
+    #[test]
+    fn parses_real_text_fallback_mirror_raidz_log_cache_and_spare() {
+        let pools = parse_zpool_text(REAL_ZPOOL_TEXT_FIXTURE);
+        assert_eq!(pools.len(), 2);
+        let mirror = &pools[0];
+        assert_eq!(mirror.name, "iodynetestm");
+        assert_eq!(mirror.vdevs.len(), 3);
+        assert_eq!(mirror.vdevs[0].name, "mirror-0");
+        assert_eq!(mirror.vdevs[0].children.len(), 3);
+        assert_eq!(mirror.vdevs[0].vdev_type, "mirror");
+        assert_eq!(
+            leaf_allocations_named(mirror),
+            [
+                ("a", 267264),
+                ("b", 267264),
+                ("g", 0),
+                ("h", 0),
+                ("i", 267264)
+            ]
+            .into_iter()
+            .collect()
+        );
+        let sections: std::collections::HashMap<_, _> = mirror
+            .leaf_vdevs()
+            .into_iter()
+            .map(|(leaf, _)| (leaf.name.as_str(), leaf.section))
+            .collect();
+        assert_eq!(sections["g"], ZfsVdevSection::Cache);
+        assert_eq!(sections["h"], ZfsVdevSection::Spare);
+        assert_eq!(
+            mirror
+                .leaf_vdevs()
+                .iter()
+                .find(|(leaf, _)| leaf.name == "h")
+                .unwrap()
+                .0
+                .health,
+            "AVAIL"
+        );
+
+        let raidz = &pools[1];
+        assert_eq!(raidz.name, "iodynetestr");
+        assert_eq!(raidz.vdevs[0].vdev_type, "raidz");
+        assert_eq!(raidz.vdevs[0].children.len(), 3);
+        assert_eq!(
+            leaf_allocations_named(raidz),
+            [("c", 111616), ("d", 111616), ("e", 111616), ("f", 0)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            raidz
+                .leaf_vdevs()
+                .iter()
+                .find(|(leaf, _)| leaf.name == "f")
+                .unwrap()
+                .0
+                .section,
+            ZfsVdevSection::Log
+        );
+    }
+
+    #[test]
+    fn parses_real_optane_stripe_from_json_and_text() {
+        let json_pools = parse_zpool_json(OPTANE_JSON_FIXTURE).unwrap();
+        let text_pools = parse_zpool_text(OPTANE_TEXT_FIXTURE);
+        for pool in [&json_pools[0], &text_pools[0]] {
+            assert_eq!(pool.name, "optane");
+            assert_eq!(pool.health, "ONLINE");
+            assert_eq!(
+                pool.leaf_vdevs()
+                    .iter()
+                    .map(|(leaf, _)| leaf.name.as_str())
+                    .collect::<std::collections::HashSet<_>>(),
+                ["sdc1", "sdd1", "sde2"].into_iter().collect()
+            );
+        }
+        assert_eq!(
+            leaf_allocations_named(&json_pools[0]),
+            [
+                ("sdc1", 24_128_602_112),
+                ("sdd1", 24_020_709_376),
+                ("sde2", 36_565_995_520)
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            leaf_allocations_named(&text_pools[0]),
+            [
+                ("sdc1", 24_127_934_464),
+                ("sdd1", 24_019_652_608),
+                ("sde2", 36_566_188_032)
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn matches_zfs_pool_by_root_or_nested_dataset_source() {
+        let pools = parse_zpool_text(OPTANE_TEXT_FIXTURE);
+        assert_eq!(pool_for_dataset("optane", &pools).unwrap().name, "optane");
+        assert_eq!(
+            pool_for_dataset("optane/Projects/foo", &pools)
+                .unwrap()
+                .name,
+            "optane"
+        );
+        assert!(pool_for_dataset("optane-old/Projects", &pools).is_none());
     }
 }

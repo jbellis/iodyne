@@ -15,9 +15,9 @@ The top of the screen is the device overview:
 The tabbed detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
 merges, and await. Its header identifies the mount and backing-device topology,
-followed by available filesystem, device, mdraid, APFS, and SMART facts. On
-Linux, the VFS tab shows the processes and paths currently requesting the most
-file IO.
+followed by available filesystem, device, mdraid, APFS, ZFS vdev, and SMART
+facts. On Linux, the VFS tab shows the processes and paths currently
+requesting the most file IO.
 
 This is the view for answering "which device, which direction, and what kind of
 workload?" It complements `iostat`; it is not a benchmark or a long-term
@@ -121,12 +121,12 @@ x86_64 and arm64. Root usually has the required permission, but lockdown,
 containers, vendor kernels, or LSM policy can still reject a probe.
 
 On Linux with `zpool` installed, ZFS datasets are connected to the pool's
-resolved backing disks (including log, cache, and spare devices). These disks
-appear in the mounted view, and JSONL includes dataset/pool/member topology.
-The free-space percentage reflects the least-free mounted dataset; shared ZFS
-capacity is not summed in the detail facts. Privileged VFS collection includes
-ZFS files. Selecting any pool member shows the pool's mounted dataset activity;
-this is logical file IO, not a claim that those bytes reached that member.
+resolved backing disks, including log, cache, and spare devices. These disks
+appear in the mounted view and JSONL topology. The free-space percentage reflects
+the least-free mounted dataset; shared ZFS capacity is not summed in detail
+facts. Privileged VFS collection includes ZFS files. Selecting any pool member
+shows the pool's mounted dataset activity as logical file I/O; those bytes do
+not indicate how much data reached an individual member.
 
 The full bare-host, Docker, and Podman matrix has passed in both unprivileged
 fallback and privileged eBPF modes on these x86_64 EC2 guests:
@@ -174,8 +174,11 @@ otherwise under `~/.config/iodyne/`.
   (including some `io_uring` operations) are absent from VFS attribution.
 - Long paths may fall back to a basename and inode. Hard links are represented
   by the first observed path for that identity.
-- LVM-specific topology is not decoded. Device-mapper IO remains
-  visible, but the detail header may not reconstruct the complete stack.
+- LVM topology is not decoded. On Linux, ZFS pool, dataset, and vdev topology
+  plus per-leaf allocation are read from `zpool`; selecting a pool member also
+  filters VFS activity to datasets in that pool.
+- Device-mapper IO remains visible, but the detail header may not reconstruct
+  the complete stack.
 - SMART access varies by controller, bridge, permissions, and device support;
   missing fields are omitted rather than inferred.
 - Discard (TRIM) and flush activity appears in JSONL only, not in the TUI.

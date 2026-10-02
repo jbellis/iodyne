@@ -6,6 +6,9 @@ pub mod smart;
 pub mod topology;
 pub mod volumes;
 
+#[cfg(target_os = "linux")]
+pub mod btrfs;
+
 pub mod ebpf;
 
 #[cfg(target_os = "macos")]
