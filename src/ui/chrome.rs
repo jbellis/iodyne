@@ -4,21 +4,28 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::config::TopView;
 use crate::ui::palette as p;
 
-pub fn draw_footer(f: &mut Frame, area: Rect, show_unmounted: bool, collection_source: &str) {
+pub fn draw_footer(
+    f: &mut Frame,
+    area: Rect,
+    show_unmounted: bool,
+    top_view: TopView,
+    collection_source: &str,
+) {
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::raw(" "));
     let groups: &[&[(&str, &str)]] = &[
         &[("p", "Pause"), (",", "Settings")],
-        &[("j/k", "Select"), ("Tab", "Detail")],
+        &[("v/d", "View"), ("j/k", "Select"), ("Tab", "Detail")],
         &[("-/+", "Sample"), ("q", "Quit")],
     ];
     for (gi, group) in groups.iter().enumerate() {
         if gi > 0 {
             spans.push(Span::styled(" \u{2502} ", Style::default().fg(p::FAINT)));
         }
-        if gi == 1 {
+        if gi == 1 && top_view == TopView::Devices {
             spans.push(Span::styled(
                 "u",
                 Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),

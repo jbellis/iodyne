@@ -19,7 +19,7 @@ use ratatui::Terminal;
 use sysinfo::System;
 
 use crate::collect;
-use crate::config::Settings;
+use crate::config::{Settings, TopView};
 use crate::ui::chrome;
 use crate::ui::format::{set_unit_mode, UnitMode};
 use crate::ui::palette as p;
@@ -54,7 +54,8 @@ pub struct App {
     pub settings: Settings,
     pub show_settings: bool,
     pub smart: collect::SmartCollector,
-    pub selected_io: usize,
+    pub selected_devices: usize,
+    pub selected_volumes: usize,
     pub detail_tab: DetailTab,
     pub sample_interval: Duration,
     pub cpu_usage: f64,
@@ -72,6 +73,7 @@ struct CollectorSnapshot {
     devices: Vec<collect::DeviceTick>,
     filesystems: Vec<collect::FsTick>,
     volumes: collect::VolumeTick,
+    volume_rows: Vec<collect::storage::VolumeRow>,
     smart_by_device: std::collections::HashMap<String, collect::smart::SmartTick>,
 }
 
@@ -80,12 +82,14 @@ impl CollectorSnapshot {
         devices: Vec<collect::DeviceTick>,
         filesystems: Vec<collect::FsTick>,
         volumes: collect::VolumeTick,
+        volume_rows: Vec<collect::storage::VolumeRow>,
         smart: &collect::SmartCollector,
     ) -> Self {
         Self {
             devices,
             filesystems,
             volumes,
+            volume_rows,
             smart_by_device: smart.by_device.clone(),
         }
     }
@@ -97,9 +101,11 @@ impl App {
         set_unit_mode(settings.unit_mode);
         let filesystems = collect::filesystems::collect();
         let volumes = collect::volumes::collect();
+        let volume_rows = collect::storage::resolve(&filesystems, &volumes);
         let devices = collect::devices::collect_with_volumes(&volumes);
         let mut io = collect::IoCollector::new();
         io.prime();
+        io.set_volume_rows(volume_rows.clone());
         let mut cpu_system = System::new();
         cpu_system.refresh_cpu_usage();
         let mut smart = collect::SmartCollector::new();
@@ -108,6 +114,7 @@ impl App {
             devices.clone(),
             filesystems.clone(),
             volumes.clone(),
+            volume_rows,
             &smart,
         )));
         Self {
@@ -116,7 +123,8 @@ impl App {
             cpu_usage: 0.0,
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
             cpu_system,
-            selected_io: 0,
+            selected_devices: 0,
+            selected_volumes: 0,
             detail_tab: DetailTab::Disk,
             devices,
             filesystems,
@@ -135,6 +143,7 @@ impl App {
     fn persist_settings(&mut self) {
         self.settings.io_show_unmounted = self.io_show_unmounted;
         set_unit_mode(self.settings.unit_mode);
+        #[cfg(not(test))]
         self.settings.save();
     }
 
@@ -145,7 +154,56 @@ impl App {
 
     fn toggle_io_unmounted(&mut self) {
         self.io_show_unmounted = !self.io_show_unmounted;
-        self.selected_io = 0;
+        self.selected_devices = 0;
+        self.persist_settings();
+    }
+
+    fn switch_top_view(&mut self, target: TopView) {
+        let current = self.settings.top_view;
+        if current == target {
+            return;
+        }
+
+        match (current, target) {
+            (TopView::Volumes, TopView::Devices) => {
+                if self.selected_volumes == 0 {
+                    self.selected_devices = 0;
+                } else if let Some(row) = self.io.volume_rows().get(self.selected_volumes - 1) {
+                    let visible = crate::screen::visible_io_ticks(self);
+                    if let Some((index, _)) = visible
+                        .iter()
+                        .enumerate()
+                        .find(|(_, tick)| row.member_disks.iter().any(|disk| disk == &tick.device))
+                    {
+                        self.selected_devices = index + 1;
+                    }
+                }
+            }
+            (TopView::Devices, TopView::Volumes) => {
+                if self.selected_devices == 0 {
+                    self.selected_volumes = 0;
+                } else {
+                    let visible = crate::screen::visible_io_ticks(self);
+                    if let Some(tick) = visible.get(self.selected_devices - 1) {
+                        if let Some(row) =
+                            collect::storage::volume_for_device(self.io.volume_rows(), &tick.device)
+                        {
+                            if let Some(index) = self
+                                .io
+                                .volume_rows()
+                                .iter()
+                                .position(|candidate| candidate.id == row.id)
+                            {
+                                self.selected_volumes = index + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        self.settings.top_view = target;
         self.persist_settings();
     }
 
@@ -180,9 +238,21 @@ impl App {
 
     fn tick(&mut self) {
         self.apply_background_snapshot();
+        let selected_device = crate::screen::visible_io_ticks(self)
+            .get(self.selected_devices.saturating_sub(1))
+            .filter(|_| self.selected_devices > 0)
+            .map(|tick| tick.device.clone());
         // The collector forms calm display buckets at the selected cadence.
         // The eBPF backend still accounts for every request between polls.
         if self.io.sample(self.sample_interval) {
+            if let Some(device) = selected_device {
+                if let Some(index) = crate::screen::visible_io_ticks(self)
+                    .iter()
+                    .position(|tick| tick.device == device)
+                {
+                    self.selected_devices = index + 1;
+                }
+            }
             self.cpu_system.refresh_cpu_usage();
             let usage = self.cpu_system.global_cpu_usage() as f64;
             if usage.is_finite() {
@@ -195,7 +265,10 @@ impl App {
             self.note_interval_completed();
         }
         let visible_io = crate::screen::visible_device_count(self);
-        self.selected_io = self.selected_io.min(visible_io.saturating_sub(1));
+        self.selected_devices = self.selected_devices.min(visible_io.saturating_sub(1));
+        self.selected_volumes = self
+            .selected_volumes
+            .min(crate::screen::visible_volume_count(self).saturating_sub(1));
     }
 
     fn apply_background_snapshot(&mut self) {
@@ -205,9 +278,33 @@ impl App {
         let Ok(snapshot) = snapshot.lock() else {
             return;
         };
+        let selected_device = crate::screen::visible_io_ticks(self)
+            .get(self.selected_devices.saturating_sub(1))
+            .filter(|_| self.selected_devices > 0)
+            .map(|tick| tick.device.clone());
+        let selected_volume = self
+            .io
+            .volume_rows()
+            .get(self.selected_volumes.saturating_sub(1))
+            .filter(|_| self.selected_volumes > 0)
+            .map(|row| row.id.clone());
         self.devices.clone_from(&snapshot.devices);
         self.filesystems.clone_from(&snapshot.filesystems);
         self.volumes = snapshot.volumes.clone();
+        self.io.set_volume_rows(snapshot.volume_rows.clone());
+        if let Some(device) = selected_device {
+            if let Some(index) = crate::screen::visible_io_ticks(self)
+                .iter()
+                .position(|tick| tick.device == device)
+            {
+                self.selected_devices = index + 1;
+            }
+        }
+        if let Some(id) = selected_volume {
+            if let Some(index) = self.io.volume_rows().iter().position(|row| row.id == id) {
+                self.selected_volumes = index + 1;
+            }
+        }
         self.smart.by_device.clone_from(&snapshot.smart_by_device);
     }
 }
@@ -219,6 +316,7 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
         let mut devices = initial.devices;
         let mut filesystems = initial.filesystems;
         let mut volumes = initial.volumes;
+        let mut volume_rows = initial.volume_rows;
         let mut smart = collect::SmartCollector::new();
         smart.by_device = initial.smart_by_device;
         let mut last_usage_refresh = Instant::now();
@@ -227,11 +325,13 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
             if last_usage_refresh.elapsed() >= USAGE_REFRESH_INTERVAL {
                 collect::devices::refresh_usage_with_volumes(&mut devices, &volumes);
                 filesystems = collect::filesystems::collect();
+                volume_rows = collect::storage::resolve(&filesystems, &volumes);
                 last_usage_refresh = Instant::now();
             }
             if last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
                 volumes = collect::volumes::collect();
                 devices = collect::devices::collect_with_volumes(&volumes);
+                volume_rows = collect::storage::resolve(&filesystems, &volumes);
                 last_metadata_refresh = Instant::now();
             }
             smart.refresh_if_due(&devices);
@@ -240,6 +340,7 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
                     devices.clone(),
                     filesystems.clone(),
                     volumes.clone(),
+                    volume_rows.clone(),
                     &smart,
                 );
             }
@@ -310,7 +411,9 @@ fn handle_key(app: &mut App, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Char(',') => app.show_settings = false,
             KeyCode::Char('b') => app.toggle_unit_mode(),
-            KeyCode::Char('u') => app.toggle_io_unmounted(),
+            KeyCode::Char('u') if app.settings.top_view == TopView::Devices => {
+                app.toggle_io_unmounted()
+            }
             KeyCode::Char('-') => app.decrease_sample_interval(),
             KeyCode::Char('+') | KeyCode::Char('=') => app.increase_sample_interval(),
             KeyCode::Char('q') => app.should_quit = true,
@@ -328,15 +431,32 @@ fn handle_key(app: &mut App, key: KeyCode) {
                 LiveState::Paused => LiveState::Live,
             };
         }
-        KeyCode::Char('u') => app.toggle_io_unmounted(),
+        KeyCode::Char('u') if app.settings.top_view == TopView::Devices => {
+            app.toggle_io_unmounted()
+        }
+        KeyCode::Char('v') => app.switch_top_view(TopView::Volumes),
+        KeyCode::Char('d') => app.switch_top_view(TopView::Devices),
+        KeyCode::BackTab => app.switch_top_view(match app.settings.top_view {
+            TopView::Volumes => TopView::Devices,
+            TopView::Devices => TopView::Volumes,
+        }),
         KeyCode::Tab => app.toggle_detail_tab(),
         KeyCode::Char('-') => app.decrease_sample_interval(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.increase_sample_interval(),
-        KeyCode::Up | KeyCode::Char('k') if app.selected_io > 0 => app.selected_io -= 1,
-        KeyCode::Down | KeyCode::Char('j')
-            if app.selected_io + 1 < crate::screen::visible_device_count(app) =>
-        {
-            app.selected_io += 1
+        KeyCode::Up | KeyCode::Char('k') => match app.settings.top_view {
+            TopView::Volumes if app.selected_volumes > 0 => app.selected_volumes -= 1,
+            TopView::Devices if app.selected_devices > 0 => app.selected_devices -= 1,
+            _ => {}
+        },
+        KeyCode::Down | KeyCode::Char('j') => {
+            let row_count = crate::screen::visible_top_view_count(app);
+            let selected = match app.settings.top_view {
+                TopView::Volumes => &mut app.selected_volumes,
+                TopView::Devices => &mut app.selected_devices,
+            };
+            if *selected + 1 < row_count {
+                *selected += 1;
+            }
         }
         _ => {}
     }
@@ -370,7 +490,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         collect::ebpf::LatencySource::AggregateAwait => "AGGREGATE AWAIT",
         collect::ebpf::LatencySource::EbpfPerRequest => "PER-REQUEST eBPF",
     };
-    chrome::draw_footer(f, layout[1], app.io_show_unmounted, collection_source);
+    chrome::draw_footer(
+        f,
+        layout[1],
+        app.io_show_unmounted,
+        app.settings.top_view,
+        collection_source,
+    );
 }
 
 fn draw_settings_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -452,6 +578,7 @@ mod tests {
         TracedLatencySample, WorkloadSample,
     };
     use crate::collect::smart::{SmartCollector, SmartTick};
+    use crate::collect::storage::{VolumeKind, VolumeRow};
     use crate::collect::{FsTick, VolumeTick};
     use ratatui::backend::TestBackend;
     use std::collections::VecDeque;
@@ -580,14 +707,37 @@ mod tests {
             volumes: VolumeTick::default(),
             io,
             io_show_unmounted: false,
-            settings: Settings::default(),
+            settings: Settings {
+                top_view: TopView::Devices,
+                ..Settings::default()
+            },
             show_settings: false,
             smart,
-            selected_io: 0,
+            selected_devices: 0,
+            selected_volumes: 0,
             detail_tab: DetailTab::Disk,
             background_snapshot: None,
             remaining_intervals: None,
             should_quit: false,
+        }
+    }
+
+    fn fixture_volume(id: &str, members: Vec<&str>) -> VolumeRow {
+        VolumeRow {
+            id: id.into(),
+            label: "/mnt/data".into(),
+            kind: VolumeKind::Filesystem,
+            fs_type: "ext4".into(),
+            mounts: vec!["/mnt/data".into(), "/srv/data".into()],
+            size_bytes: 1_000_000_000_000,
+            free_bytes: 250_000_000_000,
+            backing: "vg0/root → dm-0 → sda".into(),
+            member_disks: members.into_iter().map(str::to_string).collect(),
+            counter_sources: vec!["dm-0".into()],
+            latency_sources: Vec::new(),
+            latency_note: Some("sda shared with swap".into()),
+            fs_device_ids: vec![(8, 1)],
+            warnings: vec!["DEGRADED".into()],
         }
     }
 
@@ -651,7 +801,7 @@ mod tests {
             app.io.latest.push(tick);
         }
         app.io_show_unmounted = true;
-        app.selected_io = 8;
+        app.selected_devices = 8;
 
         let screen = render_screen(&app, 130, 28);
         assert!(screen.contains("DEVICES 3–8 of 8"));
@@ -719,7 +869,7 @@ mod tests {
     fn numeric_keys_have_no_navigation_behavior() {
         let mut app = fixture_app(false);
         let before = (
-            app.selected_io,
+            app.selected_devices,
             app.io_show_unmounted,
             app.live,
             app.show_settings,
@@ -733,7 +883,7 @@ mod tests {
         assert_eq!(
             before,
             (
-                app.selected_io,
+                app.selected_devices,
                 app.io_show_unmounted,
                 app.live,
                 app.show_settings,
@@ -781,13 +931,115 @@ mod tests {
     fn selection_moves_from_all_to_the_last_physical_device() {
         let mut app = fixture_app(true);
         assert_eq!(crate::screen::visible_device_count(&app), 2);
-        assert_eq!(app.selected_io, 0);
+        assert_eq!(app.selected_devices, 0);
 
         handle_key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.selected_io, 1);
+        assert_eq!(app.selected_devices, 1);
         handle_key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.selected_io, 1);
+        assert_eq!(app.selected_devices, 1);
         handle_key(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.selected_io, 0);
+        assert_eq!(app.selected_devices, 0);
+    }
+
+    #[test]
+    fn view_keys_map_selection_and_keep_independent_view_state() {
+        let mut app = fixture_app(true);
+        app.io
+            .set_volume_rows(vec![fixture_volume("fs:8:1", vec!["sda"])]);
+        app.settings.top_view = TopView::Volumes;
+        app.selected_volumes = 1;
+
+        handle_key(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.settings.top_view, TopView::Devices);
+        assert_eq!(app.selected_devices, 1);
+
+        app.selected_volumes = 0;
+        handle_key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.settings.top_view, TopView::Volumes);
+        assert_eq!(app.selected_volumes, 1);
+        assert_eq!(app.selected_devices, 1);
+
+        handle_key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.selected_volumes, 1);
+        handle_key(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.selected_devices, 1);
+    }
+
+    #[test]
+    fn switching_to_a_volume_member_hidden_by_the_device_filter_keeps_device_selection() {
+        let mut app = fixture_app(true);
+        app.io
+            .set_volume_rows(vec![fixture_volume("fs:8:2", vec!["sdb"])]);
+        app.settings.top_view = TopView::Volumes;
+        app.selected_devices = 1;
+        app.selected_volumes = 1;
+
+        handle_key(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.settings.top_view, TopView::Devices);
+        assert_eq!(app.selected_devices, 1);
+    }
+
+    #[test]
+    fn mounted_filter_key_is_ignored_in_volumes_and_applies_in_devices() {
+        let mut app = fixture_app(true);
+        app.settings.top_view = TopView::Volumes;
+        handle_key(&mut app, KeyCode::Char('u'));
+        assert!(!app.io_show_unmounted);
+
+        handle_key(&mut app, KeyCode::Char('d'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        assert!(app.io_show_unmounted);
+    }
+
+    #[test]
+    fn volume_view_renders_volume_series_metadata_and_member_counters() {
+        let mut app = fixture_app(true);
+        let volume = fixture_volume("fs:8:1", vec!["sda"]);
+        let volume_id = volume.id.clone();
+        app.io.set_volume_rows(vec![volume]);
+        app.io.volume_io.history.insert(
+            volume_id.clone(),
+            app.io.history.get("sda").expect("device history").clone(),
+        );
+        app.io.volume_io.latest.push(IoTick {
+            device: volume_id.clone(),
+            bps: 1_000_000.0,
+            split: Some((600_000.0, 400_000.0)),
+            iops: 15.0,
+            iops_split: Some((10.0, 5.0)),
+            ..IoTick::default()
+        });
+        app.io.volume_io.members.insert(
+            volume_id,
+            vec![IoTick {
+                device: "sda".into(),
+                split: Some((600_000.0, 400_000.0)),
+                iops_split: Some((10.0, 5.0)),
+                await_sample: AwaitSample {
+                    read_us: Some(800.0),
+                    write_us: Some(1_600.0),
+                },
+                ..IoTick::default()
+            }],
+        );
+        app.settings.top_view = TopView::Volumes;
+        app.selected_volumes = 1;
+
+        let screen = render_screen(&app, 140, 46);
+        for expected in [
+            "VOLUMES",
+            "Volume",
+            "/mnt/data",
+            "Filesystem / ext4",
+            "Backing:",
+            "Mounts:",
+            "WARNING: DEGRADED",
+            "Latency fallback: counter-derived await",
+            "MEMBER",
+            "sda",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
     }
 }

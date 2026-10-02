@@ -24,12 +24,14 @@ use crate::app::{App, DetailTab, LiveState};
 use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
 use crate::collect::io::{DeviceHistory, VfsActivitySource, VfsFileActivity};
 use crate::collect::smart::{AtaAttr, SmartTick};
+use crate::collect::storage::{VolumeKind, VolumeRow};
 use crate::collect::volumes::{
     ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick, ZfsPool, ZfsVdev, ZfsVdevSection,
 };
 use crate::collect::{
     AwaitSample, DeviceTick, FsTick, IoTick, MergeRates, TracedLatencySample, WorkloadSample,
 };
+use crate::config::TopView;
 use crate::ui::format::{fmt_rate, fmt_size, unit_mode, UnitMode};
 use crate::ui::palette as p;
 use crate::ui::sparkline::{sparkline_symbols, BaselineSparkline};
@@ -51,11 +53,6 @@ const MAX_DETAIL_CONTEXT_ROWS: u16 = 2;
 // Tab row + pane borders + context rows + the full directional metric body.
 const TABBED_DETAIL_MIN_HEIGHT: u16 = 1 + 2 + MAX_DETAIL_CONTEXT_ROWS + DIRECTION_DETAIL_HEIGHT;
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
-    if app.io.latest.is_empty() {
-        draw_empty(f, area, app);
-        return;
-    }
-
     let volume_state = volume_exception_summary(&app.volumes);
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -68,7 +65,45 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     if let Some(state) = volume_state {
         draw_volume_exception(f, rows[0], &state);
     }
-    draw_master_detail(f, rows[1], app);
+    if app.settings.top_view == TopView::Devices && app.io.latest.is_empty() {
+        draw_empty(f, rows[1], app);
+    } else {
+        draw_master_detail(f, rows[1], app);
+    }
+}
+
+fn top_view_tabs_line(app: &App) -> Line<'static> {
+    let selected = Style::default()
+        .fg(p::BR_WHITE)
+        .add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(p::DIM);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "VOLUMES",
+            if app.settings.top_view == TopView::Volumes {
+                selected
+            } else {
+                inactive
+            },
+        ),
+        Span::styled(" │ ", Style::default().fg(p::FAINT)),
+        Span::styled(
+            "DEVICES",
+            if app.settings.top_view == TopView::Devices {
+                selected
+            } else {
+                inactive
+            },
+        ),
+        Span::raw("  "),
+    ])
+}
+
+fn overview_title(app: &App, range: Line<'static>) -> Line<'static> {
+    let mut spans = top_view_tabs_line(app).spans;
+    spans.extend(range.spans);
+    Line::from(spans)
 }
 
 fn pane_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
@@ -80,12 +115,9 @@ fn pane_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
 }
 
 fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
-    let block = pane_block(Span::styled(
-        " IO ",
-        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-    ))
-    .title(center_status_title(app))
-    .title(cpu_title(app));
+    let block = pane_block(top_view_tabs_line(app))
+        .title(center_status_title(app))
+        .title(cpu_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -101,12 +133,14 @@ fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn device_range_title(start: usize, count: usize, device_count: usize) -> Line<'static> {
-    let first = start.max(1).min(device_count);
-    let last = start
-        .saturating_add(count)
-        .saturating_sub(1)
-        .min(device_count);
+fn overview_range_title(
+    name: &'static str,
+    start: usize,
+    count: usize,
+    row_count: usize,
+) -> Line<'static> {
+    let first = start.max(1).min(row_count);
+    let last = start.saturating_add(count).saturating_sub(1).min(row_count);
     let range = if count == 0 || last == 0 || first > last {
         "0".to_string()
     } else if first == last {
@@ -117,13 +151,21 @@ fn device_range_title(start: usize, count: usize, device_count: usize) -> Line<'
     Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            format!("DEVICES {range} of {device_count}"),
+            format!("{name} {range} of {row_count}"),
             Style::default()
                 .fg(p::BR_WHITE)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
     ])
+}
+
+fn device_range_title(start: usize, count: usize, device_count: usize) -> Line<'static> {
+    overview_range_title("DEVICES", start, count, device_count)
+}
+
+fn volume_range_title(start: usize, count: usize, volume_count: usize) -> Line<'static> {
+    overview_range_title("VOLUMES", start, count, volume_count)
 }
 
 fn center_status_title(app: &App) -> Line<'static> {
@@ -179,6 +221,13 @@ fn cpu_title(app: &App) -> Line<'static> {
 }
 
 fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
+    match app.settings.top_view {
+        TopView::Volumes => draw_volumes_view(f, area, app),
+        TopView::Devices => draw_devices_view(f, area, app),
+    }
+}
+
+fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
     let visible = visible_io_ticks(app);
     if visible.is_empty() {
         draw_no_mounted_io(f, area, app);
@@ -195,7 +244,7 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(detail_height),
         ])
         .split(area);
-    let selected = app.selected_io.min(row_count - 1);
+    let selected = app.selected_devices.min(row_count - 1);
     let (throughput_scale, iops_scale) =
         overview_workload_scales(&visible, Some(&aggregate.history), app);
     let overview_inner = pane_block("").inner(sections[0]);
@@ -205,9 +254,12 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
         ..overview_inner
     };
     let (start, count, _) = visible_band_window(device_area.height, row_count, selected);
-    let overview_block = pane_block(device_range_title(start, count, visible.len()))
-        .title(center_status_title(app))
-        .title(cpu_title(app));
+    let overview_block = pane_block(overview_title(
+        app,
+        device_range_title(start, count, visible.len()),
+    ))
+    .title(center_status_title(app))
+    .title(cpu_title(app));
     f.render_widget(overview_block, sections[0]);
     if overview_inner.height > 0 {
         draw_scale_legend(
@@ -216,6 +268,7 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
                 height: 1,
                 ..overview_inner
             },
+            "Device",
         );
     }
     for (slot, index) in (start..start + count).enumerate() {
@@ -239,11 +292,23 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
             draw_overview_row(
                 f,
                 row,
-                visible[index - 1],
-                app,
+                OverviewRow {
+                    tick: visible[index - 1],
+                    label: None,
+                    free: filesystem_free_pct(
+                        &visible[index - 1].device,
+                        &app.filesystems,
+                        &app.volumes,
+                    ),
+                    history: app.io.history.get(&visible[index - 1].device),
+                    traced: app.io.traced_history.get(&visible[index - 1].device),
+                    use_traced: app.io.latency_source() == LatencySource::EbpfPerRequest,
+                },
                 index == selected,
-                throughput_scale,
-                iops_scale,
+                OverviewScales {
+                    throughput: throughput_scale,
+                    iops: iops_scale,
+                },
             );
         }
     }
@@ -269,6 +334,127 @@ fn draw_master_detail(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
+    let volumes = app.io.volume_rows();
+    let ticks: Vec<IoTick> = volumes
+        .iter()
+        .map(|volume| {
+            app.io
+                .volume_io
+                .latest
+                .iter()
+                .find(|tick| tick.device == volume.id)
+                .cloned()
+                .unwrap_or_else(|| IoTick {
+                    device: volume.id.clone(),
+                    ..IoTick::default()
+                })
+        })
+        .collect();
+    let all_ticks: Vec<&IoTick> = app.io.latest.iter().collect();
+    let aggregate = aggregate_io(&all_ticks, app);
+    let row_count = volumes.len() + 1;
+    let (overview_height, detail_height) = master_detail_heights(area.height, row_count);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(overview_height),
+            Constraint::Length(detail_height),
+        ])
+        .split(area);
+    let selected = app.selected_volumes.min(row_count - 1);
+    let (throughput_scale, iops_scale) =
+        volume_workload_scales(volumes, Some(&aggregate.history), app);
+    let overview_inner = pane_block("").inner(sections[0]);
+    let row_area = Rect {
+        y: overview_inner.y.saturating_add(1),
+        height: overview_inner.height.saturating_sub(1),
+        ..overview_inner
+    };
+    let (start, count, _) = visible_band_window(row_area.height, row_count, selected);
+    let overview_block = pane_block(overview_title(
+        app,
+        volume_range_title(start, count, volumes.len()),
+    ))
+    .title(center_status_title(app))
+    .title(cpu_title(app));
+    f.render_widget(overview_block, sections[0]);
+    if overview_inner.height > 0 {
+        draw_scale_legend(
+            f,
+            Rect {
+                height: 1,
+                ..overview_inner
+            },
+            "Volume",
+        );
+    }
+    for (slot, index) in (start..start + count).enumerate() {
+        let row_area = Rect {
+            x: row_area.x,
+            y: row_area.y + slot as u16,
+            width: row_area.width,
+            height: 1,
+        };
+        if index == 0 {
+            draw_overview_aggregate_row(
+                f,
+                row_area,
+                &aggregate,
+                app,
+                selected == 0,
+                throughput_scale,
+                iops_scale,
+            );
+        } else {
+            let volume = &volumes[index - 1];
+            let tick = &ticks[index - 1];
+            let history = app.io.volume_io.history.get(&volume.id);
+            let traced = app.io.volume_io.traced_history.get(&volume.id);
+            draw_overview_row(
+                f,
+                row_area,
+                OverviewRow {
+                    tick,
+                    label: Some(&volume.label),
+                    free: volume_free_pct(volume),
+                    history,
+                    traced,
+                    use_traced: traced.is_some(),
+                },
+                index == selected,
+                OverviewScales {
+                    throughput: throughput_scale,
+                    iops: iops_scale,
+                },
+            );
+        }
+    }
+    if count < row_count {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+        let scrollbar_area = Rect {
+            x: sections[0].x,
+            y: row_area.y,
+            width: sections[0].width,
+            height: row_area.height,
+        };
+        let mut scrollbar_state = ScrollbarState::new(row_count)
+            .position(start)
+            .viewport_content_length(count);
+        f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+    if selected == 0 {
+        draw_aggregate_detail(f, sections[1], &aggregate, app);
+    } else {
+        let volume = &volumes[selected - 1];
+        let history = app.io.volume_io.history.get(&volume.id);
+        let traced = app.io.volume_io.traced_history.get(&volume.id);
+        draw_volume_detail(f, sections[1], volume, history, traced, app);
+    }
+}
+
 fn visible_band_window(height: u16, total: usize, selected: usize) -> (usize, usize, usize) {
     if total == 0 {
         return (0, 0, 0);
@@ -285,7 +471,7 @@ fn visible_band_window(height: u16, total: usize, selected: usize) -> (usize, us
     (start, slots, selected)
 }
 
-fn visible_io_ticks(app: &App) -> Vec<&IoTick> {
+pub(crate) fn visible_io_ticks(app: &App) -> Vec<&IoTick> {
     app.io
         .latest
         .iter()
@@ -299,6 +485,17 @@ fn visible_io_ticks(app: &App) -> Vec<&IoTick> {
 pub(crate) fn visible_device_count(app: &App) -> usize {
     let physical = visible_io_ticks(app).len();
     physical + usize::from(physical > 0)
+}
+
+pub(crate) fn visible_volume_count(app: &App) -> usize {
+    app.io.volume_rows().len() + 1
+}
+
+pub(crate) fn visible_top_view_count(app: &App) -> usize {
+    match app.settings.top_view {
+        TopView::Volumes => visible_volume_count(app),
+        TopView::Devices => visible_device_count(app),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -462,12 +659,9 @@ fn aggregate_histories(
 }
 
 fn draw_no_mounted_io(f: &mut Frame, area: Rect, app: &App) {
-    let block = pane_block(Span::styled(
-        " IO ",
-        Style::default().fg(p::CYAN).add_modifier(Modifier::BOLD),
-    ))
-    .title(center_status_title(app))
-    .title(cpu_title(app));
+    let block = pane_block(top_view_tabs_line(app))
+        .title(center_status_title(app))
+        .title(cpu_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -611,13 +805,13 @@ fn md_failure_flag(flag: &str) -> bool {
     flag.trim_matches(['(', ')']).eq_ignore_ascii_case("f")
 }
 
-fn draw_scale_legend(f: &mut Frame, area: Rect) {
+fn draw_scale_legend(f: &mut Frame, area: Rect, name: &str) {
     if area.height == 0 {
         return;
     }
     let geometry = row_geometry(area.width);
     let mut line = vec![Span::styled(
-        overview_prefix_header(geometry.label),
+        overview_prefix_header_for(geometry.label, name),
         Style::default().fg(p::DIM),
     )];
     let lanes = latency_plot_geometry(geometry.plot);
@@ -658,6 +852,20 @@ struct OverviewPrefixGeometry {
     free: u16,
     throughput: u16,
     iops: u16,
+}
+
+struct OverviewScales {
+    throughput: f64,
+    iops: f64,
+}
+
+struct OverviewRow<'a> {
+    tick: &'a IoTick,
+    label: Option<&'a str>,
+    free: Option<u32>,
+    history: Option<&'a DeviceHistory>,
+    traced: Option<&'a VecDeque<TracedLatencySample>>,
+    use_traced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -705,10 +913,15 @@ fn overview_prefix_geometry(width: u16) -> OverviewPrefixGeometry {
     }
 }
 
+#[cfg(test)]
 fn overview_prefix_header(width: u16) -> String {
+    overview_prefix_header_for(width, "Device")
+}
+
+fn overview_prefix_header_for(width: u16, name: &str) -> String {
     let geometry = overview_prefix_geometry(width);
-    let device = fit_overview_device("Device", geometry.device as usize);
-    let mut header = format!(" {device:<width$}", width = geometry.device as usize);
+    let name = fit_overview_device(name, geometry.device as usize);
+    let mut header = format!(" {name:<width$}", width = geometry.device as usize);
     if geometry.free > 0 {
         header.push_str(&format!(
             " {:>width$} ",
@@ -760,26 +973,27 @@ fn master_detail_heights(height: u16, device_count: usize) -> (u16, u16) {
 fn draw_overview_row(
     f: &mut Frame,
     area: Rect,
-    tick: &IoTick,
-    app: &App,
+    row: OverviewRow<'_>,
     selected: bool,
-    throughput_scale: f64,
-    iops_scale: f64,
+    scales: OverviewScales,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let OverviewRow {
+        tick,
+        label,
+        free,
+        history,
+        traced,
+        use_traced,
+    } = row;
+    let label = label.unwrap_or(&tick.device);
     let g = row_geometry(area.width);
-    let throughput = app
-        .io
-        .history
-        .get(&tick.device)
+    let throughput = history
         .map(|history| combined_throughput(&history.workload_samples))
         .unwrap_or_default();
-    let iops = app
-        .io
-        .history
-        .get(&tick.device)
+    let iops = history
         .map(|history| combined_iops(&history.workload_samples))
         .unwrap_or_default();
     draw_overview_prefix(
@@ -788,31 +1002,30 @@ fn draw_overview_row(
             width: g.label,
             ..area
         },
-        &tick.device,
-        filesystem_free_pct(&tick.device, &app.filesystems, &app.volumes),
+        label,
+        free,
         &throughput,
-        throughput_scale,
+        scales.throughput,
         &iops,
-        iops_scale,
+        scales.iops,
         selected,
     );
 
-    let (read_visual, write_visual) = if app.io.latency_source() == LatencySource::EbpfPerRequest {
-        let samples = app.io.traced_history.get(&tick.device);
+    let (read_visual, write_visual) = if use_traced {
         let lanes = latency_plot_geometry(g.plot);
-        let mut read = samples
+        let mut read = traced
             .map(|s| request_spectrum(s, lanes.read as usize, IoLane::Read))
             .unwrap_or_else(|| "·".repeat(lanes.read as usize));
-        let mut write = samples
+        let mut write = traced
             .map(|s| request_spectrum(s, lanes.write as usize, IoLane::Write))
             .unwrap_or_else(|| "·".repeat(lanes.write as usize));
-        let read_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Read, 0.99));
-        let write_p99 = samples.and_then(|s| directional_quantile(s, IoLane::Write, 0.99));
+        let read_p99 = traced.and_then(|s| directional_quantile(s, IoLane::Read, 0.99));
+        let write_p99 = traced.and_then(|s| directional_quantile(s, IoLane::Write, 0.99));
         overlay_latency_marker(&mut read, read_p99);
         overlay_latency_marker(&mut write, write_p99);
         (read, write)
     } else {
-        let samples = app.io.history.get(&tick.device).map(|h| &h.await_samples);
+        let samples = history.map(|h| &h.await_samples);
         let lanes = latency_plot_geometry(g.plot);
         let mut read = samples
             .map(|s| await_spectrum(s, lanes.read as usize, IoLane::Read))
@@ -1013,11 +1226,18 @@ fn draw_detail(f: &mut Frame, area: Rect, tick: &IoTick, app: &App) {
     draw_detail_data(
         f,
         area,
-        detail_header(&tick.device, &app.filesystems, &app.volumes),
-        detail_context_lines(tick, app),
-        workload,
-        histograms,
-        Some(tick),
+        DetailData {
+            header: detail_header(&tick.device, &app.filesystems, &app.volumes),
+            context: detail_context_lines(tick, app)
+                .into_iter()
+                .map(DetailContext::muted)
+                .collect(),
+            history: workload,
+            histograms,
+            tick: Some(tick),
+            volume_fs_device_ids: None,
+            members: None,
+        },
         app,
     );
 }
@@ -1030,13 +1250,132 @@ fn draw_aggregate_detail(f: &mut Frame, area: Rect, aggregate: &AggregateIo, app
     draw_detail_data(
         f,
         area,
-        aggregate_detail_header(aggregate.device_count, app.io.latest.len()),
-        Vec::new(),
-        Some(&aggregate.history),
-        histograms,
-        None,
+        DetailData {
+            header: aggregate_detail_header(aggregate.device_count, app.io.latest.len()),
+            context: Vec::new(),
+            history: Some(&aggregate.history),
+            histograms,
+            tick: None,
+            volume_fs_device_ids: None,
+            members: None,
+        },
         app,
     );
+}
+
+fn draw_volume_detail(
+    f: &mut Frame,
+    area: Rect,
+    volume: &VolumeRow,
+    history: Option<&DeviceHistory>,
+    traced: Option<&VecDeque<TracedLatencySample>>,
+    app: &App,
+) {
+    let histograms = traced
+        .map(request_histogram)
+        .or_else(|| history.map(|history| await_histogram(&history.await_samples)))
+        .unwrap_or(([0; 7], [0; 7]));
+    let members = app
+        .io
+        .volume_io
+        .members
+        .get(&volume.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    draw_detail_data(
+        f,
+        area,
+        DetailData {
+            header: volume_detail_header(volume),
+            context: volume_detail_context(volume),
+            history,
+            histograms,
+            tick: None,
+            volume_fs_device_ids: Some(&volume.fs_device_ids),
+            members: Some(members),
+        },
+        app,
+    );
+}
+
+fn volume_detail_header(volume: &VolumeRow) -> String {
+    format!(
+        " {} | {} / {} | {} | {} free ",
+        volume.label,
+        volume_kind_label(volume.kind),
+        volume.fs_type,
+        fmt_size(volume.size_bytes),
+        fmt_size(volume.free_bytes),
+    )
+}
+
+fn volume_detail_context(volume: &VolumeRow) -> Vec<DetailContext> {
+    let mut context = Vec::new();
+    if !volume.backing.is_empty() {
+        context.push(DetailContext::muted(format!("Backing: {}", volume.backing)));
+    }
+    if !volume.mounts.is_empty() {
+        const MAX_MOUNTS: usize = 3;
+        let extra = volume.mounts.len().saturating_sub(MAX_MOUNTS);
+        let mut mounts = volume
+            .mounts
+            .iter()
+            .take(MAX_MOUNTS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if extra > 0 {
+            mounts.push_str(&format!(" +{extra} more"));
+        }
+        context.push(DetailContext::muted(format!("Mounts: {mounts}")));
+    }
+    if !volume.warnings.is_empty() {
+        context.push(DetailContext {
+            text: format!("WARNING: {}", volume.warnings.join(" · ")),
+            warning: true,
+        });
+    }
+    if let Some(note) = &volume.latency_note {
+        context.push(DetailContext::muted(format!(
+            "Latency fallback: counter-derived await ({note})"
+        )));
+    }
+    context
+}
+
+fn volume_kind_label(kind: VolumeKind) -> &'static str {
+    match kind {
+        VolumeKind::Filesystem => "Filesystem",
+        VolumeKind::Btrfs => "Btrfs",
+        VolumeKind::ZfsPool => "ZFS pool",
+        VolumeKind::ApfsContainer => "APFS container",
+        VolumeKind::Swap => "Swap",
+    }
+}
+
+#[derive(Debug)]
+struct DetailContext {
+    text: String,
+    warning: bool,
+}
+
+impl DetailContext {
+    fn muted(text: String) -> Self {
+        Self {
+            text,
+            warning: false,
+        }
+    }
+}
+
+struct DetailData<'a> {
+    header: String,
+    context: Vec<DetailContext>,
+    history: Option<&'a DeviceHistory>,
+    histograms: ([u64; 7], [u64; 7]),
+    tick: Option<&'a IoTick>,
+    volume_fs_device_ids: Option<&'a [(u32, u32)]>,
+    members: Option<&'a [IoTick]>,
 }
 
 fn aggregate_detail_header(device_count: usize, total_io_devices: usize) -> String {
@@ -1052,19 +1391,19 @@ fn aggregate_detail_header(device_count: usize, total_io_devices: usize) -> Stri
     }
 }
 
-fn draw_detail_data(
-    f: &mut Frame,
-    area: Rect,
-    header: String,
-    context: Vec<String>,
-    history: Option<&DeviceHistory>,
-    histograms: ([u64; 7], [u64; 7]),
-    tick: Option<&IoTick>,
-    app: &App,
-) {
+fn draw_detail_data(f: &mut Frame, area: Rect, data: DetailData<'_>, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let DetailData {
+        header,
+        context,
+        history,
+        histograms,
+        tick,
+        volume_fs_device_ids,
+        members,
+    } = data;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -1087,12 +1426,20 @@ fn draw_detail_data(
     );
     let panel_area = rows[1];
     if app.detail_tab == DetailTab::Vfs {
-        draw_vfs_activity(f, panel_area, tick, app);
+        draw_vfs_activity(f, panel_area, tick, volume_fs_device_ids, app);
         return;
     }
 
     let available_inner = panel_area.height.saturating_sub(2);
-    let context_rows = detail_context_row_count(available_inner, context.len());
+    let member_rows_wanted = members.map(member_table_row_count).unwrap_or(0);
+    let context_rows = if members.is_some() {
+        let context_capacity = available_inner
+            .saturating_sub(DIRECTION_DETAIL_HEIGHT)
+            .saturating_sub(member_rows_wanted.min(8));
+        (context.len() as u16).min(context_capacity)
+    } else {
+        detail_context_row_count(available_inner, context.len())
+    };
     let block = pane_block(Span::styled(
         header,
         Style::default()
@@ -1107,8 +1454,12 @@ fn draw_detail_data(
     for (offset, line) in context.iter().take(context_rows as usize).enumerate() {
         f.render_widget(
             Paragraph::new(Span::styled(
-                truncate_line(line, area.width as usize),
-                Style::default().fg(p::DIM),
+                truncate_line(&line.text, area.width as usize),
+                if line.warning {
+                    Style::default().fg(p::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(p::DIM)
+                },
             )),
             Rect {
                 x: inner.x,
@@ -1123,7 +1474,26 @@ fn draw_detail_data(
         height: inner.height.saturating_sub(context_rows),
         ..inner
     };
-    let (read_area, write_area) = directional_areas(body);
+    let member_area = if members.is_some() {
+        let height = body
+            .height
+            .saturating_sub(DIRECTION_DETAIL_HEIGHT)
+            .min(member_rows_wanted.min(8));
+        Some(Rect {
+            y: body.y + body.height.saturating_sub(height),
+            height,
+            ..body
+        })
+    } else {
+        None
+    };
+    let detail_area = Rect {
+        height: body
+            .height
+            .saturating_sub(member_area.map_or(0, |area| area.height)),
+        ..body
+    };
+    let (read_area, write_area) = directional_areas(detail_area);
     let workload = history.map(|history| workload_view(&history.workload_samples));
     let await_view = history.map(|history| await_view(&history.await_samples));
     draw_direction_detail(
@@ -1142,6 +1512,84 @@ fn draw_detail_data(
         workload.as_ref(),
         await_view.as_ref(),
     );
+    if let (Some(members), Some(member_area)) = (members, member_area) {
+        draw_member_table(f, member_area, members);
+    }
+}
+
+fn member_table_row_count(members: &[IoTick]) -> u16 {
+    if members.is_empty() {
+        1
+    } else {
+        (members.len() as u16).saturating_add(1)
+    }
+}
+
+fn draw_member_table(f: &mut Frame, area: Rect, members: &[IoTick]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " MEMBER         READ B/s    WRITE B/s      IOPS        R/W AWAIT",
+            Style::default().fg(p::DIM).add_modifier(Modifier::BOLD),
+        )),
+        Rect { height: 1, ..area },
+    );
+    if members.is_empty() {
+        if area.height > 1 {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " no member counter data",
+                    Style::default().fg(p::DIM),
+                )),
+                Rect {
+                    y: area.y + 1,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+        return;
+    }
+
+    let visible_count = (area.height as usize).saturating_sub(1);
+    let extra = members.len().saturating_sub(visible_count);
+    let data_count = visible_count.saturating_sub(usize::from(extra > 0));
+    for (index, member) in members.iter().take(data_count).enumerate() {
+        let (read_bps, write_bps) = member.split.unwrap_or_default();
+        let (read_iops, write_iops) = member.iops_split.unwrap_or_default();
+        let line = format!(
+            " {:<12} {:>10} {:>10} {:>8} {:>9}/{:<9}",
+            member.device,
+            fmt_rate(read_bps),
+            fmt_rate(write_bps),
+            format_iops(read_iops + write_iops),
+            format_latency(member.await_sample.read_us.unwrap_or(0.0)),
+            format_latency(member.await_sample.write_us.unwrap_or(0.0)),
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(line, Style::default().fg(p::DIM))),
+            Rect {
+                y: area.y + 1 + index as u16,
+                height: 1,
+                ..area
+            },
+        );
+    }
+    if extra > 0 && visible_count > 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" +{extra} more members"),
+                Style::default().fg(p::DIM),
+            )),
+            Rect {
+                y: area.y + area.height - 1,
+                height: 1,
+                ..area
+            },
+        );
+    }
 }
 
 fn detail_context_row_count(detail_height: u16, available_lines: usize) -> u16 {
@@ -1413,6 +1861,43 @@ fn overview_workload_scales(
     )
 }
 
+fn volume_workload_scales(
+    volumes: &[VolumeRow],
+    aggregate: Option<&DeviceHistory>,
+    app: &App,
+) -> (f64, f64) {
+    let mut throughput: Vec<Vec<f64>> = volumes
+        .iter()
+        .map(|volume| {
+            app.io
+                .volume_io
+                .history
+                .get(&volume.id)
+                .map(|history| combined_throughput(&history.workload_samples))
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut iops: Vec<Vec<f64>> = volumes
+        .iter()
+        .map(|volume| {
+            app.io
+                .volume_io
+                .history
+                .get(&volume.id)
+                .map(|history| combined_iops(&history.workload_samples))
+                .unwrap_or_default()
+        })
+        .collect();
+    if let Some(history) = aggregate {
+        throughput.push(combined_throughput(&history.workload_samples));
+        iops.push(combined_iops(&history.workload_samples));
+    }
+    (
+        shared_workload_scale(throughput.iter().map(Vec::as_slice)),
+        shared_workload_scale(iops.iter().map(Vec::as_slice)),
+    )
+}
+
 #[derive(Debug, PartialEq)]
 struct AwaitView {
     read: Vec<f64>,
@@ -1666,7 +2151,13 @@ fn vfs_activity_block<'a>(visible: Option<usize>, admitted: u64, dropped: u64) -
     pane_block(Line::from(spans))
 }
 
-fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App) {
+fn draw_vfs_activity(
+    f: &mut Frame,
+    area: Rect,
+    tick: Option<&IoTick>,
+    volume_fs_device_ids: Option<&[(u32, u32)]>,
+    app: &App,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1692,11 +2183,16 @@ fn draw_vfs_activity(f: &mut Frame, area: Rect, tick: Option<&IoTick>, app: &App
         return;
     }
 
-    let fs_devices =
-        tick.map(|tick| filesystem_device_ids_for_io(&tick.device, &app.filesystems, &app.volumes));
-    let entries: Vec<_> = match &fs_devices {
-        Some(ids) => hot_files_for_fs_devices(&app.io.hot_files, ids),
-        None => app.io.hot_files.iter().collect(),
+    let fs_devices = volume_fs_device_ids.map(fs_device_id_set).or_else(|| {
+        tick.map(|tick| filesystem_device_ids_for_io(&tick.device, &app.filesystems, &app.volumes))
+    });
+    let entries: Vec<_> = if let Some(ids) = volume_fs_device_ids {
+        hot_files_for_fs_device_ids(&app.io.hot_files, ids)
+    } else {
+        match &fs_devices {
+            Some(ids) => hot_files_for_fs_devices(&app.io.hot_files, ids),
+            None => app.io.hot_files.iter().collect(),
+        }
     };
     if entries.is_empty() {
         f.render_widget(block, area);
@@ -2037,6 +2533,17 @@ fn hot_files_for_fs_devices<'a>(
     filtered
 }
 
+fn fs_device_id_set(ids: &[(u32, u32)]) -> HashSet<(u32, u32)> {
+    ids.iter().copied().collect()
+}
+
+fn hot_files_for_fs_device_ids<'a>(
+    entries: &'a [VfsFileActivity],
+    fs_device_ids: &[(u32, u32)],
+) -> Vec<&'a VfsFileActivity> {
+    hot_files_for_fs_devices(entries, &fs_device_id_set(fs_device_ids))
+}
+
 fn filesystems_for_io_device<'a>(
     device: &str,
     filesystems: &'a [FsTick],
@@ -2059,6 +2566,14 @@ fn filesystem_free_pct(device: &str, filesystems: &[FsTick], volumes: &VolumeTic
         })
         .max()
         .map(|used| 100 - used)
+}
+
+fn volume_free_pct(volume: &VolumeRow) -> Option<u32> {
+    (volume.size_bytes > 0).then(|| {
+        (volume.free_bytes as f64 / volume.size_bytes as f64 * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u32
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3381,6 +3896,31 @@ mod tests {
     }
 
     #[test]
+    fn volume_vfs_filter_uses_the_rows_filesystem_device_ids() {
+        let volume = VolumeRow {
+            id: "btrfs:test".into(),
+            label: "/mnt/data".into(),
+            kind: VolumeKind::Btrfs,
+            fs_type: "btrfs".into(),
+            mounts: vec!["/mnt/data".into()],
+            size_bytes: 1_000,
+            free_bytes: 500,
+            backing: "btrfs {sda,sdb}".into(),
+            member_disks: vec!["sda".into(), "sdb".into()],
+            counter_sources: vec!["sda".into(), "sdb".into()],
+            latency_sources: Vec::new(),
+            latency_note: None,
+            fs_device_ids: vec![(8, 2)],
+            warnings: Vec::new(),
+        };
+        let entries = vec![hot_file(8, 1, 100.0, 0.0), hot_file(8, 2, 0.0, 500.0)];
+
+        let filtered = hot_files_for_fs_device_ids(&entries, &volume.fs_device_ids);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].write_bps, 500.0);
+    }
+
+    #[test]
     fn vfs_paths_distinguish_resolved_paths_from_collector_fallbacks() {
         let mut item = hot_file(8, 1, 1.0, 0.0);
         assert_eq!(vfs_display_path(&item), "/srv/data.bin");
@@ -3909,6 +4449,7 @@ mod tests {
             }
         );
         assert_eq!(overview_prefix_header(30), " Device     Free B/s    IOPS  ");
+        assert!(overview_prefix_header_for(30, "Volume").starts_with(" Volume"));
         assert_eq!(overview_prefix_header(30).chars().count(), 30);
         assert_eq!(overview_prefix_header(43).chars().count(), 43);
         let lanes = latency_plot_geometry(geometry.plot);
@@ -3943,6 +4484,82 @@ mod tests {
         assert!(line.starts_with("▌nvm~  85%"));
         assert_eq!(buffer.cell((geometry.label - 1, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((geometry.label, 0)).unwrap().symbol(), "R");
+    }
+
+    #[test]
+    fn shared_volume_row_renderer_uses_supplied_history_and_latency_series() {
+        let tick = IoTick {
+            device: "fs:8:1".into(),
+            ..IoTick::default()
+        };
+        let history = DeviceHistory {
+            workload_samples: VecDeque::from(
+                [WorkloadSample {
+                    read_bps: 10_000_000.0,
+                    write_bps: 5_000_000.0,
+                    read_iops: 20.0,
+                    write_iops: 10.0,
+                    ..WorkloadSample::default()
+                }; 8],
+            ),
+            await_samples: VecDeque::from(
+                [AwaitSample {
+                    read_us: Some(300.0),
+                    write_us: Some(2_000.0),
+                }; 8],
+            ),
+            ..DeviceHistory::default()
+        };
+        let traced = VecDeque::from([TracedLatencySample {
+            read: {
+                let mut buckets = [0; LATENCY_BUCKETS];
+                buckets[8] = 10;
+                buckets
+            },
+            write: {
+                let mut buckets = [0; LATENCY_BUCKETS];
+                buckets[14] = 10;
+                buckets
+            },
+        }]);
+        let render = |history: Option<&DeviceHistory>,
+                      traced: Option<&VecDeque<TracedLatencySample>>,
+                      use_traced: bool| {
+            let backend = TestBackend::new(120, 1);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    draw_overview_row(
+                        frame,
+                        frame.area(),
+                        OverviewRow {
+                            tick: &tick,
+                            label: Some("/mnt/volume"),
+                            free: Some(25),
+                            history,
+                            traced,
+                            use_traced,
+                        },
+                        true,
+                        OverviewScales {
+                            throughput: 20_000_000.0,
+                            iops: 40.0,
+                        },
+                    )
+                })
+                .expect("draw volume row");
+            (0..120)
+                .map(|x| terminal.backend().buffer().cell((x, 0)).unwrap().symbol())
+                .collect::<String>()
+        };
+
+        let with_history = render(Some(&history), None, false);
+        let without_history = render(None, None, false);
+        let with_traces = render(Some(&history), Some(&traced), true);
+        assert!(with_history.contains("/mnt/volu"));
+        assert!(with_history.contains("25%"));
+        assert_ne!(with_history, without_history);
+        assert_ne!(with_history, with_traces);
     }
 
     #[test]

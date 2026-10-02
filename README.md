@@ -5,12 +5,14 @@
 all devices on comparable scales, so the busy or slow device stands out before
 you inspect its numbers.
 
-The top of the screen is the device overview:
+The top of the screen has two storage views. **Volumes** is the default and
+groups capacity and IO by the filesystem or pool that can run out of space;
+**Devices** shows the physical IO devices:
 
 - free space, bandwidth, and IOPS, with bandwidth and IOPS histories scaled
-  across the visible devices;
+  across the visible rows;
 - separate read and write latency-density lanes on one fixed logarithmic axis;
-- one selected device whose evidence fills the rest of the screen.
+- one selected volume or device whose evidence fills the rest of the screen.
 
 The tabbed detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
@@ -19,9 +21,9 @@ followed by available filesystem, device, mdraid, APFS, ZFS vdev, and SMART
 facts. On Linux, the VFS tab shows the processes and paths currently
 requesting the most file IO.
 
-This is the view for answering "which device, which direction, and what kind of
-workload?" It complements `iostat`; it is not a benchmark or a long-term
-metrics store.
+This is the view for answering "which volume or device, which direction, and
+what kind of workload?" It complements `iostat`; it is not a benchmark or a
+long-term metrics store.
 
 Sampling defaults to once every two seconds (0.5 Hz). Use `-` and `+` while
 the TUI is running to adjust the interval in 100 ms steps, or select the
@@ -154,9 +156,11 @@ as temperature, wear, spare, and power-on time. `smartmontools` is optional.
 
 | Key | Action |
 |---|---|
-| `j` / `k`, `Down` / `Up` | Select a device |
+| `j` / `k`, `Down` / `Up` | Select a volume or device |
+| `v` / `d` | Show Volumes / Devices |
+| `Shift-Tab` | Toggle between Volumes and Devices |
 | `Tab` | Switch between disk details and VFS activity |
-| `u` | Show mounted devices or all devices |
+| `u` | In Devices, show mounted devices or all devices |
 | `p` | Freeze or resume the display (collection continues) |
 | `-` / `+` | Decrease or increase the sampling interval |
 | `,` | Open settings |
