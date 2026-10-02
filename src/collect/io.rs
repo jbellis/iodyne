@@ -460,6 +460,10 @@ pub struct IoCollector {
     last_vfs_window_update: Instant,
     vfs_activity_window: VfsActivityWindow,
     latency_probe: EbpfLatencyCollector,
+    /// Rows whose series `volume_io` maintains; set by the app when the
+    /// mount/volume snapshot refreshes.
+    volume_rows: Vec<super::storage::VolumeRow>,
+    pub volume_io: super::storage::VolumeIo,
 }
 
 impl IoCollector {
@@ -481,6 +485,8 @@ impl IoCollector {
             last_vfs_window_update: Instant::now(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::new(),
+            volume_rows: Vec::new(),
+            volume_io: Default::default(),
         }
     }
 
@@ -502,6 +508,8 @@ impl IoCollector {
             last_vfs_window_update: Instant::now(),
             vfs_activity_window: VfsActivityWindow::default(),
             latency_probe: EbpfLatencyCollector::unavailable_for_test(),
+            volume_rows: Vec::new(),
+            volume_io: Default::default(),
         }
     }
 
@@ -556,6 +564,15 @@ impl IoCollector {
     }
 
     /// Called from the main loop and rate-limited to the selected cadence.
+    /// Replace the Volumes rows whose IO series are maintained.
+    pub fn set_volume_rows(&mut self, rows: Vec<super::storage::VolumeRow>) {
+        self.volume_rows = rows;
+    }
+
+    pub fn volume_rows(&self) -> &[super::storage::VolumeRow] {
+        &self.volume_rows
+    }
+
     pub fn sample(&mut self, interval: Duration) -> bool {
         self.poll_vfs_events();
         let now = Instant::now();
