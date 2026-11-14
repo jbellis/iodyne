@@ -386,28 +386,63 @@ fn volume_line_window(lines: &[VolumeLine], height: u16, selected: usize) -> (us
     (start, visible)
 }
 
-fn display_path(path: &str) -> String {
-    for (prefix, short) in [
-        ("/Library/Developer", "/L./D."),
-        ("/System/Volumes", "/S./V."),
-        ("/private/var/run", "/p./v./r."),
-        ("/private/tmp/run", "/p./t./r."),
-        ("/Volumes", "/V."),
-        ("/Library", "/L."),
-        ("/System", "/S."),
-        ("/private/var", "/p./v."),
-        ("/private/tmp", "/p./t."),
-        ("/private", "/p."),
-        ("/Users", "/U."),
-    ] {
-        if let Some(suffix) = path
-            .strip_prefix(prefix)
-            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-        {
-            return format!("{short}{suffix}");
+fn display_path(path: &str, width: usize) -> String {
+    if path.chars().count() <= width {
+        return path.to_string();
+    }
+    let prefixes = [
+        "/Library/Developer",
+        "/System/Volumes",
+        "/private/var/run",
+        "/private/tmp/run",
+        "/Volumes",
+        "/Library",
+        "/System",
+        "/private/var",
+        "/private/tmp",
+        "/private",
+        "/Users",
+    ];
+    let Some(prefix) = prefixes.into_iter().find(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    }) else {
+        return fit_overview_device(path, width);
+    };
+    let components: Vec<_> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+    let mut lengths = vec![1; components.len()];
+    let render = |lengths: &[usize]| {
+        let mut label = String::new();
+        for (part, length) in components.iter().zip(lengths) {
+            label.push('/');
+            label.push_str(&part[..*length]);
+            if *length < part.len() {
+                label.push('.');
+            }
+        }
+        label.push_str(&path[prefix.len()..]);
+        label
+    };
+    let mut label = render(&lengths);
+    loop {
+        let mut expanded = false;
+        for index in 0..lengths.len() {
+            if lengths[index] == components[index].len() {
+                continue;
+            }
+            lengths[index] += 1;
+            let candidate = render(&lengths);
+            if candidate.chars().count() <= width {
+                label = candidate;
+                expanded = true;
+            } else {
+                lengths[index] -= 1;
+            }
+        }
+        if !expanded {
+            return fit_overview_device(&label, width);
         }
     }
-    path.to_string()
 }
 
 fn volume_group_label(volume: &VolumeRow, devices: &[DeviceTick]) -> String {
@@ -464,7 +499,7 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_volumes.min(volumes.len());
     let longest_label = volumes
         .iter()
-        .map(|volume| display_path(&volume.label).chars().count() + 2)
+        .map(|volume| volume.label.chars().count() + 2)
         .max()
         .unwrap_or(10);
     let (throughput_scale, iops_scale) =
@@ -544,7 +579,13 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
                 let tick = &ticks[index];
                 let history = app.io.volume_io.history.get(&volume.id);
                 let traced = app.io.volume_io.traced_history.get(&volume.id);
-                let label = format!("  {}", display_path(&volume.label));
+                let label = format!(
+                    "  {}",
+                    display_path(
+                        &volume.label,
+                        overview_geometry.prefix.device.saturating_sub(2) as usize
+                    )
+                );
                 draw_overview_row(
                     f,
                     row_area,
@@ -1513,7 +1554,7 @@ fn draw_volume_detail(
 fn volume_detail_header(volume: &VolumeRow) -> String {
     format!(
         " {} | {} / {} | {} | {} free ",
-        display_path(&volume.label),
+        display_path(&volume.label, 48),
         volume_kind_label(volume.kind),
         volume.fs_type,
         fmt_size(volume.size_bytes),
@@ -1533,7 +1574,7 @@ fn volume_detail_context(volume: &VolumeRow) -> Vec<DetailContext> {
             .mounts
             .iter()
             .take(MAX_MOUNTS)
-            .map(|mount| display_path(mount))
+            .map(|mount| display_path(mount, 32))
             .collect::<Vec<_>>()
             .join(", ");
         if extra > 0 {
@@ -3900,16 +3941,28 @@ mod tests {
     }
 
     #[test]
-    fn display_paths_abbreviate_components_without_changing_similar_names() {
-        assert_eq!(display_path("/Volumes/home_ext1"), "/V./home_ext1");
-        assert_eq!(display_path("/Library/Developer/* (8)"), "/L./D./* (8)");
-        assert_eq!(display_path("/private/var/run/* (7)"), "/p./v./r./* (7)");
-        assert_eq!(display_path("/System/Volumes/Hardware"), "/S./V./Hardware");
+    fn display_paths_expand_to_available_width_without_crossing_the_free_column() {
+        for (path, minimal) in [
+            ("/Volumes/home_ext1", "/V./home_ext1"),
+            ("/Library/Developer/* (11)", "/L./D./* (11)"),
+            ("/private/var/run/* (7)", "/p./v./r./* (7)"),
+            ("/System/Volumes/Hardware", "/S./V./Hardware"),
+        ] {
+            assert_eq!(display_path(path, minimal.chars().count()), minimal);
+            let mut previous = 0;
+            for width in 0..=40 {
+                let label = display_path(path, width);
+                assert!(label.chars().count() <= width);
+                assert!(label.chars().count() >= previous);
+                previous = label.chars().count();
+            }
+            assert_eq!(display_path(path, 40), path);
+        }
         assert_eq!(
-            display_path("/VolumesElsewhere/file"),
+            display_path("/VolumesElsewhere/file", 40),
             "/VolumesElsewhere/file"
         );
-        assert_eq!(display_path("/"), "/");
+        assert_eq!(display_path("/", 1), "/");
     }
 
     #[test]
@@ -3945,7 +3998,7 @@ mod tests {
 
     #[test]
     fn stacked_mount_is_included_for_selected_member() {
-        let filesystems = vec![fs("/dev/md0", "/mnt/optane")];
+        let filesystems = [fs("/dev/md0", "/mnt/optane")];
         let members = vec!["sdd".to_string(), "sde".to_string()];
 
         let selected: Vec<_> = filesystems

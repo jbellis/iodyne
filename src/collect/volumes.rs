@@ -17,6 +17,8 @@ pub struct VolumeTick {
 pub struct DiskImage {
     pub devices: Vec<String>,
     pub path: String,
+    #[cfg(any(target_os = "macos", test))]
+    pub host_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,6 +363,14 @@ fn macos_collect() -> VolumeTick {
     }
     if let Some(root) = super::macos::plist_json("/usr/bin/hdiutil", &["info", "-plist"]) {
         tick.disk_images = parse_disk_images(&root);
+        let mounts = super::mounts::macos_mount_table();
+        for image in &mut tick.disk_images {
+            image.host_device = mounts
+                .iter()
+                .filter(|(mount, _)| std::path::Path::new(&image.path).starts_with(mount))
+                .max_by_key(|(mount, _)| mount.len())
+                .map(|(_, device)| device.clone());
+        }
     }
     tick
 }
@@ -382,7 +392,11 @@ fn parse_disk_images(root: &serde_json::Value) -> Vec<DiskImage> {
                 .collect();
             devices.sort();
             devices.dedup();
-            Some(DiskImage { devices, path })
+            Some(DiskImage {
+                devices,
+                path,
+                host_device: None,
+            })
         })
         .collect()
 }

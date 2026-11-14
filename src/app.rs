@@ -1025,6 +1025,30 @@ mod tests {
     }
 
     #[test]
+    fn runtime_summary_expands_its_label_without_overwriting_a_hundred_percent_free() {
+        let mut app = fixture_app(true);
+        app.settings.top_view = TopView::Volumes;
+        let mut volume = fixture_volume("runtime", vec!["sda"]);
+        volume.mounts = (0..11)
+            .map(|index| format!("/Library/Developer/Runtime/{index}"))
+            .collect();
+        volume.free_bytes = volume.size_bytes;
+        app.io.set_volume_rows(vec![volume]);
+        let screen = render_screen(&app, 160, 50);
+        let row = screen
+            .lines()
+            .find(|line| line.contains("/* (11)"))
+            .unwrap();
+        let legend = screen
+            .lines()
+            .find(|line| line.contains("Free B/s"))
+            .unwrap();
+        assert!(row.contains("/Lib"), "{screen}");
+        assert!(!row.contains('~'), "{screen}");
+        assert_eq!(row.find("100%"), legend.find("Free"), "{screen}");
+    }
+
+    #[test]
     fn compact_volume_overview_shows_a_volume_below_its_disk_header() {
         let mut app = fixture_app(true);
         app.settings.top_view = TopView::Volumes;

@@ -20,6 +20,11 @@ Both views show:
 - separate read and write latency-density lanes on one fixed logarithmic axis;
 - one selected volume or device whose evidence fills the rest of the screen.
 
+Runtime mounts under `/Library/Developer` and `/private/var/run` share summary
+rows within each disk group. These rows sum distinct counter deltas before
+calculating rates and weight latency by operation count. Directory names shorten
+to fit the label column and expand when space permits. JSONL retains full paths.
+
 The tabbed detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
 merges, and await. Its header identifies the mount and backing-device topology,

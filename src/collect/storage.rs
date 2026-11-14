@@ -183,8 +183,12 @@ impl StorageInputs {
                 .iter()
                 .filter(|fs| path.starts_with(&fs.mount))
                 .max_by_key(|fs| fs.mount.len());
-            if let Some(host) = host {
-                let source = mac_media_name(&host.device);
+            if let Some(source) = image
+                .host_device
+                .as_deref()
+                .or_else(|| host.map(|fs| fs.device.as_str()))
+            {
+                let source = mac_media_name(source);
                 if source.starts_with("disk") {
                     for device in &image.devices {
                         self.image_hosts
@@ -1233,6 +1237,75 @@ mod tests {
     }
 
     #[test]
+    fn runtime_groups_keep_backing_disks_and_unrelated_mounts_separate() {
+        let row = |id: &str, mount: &str, disk: &str| VolumeRow {
+            id: id.into(),
+            label: mount.into(),
+            kind: VolumeKind::Filesystem,
+            fs_type: "apfs".into(),
+            mounts: vec![mount.into()],
+            size_bytes: 100,
+            free_bytes: 30,
+            backing: disk.into(),
+            member_disks: vec![disk.into()],
+            counter_sources: vec![disk.into()],
+            latency_sources: vec![],
+            latency_note: None,
+            fs_device_ids: vec![],
+            warnings: vec![],
+        };
+        let rows = group_runtime_rows(vec![
+            row("a", "/Library/Developer/one", "disk0"),
+            row("b", "/Library/Developer/two", "disk1"),
+            row("c", "/Library/DeveloperElsewhere/three", "disk0"),
+            row("d", "/private/var/run/one", "disk0"),
+        ]);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row.id == "c"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == VolumeKind::MountGroup)
+                .count(),
+            3
+        );
+        let before: BTreeMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    (row.size_bytes, row.free_bytes, row.counter_sources.clone()),
+                )
+            })
+            .collect();
+        let after: BTreeMap<_, _> = group_runtime_rows(rows)
+            .into_iter()
+            .map(|row| {
+                (
+                    row.id,
+                    (row.size_bytes, row.free_bytes, row.counter_sources),
+                )
+            })
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn network_hosted_disk_images_are_not_assigned_to_local_root() {
+        let filesystems = [fs("/", "/dev/disk3s1", "apfs", 1000, 400)];
+        let volumes = VolumeTick {
+            disk_images: vec![super::super::volumes::DiskImage {
+                devices: vec!["disk50".into()],
+                path: "/Volumes/network/backup.dmg".into(),
+                host_device: Some("//server/share".into()),
+            }],
+            ..Default::default()
+        };
+        let mut inputs = base_inputs(Platform::MacOs);
+        inputs.read_macos_blocks(&volumes, &filesystems);
+        assert!(!inputs.image_hosts.contains_key("disk50"));
+    }
+
+    #[test]
     fn disk_images_group_with_host_disks_and_keep_virtual_io_counters() {
         let filesystems = [
             fs("/", "/dev/disk3s1", "apfs", 1000, 400),
@@ -1254,6 +1327,7 @@ mod tests {
         let image = |bsd: &str, path: &str| super::super::volumes::DiskImage {
             devices: vec![bsd.into()],
             path: path.into(),
+            host_device: None,
         };
         let volumes = VolumeTick {
             containers: vec![

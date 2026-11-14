@@ -69,15 +69,19 @@ pub enum VfsAttributionKind {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "ebpf")),
-    expect(
-        dead_code,
-        reason = "Linux-only events retain a common cross-platform trace schema"
-    )
-)]
 pub enum VfsPathSource {
+    #[cfg_attr(
+        all(not(all(target_os = "linux", feature = "ebpf")), not(test)),
+        expect(
+            dead_code,
+            reason = "The trace schema includes eBPF paths on platforms without tracing"
+        )
+    )]
     Ebpf,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "/proc path resolution is Linux-only")
+    )]
     ProcFd,
     BasenameFallback,
     #[default]
