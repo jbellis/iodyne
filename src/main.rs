@@ -258,13 +258,16 @@ fn run_diag() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        writeln!(out, "\n=== container_to_physical map ===")?;
-        let cmap = collect::macos::container_to_physical_map();
-        if cmap.is_empty() {
-            writeln!(out, "  (empty)")?;
-        }
-        for (synth, phys) in &cmap {
-            writeln!(out, "  {} -> {}", synth, phys)?;
+        writeln!(out, "\n=== APFS containers ===")?;
+        for container in &volumes.containers {
+            writeln!(
+                out,
+                "  {} -> {}  size={}  used={}",
+                container.bsd,
+                container.physical_stores.join(", "),
+                container.size_bytes,
+                container.used_bytes
+            )?;
         }
     }
 

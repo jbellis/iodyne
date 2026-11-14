@@ -6,7 +6,6 @@ rust-version = "1.87"
 description = "Single-screen, read-only disk IO, latency, topology, and health TUI."
 license = "MIT"
 repository = "https://github.com/jbellis/iodyne"
-homepage = "https://github.com/jbellis/iodyne"
 readme = "README.md"
 keywords = ["disk", "storage", "tui", "diagnostics", "observability"]
 categories = ["command-line-utilities"]
@@ -29,6 +28,9 @@ serde_json = "1"
 aya = { version = "0.14", optional = true }
 aya-obj = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [features]
 # Linux attempts the embedded probe at startup and falls back cleanly when the

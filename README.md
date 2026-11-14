@@ -7,12 +7,23 @@ you inspect its numbers.
 
 The top of the screen has two storage views. **Volumes** is the default and
 groups capacity and IO by the filesystem or pool that can run out of space;
-**Devices** shows the physical IO devices:
+**Devices** shows the physical IO devices. Volumes are grouped beneath physical
+disk headers. Volumes spanning several disks appear once beneath a header listing
+all backing disks. Disk images join the group of the disk storing their image
+files, while their graphs retain virtual-disk I/O counters. Arrow-key selection
+skips these headers.
+
+Both views show:
 
 - free space, bandwidth, and IOPS, with bandwidth and IOPS histories scaled
   across the visible rows;
 - separate read and write latency-density lanes on one fixed logarithmic axis;
 - one selected volume or device whose evidence fills the rest of the screen.
+
+Runtime mounts under `/Library/Developer` and `/private/var/run` share summary
+rows within each disk group. These rows sum distinct counter deltas before
+calculating rates and weight latency by operation count. Directory names shorten
+to fit the label column and expand when space permits. JSONL retains full paths.
 
 The tabbed detail view splits reads from writes and shows rolling latency
 distributions plus aligned histories for IOPS, throughput, request size,
@@ -144,10 +155,35 @@ fallback and privileged eBPF modes on these x86_64 EC2 guests:
 The reusable release matrix and its exact expectations are documented under
 [`testing/ec2`](testing/ec2/README.md).
 
-**macOS:** workload statistics come from IOKit; topology comes from `diskutil`
-and `system_profiler`. APFS containers are attributed to their physical stores.
-Per-request latency and VFS path attribution are not available, so the display
-uses aggregate await.
+**macOS:** APFS and HFS+ use the same Volumes, Devices, detail, and JSONL views.
+IOKit provides read and write bytes, operation counts, and cumulative service
+time. These counters supply bandwidth, IOPS, request size, and average await.
+`system_profiler` supplies device identity and available SMART status.
+
+Topology and APFS capacity come from `diskutil` plist output. Each APFS
+container is one shared-capacity row, including volumes mounted through sealed
+snapshots. All physical stores are retained, and AppleRAID stores resolve to
+their member disks. Each mounted HFS+ filesystem has its own capacity row. Native mount statistics
+include non-browsable volumes and disk images.
+Independent filesystem capacities are added when computing device usage; shared
+APFS capacity is counted once. Per-member allocation inside multi-disk APFS or
+RAID storage is unavailable and is omitted from device usage totals.
+
+If a sandbox blocks `diskutil` access to DiskManagement, APFS uses IOKit
+backing-device relationships and mounted filesystem capacity instead. The detail
+view reports this fallback. Run the binary from Terminal to collect full disk
+metadata; basic throughput and average latency do not require `sudo`.
+
+Filesystem I/O represents the whole backing disks, including activity from
+other partitions on those disks. It is not per-volume I/O attribution.
+Per-request latency histograms, VFS path attribution, merge counts, queue depth,
+discard, and flush counters are unavailable on macOS. JSONL leaves unsupported
+counters null and marks tracing collectors as unsupported.
+
+To validate both filesystems using disposable disk images, build the binary and
+run `python3 testing/macos/smoke.py`. The check creates and mounts temporary
+APFS and HFS+ images, verifies capacity and JSONL topology, then detaches them.
+It requires macOS, Python 3, and permission to attach disk images.
 
 When `smartctl` is on `PATH`, `iodyne` adds available ATA or NVMe evidence such
 as temperature, wear, spare, and power-on time. `smartmontools` is optional.
@@ -191,7 +227,7 @@ otherwise under `~/.config/iodyne/`.
 
 ## Development
 
-Rust 1.75 or newer is required to build from source:
+Rust 1.87 or newer is required to build from source:
 
 ```sh
 git clone https://github.com/jbellis/iodyne.git

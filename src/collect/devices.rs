@@ -1,20 +1,18 @@
 //! Cross-platform device enumeration.
 //!
 //! - **macOS**: `system_profiler -json` for model / firmware / serial /
-//!   SMART / removability, plus `diskutil list` to map APFS-container
-//!   volumes back to the physical disk they live on. sysinfo provides
-//!   used-byte attribution per mount.
+//!   SMART / removability. Cached APFS metadata maps containers to physical
+//!   stores; independent HFS+ partitions contribute their own capacity usage.
 //! - **Other**: `sysinfo::Disks` as the sole source; metadata fields are
 //!   left as placeholders until a platform-specific collector lands.
 
 use std::collections::HashMap;
 
+#[cfg(not(target_os = "macos"))]
 use sysinfo::Disks;
 
 #[cfg(target_os = "macos")]
 use crate::collect::macos;
-#[cfg(target_os = "macos")]
-use crate::collect::mounts;
 
 #[cfg(target_os = "linux")]
 use crate::collect::linux;
@@ -75,7 +73,7 @@ pub fn collect() -> Vec<DeviceTick> {
 /// ZFS CLI process is never spawned on the faster usage refresh.
 pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
     let _ = volumes;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mounts_used = sysinfo_mount_used();
 
     #[cfg(target_os = "macos")]
@@ -86,15 +84,7 @@ pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
         macs.sort_by(|a, b| a.bsd_name.cmp(&b.bsd_name));
         macs.dedup_by(|a, b| a.bsd_name == b.bsd_name);
 
-        let cmap = macos::container_to_physical_map();
-        let mut used_by_phys: HashMap<String, u64> = HashMap::new();
-        for (mount_disk, used) in &mounts_used {
-            let phys = cmap.get(mount_disk).cloned().unwrap_or(mount_disk.clone());
-            let entry = used_by_phys.entry(phys).or_insert(0);
-            if *used > *entry {
-                *entry = *used;
-            }
-        }
+        let used_by_phys = macos_used_by_device(volumes);
 
         let mut out: Vec<DeviceTick> = macs
             .into_iter()
@@ -112,7 +102,7 @@ pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
                     model: m.model,
                     bus: m.protocol,
                     size_bytes: m.size_bytes,
-                    used_bytes: used,
+                    used_bytes: used.min(m.size_bytes),
                     is_removable: m.removable,
                     firmware: m.firmware,
                     serial: m.serial,
@@ -121,7 +111,7 @@ pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
                 }
             })
             .collect();
-        out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        out.sort_by_key(|device| std::cmp::Reverse(device.size_bytes));
         out
     }
 
@@ -201,7 +191,7 @@ pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
                 }
             }
         }
-        out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        out.sort_by_key(|device| std::cmp::Reverse(device.size_bytes));
         out
     }
 }
@@ -209,8 +199,7 @@ pub fn collect_with_volumes(volumes: &super::VolumeTick) -> Vec<DeviceTick> {
 /// Fast path: re-reads sysinfo and updates `used_bytes` on an existing
 /// device list without redoing the slow `system_profiler` enrichment.
 ///
-/// On macOS we re-use the cached container→physical map. If the topology
-/// changed (drive plugged in / out) the next full `collect()` picks it up.
+/// On macOS this uses the caller's cached APFS and AppleRAID topology.
 #[allow(dead_code)] // Kept for callers that do not have a cached volume snapshot.
 pub fn refresh_usage(devices: &mut [DeviceTick]) {
     refresh_usage_with_volumes(devices, &super::VolumeTick::default());
@@ -231,29 +220,27 @@ pub fn refresh_usage_with_volumes(devices: &mut [DeviceTick], volumes: &super::V
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let used = macos_used_by_device(volumes);
+        for device in devices {
+            device.used_bytes = used
+                .get(&device.name)
+                .copied()
+                .unwrap_or(0)
+                .min(device.size_bytes);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let mounts = sysinfo_mount_used();
-
-        #[cfg(target_os = "macos")]
-        let cmap = macos::container_to_physical_map();
-
-        for d in devices.iter_mut() {
-            // macOS APFS shares free across volumes → max-used per physical.
-            let mut used_max = 0u64;
-            for (mount_disk, mu) in &mounts {
-                #[cfg(target_os = "macos")]
-                let phys = cmap
-                    .get(mount_disk)
-                    .cloned()
-                    .unwrap_or_else(|| mount_disk.clone());
-                #[cfg(not(target_os = "macos"))]
-                let phys = mount_disk.clone();
-                if phys == d.name && *mu > used_max {
-                    used_max = *mu;
-                }
-            }
-            d.used_bytes = used_max;
+        for device in devices {
+            device.used_bytes = mounts
+                .iter()
+                .filter(|(name, _)| *name == device.name)
+                .map(|(_, used)| *used)
+                .max()
+                .unwrap_or(0);
         }
     }
 }
@@ -288,10 +275,12 @@ fn linux_used_by_device(volumes: &super::VolumeTick) -> HashMap<String, u64> {
 
 /// Per-leaf allocation by whole-disk name. Data, log, special, and dedup
 /// allocations count as occupied storage; cache and spare allocations do not.
+#[cfg(any(target_os = "linux", test))]
 fn zfs_allocations_by_device(pools: &[super::volumes::ZfsPool]) -> HashMap<String, u64> {
     zfs_allocations_by_device_with_members(pools, &stacked_device_members)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn zfs_allocations_by_device_with_members(
     pools: &[super::volumes::ZfsPool],
     stacked_members: &dyn Fn(&str) -> Option<Vec<String>>,
@@ -476,46 +465,53 @@ fn sysfs_source_members(dev_path: &str) -> Option<Vec<String>> {
 /// label (`Macintosh HD`). The macOS path resolves the device path via
 /// the `mount` command's mount-point → device mapping; the Linux path
 /// keeps the existing behavior.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn sysinfo_mount_used() -> Vec<(String, u64)> {
     let disks = Disks::new_with_refreshed_list();
-    #[cfg(target_os = "macos")]
-    let mount_table = mounts::macos_mount_table();
-
     let mut by_disk: HashMap<String, u64> = HashMap::new();
-    for d in disks.list() {
-        let used = d.total_space().saturating_sub(d.available_space());
-        if used == 0 {
-            continue;
-        }
-        #[cfg(target_os = "macos")]
-        let device_source = {
-            let mp = d.mount_point().to_string_lossy().to_string();
-            match mount_table.get(&mp) {
-                Some(dev) => dev.clone(),
-                None => continue, // virtual fs / devfs / unmapped
-            }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let device_source = d.name().to_string_lossy().to_string();
-
-        let name = short_name(&device_source);
-        let entry = by_disk.entry(name).or_insert(0);
-        // APFS containers report the same free across all volumes — max
-        // avoids over-counting. On Linux the caller sums instead.
-        if used > *entry {
-            *entry = used;
-        }
+    for disk in disks.list() {
+        let name = short_name(&disk.name().to_string_lossy());
+        let used = disk.total_space().saturating_sub(disk.available_space());
+        let entry = by_disk.entry(name).or_default();
+        *entry = (*entry).max(used);
     }
     by_disk.into_iter().collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_used_by_device(volumes: &super::VolumeTick) -> HashMap<String, u64> {
+    let rows = super::storage::resolve(&super::filesystems::collect(), volumes);
+    usage_by_disk(&rows)
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn usage_by_disk(rows: &[super::storage::VolumeRow]) -> HashMap<String, u64> {
+    let mut used = HashMap::<String, u64>::new();
+    for row in rows {
+        // Image capacity is already represented by its host filesystem's usage.
+        if row
+            .counter_sources
+            .iter()
+            .any(|source| !row.member_disks.contains(source))
+        {
+            continue;
+        }
+        // Shared APFS capacity is counted once per container. Multi-store
+        // containers do not expose per-store allocation, so leave it unknown.
+        if let [disk] = row.member_disks.as_slice() {
+            let entry = used.entry(disk.clone()).or_default();
+            *entry = entry.saturating_add(row.size_bytes.saturating_sub(row.free_bytes));
+        }
+    }
+    used
 }
 
 /// Fold a device path or partition name to its whole-disk name:
 /// `/dev/sda1` → `sda`, `nvme0n1p2` → `nvme0n1`, `mmcblk0p2` → `mmcblk0`,
 /// `disk3s1` → `disk3` (macOS). Names with no partition suffix pass
 /// through unchanged (`md0`, `mmcblk0boot0`, `overlay`).
-fn short_name(raw: &str) -> String {
-    let s = raw.trim_start_matches("/dev/");
+pub(super) fn short_name(raw: &str) -> String {
+    let s = super::topology::device_name(raw);
     // macOS: diskNsM → diskN
     if let Some(rest) = s.strip_prefix("disk") {
         let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -560,6 +556,15 @@ mod tests {
         assert_eq!(short_name("/dev/md0p1"), "md0");
         assert_eq!(short_name("/dev/vdb2"), "vdb");
         assert_eq!(short_name("/dev/xvda1"), "xvda");
+        for name in [
+            "/dev/disk3",
+            "/dev/rdisk3",
+            "/dev/disk3s3",
+            "/dev/rdisk3s3",
+            "rdisk3s1s1",
+        ] {
+            assert_eq!(short_name(name), "disk3");
+        }
         assert_eq!(short_name("/dev/disk3s1"), "disk3");
         assert_eq!(short_name("overlay"), "overlay");
     }

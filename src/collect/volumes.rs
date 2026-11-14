@@ -3,11 +3,29 @@
 #[derive(Debug, Clone, Default)]
 pub struct VolumeTick {
     pub containers: Vec<ApfsContainer>,
+    pub apple_raid: Vec<AppleRaid>,
+    pub disk_images: Vec<DiskImage>,
+    pub collection_note: Option<String>,
     pub mdraid: Vec<MdRaidArray>,
     pub zfs: Vec<ZfsPool>,
     /// LVM logical volume metadata, sampled on the slow metadata cadence.
     /// Empty for unprivileged users and hosts without LVM tools.
     pub lvm: Vec<LvmLogicalVolume>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiskImage {
+    pub devices: Vec<String>,
+    pub path: String,
+    #[cfg(any(target_os = "macos", test))]
+    pub host_device: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AppleRaid {
+    pub bsd: String,
+    pub members: Vec<String>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -34,10 +52,24 @@ pub struct ZfsPool {
 pub struct ZfsVdev {
     /// Vdev group name, or a leaf's kernel device name (for example `sdc1`).
     pub name: String,
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(
+            dead_code,
+            reason = "ZFS allocation metadata is consumed by the Linux collector"
+        )
+    )]
     pub vdev_type: String,
     #[allow(dead_code)]
     pub size_bytes: u64,
     /// Missing when OpenZFS prints `-` for a child vdev allocation.
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(
+            dead_code,
+            reason = "ZFS allocation metadata is consumed by the Linux collector"
+        )
+    )]
     pub alloc_bytes: Option<u64>,
     #[allow(dead_code)]
     pub free_bytes: u64,
@@ -84,6 +116,7 @@ impl ZfsPool {
 
     /// Return each leaf with its effective allocation. OpenZFS reports the
     /// allocation on a mirror/RAIDZ group rather than on its children.
+    #[cfg(any(target_os = "linux", test))]
     pub fn leaf_allocations(&self) -> Vec<(&ZfsVdev, u64)> {
         struct AllocationGroup<'a> {
             vdev: &'a ZfsVdev,
@@ -190,7 +223,7 @@ pub struct ApfsContainer {
     /// Parsed APFS usage evidence reserved for a richer volume view.
     #[allow(dead_code)]
     pub used_bytes: u64,
-    pub physical_store: Option<String>,
+    pub physical_stores: Vec<String>,
     pub volumes: Vec<ApfsVolume>,
 }
 
@@ -270,6 +303,7 @@ fn effective_root() -> bool {
         == Some(0)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_lvs_json(text: &str) -> Vec<LvmLogicalVolume> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
@@ -312,135 +346,201 @@ fn parse_lvs_json(text: &str) -> Vec<LvmLogicalVolume> {
 
 #[cfg(target_os = "macos")]
 fn macos_collect() -> VolumeTick {
-    use std::process::Command;
-    let Ok(out) = Command::new("diskutil").args(["apfs", "list"]).output() else {
-        return VolumeTick::default();
+    let mut tick = if let Some(root) =
+        super::macos::plist_json("/usr/sbin/diskutil", &["apfs", "list", "-plist"])
+    {
+        parse_apfs(&root)
+    } else {
+        fallback_apfs(
+            &super::filesystems::collect(),
+            &super::iokit::backing_disks(),
+        )
     };
-    if !out.status.success() {
-        return VolumeTick::default();
+    if let Some(root) =
+        super::macos::plist_json("/usr/sbin/diskutil", &["appleRAID", "list", "-plist"])
+    {
+        tick.apple_raid = parse_apple_raid(&root);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    if let Some(root) = super::macos::plist_json("/usr/bin/hdiutil", &["info", "-plist"]) {
+        tick.disk_images = parse_disk_images(&root);
+        let mounts = super::mounts::macos_mount_table();
+        for image in &mut tick.disk_images {
+            image.host_device = mounts
+                .iter()
+                .filter(|(mount, _)| std::path::Path::new(&image.path).starts_with(mount))
+                .max_by_key(|(mount, _)| mount.len())
+                .map(|(_, device)| device.clone());
+        }
+    }
+    tick
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_disk_images(root: &serde_json::Value) -> Vec<DiskImage> {
+    root.get("images")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|image| {
+            let path = image.get("image-path")?.as_str()?.to_string();
+            let mut devices: Vec<_> = image
+                .get("system-entities")?
+                .as_array()?
+                .iter()
+                .filter_map(|entity| entity.get("dev-entry")?.as_str())
+                .map(super::devices::short_name)
+                .collect();
+            devices.sort();
+            devices.dedup();
+            Some(DiskImage {
+                devices,
+                path,
+                host_device: None,
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn fallback_apfs(
+    filesystems: &[super::FsTick],
+    backing: &std::collections::HashMap<String, Vec<String>>,
+) -> VolumeTick {
+    let mut containers = std::collections::BTreeMap::<String, ApfsContainer>::new();
+    for fs in filesystems
+        .iter()
+        .filter(|fs| fs.fs_type.eq_ignore_ascii_case("apfs"))
+    {
+        let bsd = super::devices::short_name(&fs.device);
+        let container = containers
+            .entry(bsd.clone())
+            .or_insert_with(|| ApfsContainer {
+                bsd: bsd.clone(),
+                physical_stores: backing.get(&bsd).cloned().unwrap_or_default(),
+                ..Default::default()
+            });
+        container.size_bytes = container.size_bytes.max(fs.size_bytes);
+        container.used_bytes = container.used_bytes.max(fs.used_bytes);
+        container.volumes.push(ApfsVolume {
+            bsd: fs
+                .device
+                .strip_prefix("/dev/")
+                .unwrap_or(&fs.device)
+                .to_string(),
+            mount_point: Some(fs.mount.clone()),
+            ..Default::default()
+        });
+    }
+    VolumeTick {
+        containers: containers.into_values().collect(),
+        collection_note: Some("diskutil unavailable; using IOKit topology and mounted capacity. Run from Terminal for full metadata".into()),
+        ..Default::default()
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_apple_raid(root: &serde_json::Value) -> Vec<AppleRaid> {
+    root.get("AppleRAIDSets")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|set| {
+            Some(AppleRaid {
+                bsd: set.get("BSD Name")?.as_str()?.to_string(),
+                members: set
+                    .get("Members")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|member| member.get("BSD Name")?.as_str().map(str::to_string))
+                    .collect(),
+                status: set
+                    .get("Status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_apfs(root: &serde_json::Value) -> VolumeTick {
     let mut result = VolumeTick::default();
-    let mut cur_container: Option<ApfsContainer> = None;
-    let mut cur_volume: Option<ApfsVolume> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-
-        // Container header: "+-- Container disk3 <uuid>"
-        if let Some(rest) = trimmed.strip_prefix("+-- Container ") {
-            // Push any in-flight volume / container.
-            if let Some(v) = cur_volume.take() {
-                if let Some(c) = cur_container.as_mut() {
-                    c.volumes.push(v);
-                }
-            }
-            if let Some(c) = cur_container.take() {
-                result.containers.push(c);
-            }
-            let bsd: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-            cur_container = Some(ApfsContainer {
-                bsd,
-                ..Default::default()
-            });
+    let Some(containers) = root.get("Containers").and_then(|v| v.as_array()) else {
+        return result;
+    };
+    for container in containers {
+        let Some(bsd) = container.get("ContainerReference").and_then(|v| v.as_str()) else {
             continue;
-        }
-
-        // Volume header: "+-> Volume disk3s1 <uuid>"
-        if let Some(rest) = trimmed.strip_prefix("+-> Volume ") {
-            if let Some(v) = cur_volume.take() {
-                if let Some(c) = cur_container.as_mut() {
-                    c.volumes.push(v);
-                }
+        };
+        let size_bytes = container
+            .get("CapacityCeiling")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let free = container
+            .get("CapacityFree")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let mut physical_stores: Vec<String> = container
+            .get("PhysicalStores")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|store| store.get("DeviceIdentifier")?.as_str().map(str::to_string))
+            .collect();
+        if physical_stores.is_empty() {
+            if let Some(store) = container
+                .get("DesignatedPhysicalStore")
+                .and_then(|v| v.as_str())
+            {
+                physical_stores.push(store.to_string());
             }
-            let bsd: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-            cur_volume = Some(ApfsVolume {
-                bsd,
-                ..Default::default()
-            });
-            continue;
         }
-
-        // Physical store: "+-< Physical Store disk0s2 <uuid>"
-        if let Some(rest) = trimmed.strip_prefix("+-< Physical Store ") {
-            let store: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-            if let Some(c) = cur_container.as_mut() {
-                c.physical_store = Some(store);
-            }
-            continue;
-        }
-
-        // Container "Size (Capacity Ceiling):  994662584320 B (994.7 GB)"
-        if let Some(rest) = trimmed.strip_prefix("Size (Capacity Ceiling):") {
-            if let Some(c) = cur_container.as_mut() {
-                if cur_volume.is_none() {
-                    c.size_bytes = first_byte_count(rest);
-                }
-            }
-            continue;
-        }
-        // "Capacity In Use By Volumes:   319709114368 B (319.7 GB) (32.1% used)"
-        if let Some(rest) = trimmed.strip_prefix("Capacity In Use By Volumes:") {
-            if let Some(c) = cur_container.as_mut() {
-                c.used_bytes = first_byte_count(rest);
-            }
-            continue;
-        }
-
-        // Volume role: "APFS Volume Disk (Role):   disk3s1 (System)"
-        if let Some(rest) = trimmed.strip_prefix("APFS Volume Disk (Role):") {
-            if let Some(v) = cur_volume.as_mut() {
-                if let Some(open) = rest.find('(') {
-                    if let Some(close) = rest[open..].find(')') {
-                        v.role = rest[open + 1..open + close].to_string();
-                    }
-                }
-            }
-            continue;
-        }
-        // Volume name: "Name:                      Macintosh HD (Case-insensitive)"
-        if let Some(rest) = trimmed.strip_prefix("Name:") {
-            if let Some(v) = cur_volume.as_mut() {
-                let name = rest.trim();
-                let name = name.split_once(" (").map(|(a, _)| a).unwrap_or(name);
-                v.name = name.trim().to_string();
-            }
-            continue;
-        }
-        // Mount point: "Mount Point:               /System/Volumes/Data"
-        if let Some(rest) = trimmed.strip_prefix("Mount Point:") {
-            if let Some(v) = cur_volume.as_mut() {
-                let mp = rest.trim();
-                if !mp.is_empty() && mp != "Not Mounted" {
-                    v.mount_point = Some(mp.to_string());
-                }
-            }
-            continue;
-        }
-        // "Capacity Consumed:         17797750784 B (17.8 GB)"
-        if let Some(rest) = trimmed.strip_prefix("Capacity Consumed:") {
-            if let Some(v) = cur_volume.as_mut() {
-                v.consumed_bytes = first_byte_count(rest);
-            }
-            continue;
-        }
-        // "FileVault:                 Yes (Unlocked)"
-        if let Some(rest) = trimmed.strip_prefix("FileVault:") {
-            if let Some(v) = cur_volume.as_mut() {
-                v.filevault = rest.trim_start().starts_with("Yes");
-            }
-            continue;
-        }
-    }
-
-    // Flush trailing.
-    if let Some(v) = cur_volume.take() {
-        if let Some(c) = cur_container.as_mut() {
-            c.volumes.push(v);
-        }
-    }
-    if let Some(c) = cur_container.take() {
-        result.containers.push(c);
+        let volumes = container
+            .get("Volumes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|volume| {
+                Some(ApfsVolume {
+                    bsd: volume.get("DeviceIdentifier")?.as_str()?.to_string(),
+                    name: volume
+                        .get("Name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    role: volume
+                        .get("Roles")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    mount_point: volume
+                        .get("MountPoint")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    consumed_bytes: volume
+                        .get("CapacityInUse")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    filevault: volume
+                        .get("FileVault")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                })
+            })
+            .collect();
+        result.containers.push(ApfsContainer {
+            bsd: bsd.to_string(),
+            size_bytes,
+            used_bytes: size_bytes.saturating_sub(free),
+            physical_stores,
+            volumes,
+        });
     }
     result
 }
@@ -929,24 +1029,89 @@ fn parse_progress(line: &str) -> Option<MdRaidProgress> {
     })
 }
 
-/// Extracts the first byte count from a line like
-/// "   319709114368 B (319.7 GB) (32.1% used)" → 319_709_114_368.
-#[cfg(target_os = "macos")]
-fn first_byte_count(s: &str) -> u64 {
-    let mut digits = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-        } else if !digits.is_empty() {
-            break;
-        }
-    }
-    digits.parse().unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_diskutil_still_resolves_mounted_apfs_to_iokit_counters() {
+        let fs = |mount: &str, device: &str| super::super::FsTick {
+            mount: mount.into(),
+            device: device.into(),
+            fs_type: "apfs".into(),
+            size_bytes: 1000,
+            used_bytes: 600,
+            avail_bytes: 400,
+            inode_pct: None,
+            is_removable: false,
+            is_system: true,
+        };
+        let backing = std::collections::HashMap::from([("disk3".into(), vec!["disk0".into()])]);
+        let tick = fallback_apfs(
+            &[
+                fs("/", "/dev/disk3s1s1"),
+                fs("/System/Volumes/Data", "/dev/disk3s5"),
+            ],
+            &backing,
+        );
+        assert_eq!(tick.containers.len(), 1);
+        assert_eq!(tick.containers[0].physical_stores, ["disk0"]);
+        assert_eq!(tick.containers[0].used_bytes, 600);
+        assert_eq!(tick.containers[0].volumes.len(), 2);
+        assert!(tick
+            .collection_note
+            .unwrap()
+            .contains("diskutil unavailable"));
+    }
+
+    #[test]
+    fn parses_disk_image_files_and_normalizes_whole_devices() {
+        let images = parse_disk_images(&serde_json::json!({"images": [{
+            "image-path": "/Library/Simulator Images/runtime.dmg",
+            "system-entities": [{"dev-entry": "/dev/disk24"}, {"dev-entry": "/dev/disk24s1"},
+                {"dev-entry": "/dev/rdisk25s1"}, {"mount-point": "/Volumes/Simulator"}]
+        }, {"system-entities": []}]}));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].devices, ["disk24", "disk25"]);
+        assert_eq!(images[0].path, "/Library/Simulator Images/runtime.dmg");
+    }
+
+    #[test]
+    fn parses_apple_raid_members_and_status() {
+        let sets = parse_apple_raid(&serde_json::json!({"AppleRAIDSets": [{
+            "BSD Name": "disk14", "Status": "Online",
+            "Members": [{"BSD Name": "disk7s2"}, {"BSD Name": "disk9s2"}]
+        }]}));
+        assert_eq!(sets[0].bsd, "disk14");
+        assert_eq!(sets[0].members, ["disk7s2", "disk9s2"]);
+        assert_eq!(sets[0].status, "Online");
+    }
+
+    #[test]
+    fn parses_apfs_capacity_volumes_and_multiple_physical_stores() {
+        let tick = parse_apfs(&serde_json::json!({"Containers": [{
+            "ContainerReference": "disk3", "CapacityCeiling": 1000, "CapacityFree": 400,
+            "PhysicalStores": [{"DeviceIdentifier": "disk0s2"}, {"DeviceIdentifier": "disk1s2"}],
+            "Volumes": [{"DeviceIdentifier": "disk3s1", "Name": "Macintosh HD",
+                "Roles": ["System"], "CapacityInUse": 150, "FileVault": true},
+                {"DeviceIdentifier": "disk3s5", "Name": "Data (work)",
+                "MountPoint": "/System/Volumes/Data", "Roles": ["Data"], "CapacityInUse": 450}]
+        }]}));
+        let container = &tick.containers[0];
+        assert_eq!((container.size_bytes, container.used_bytes), (1000, 600));
+        assert_eq!(container.physical_stores, ["disk0s2", "disk1s2"]);
+        assert_eq!(container.volumes[0].role, "System");
+        assert!(container.volumes[0].filevault);
+        assert_eq!(container.volumes[1].name, "Data (work)");
+        assert_eq!(container.volumes[1].consumed_bytes, 450);
+        assert_eq!(
+            container.volumes[1].mount_point.as_deref(),
+            Some("/System/Volumes/Data")
+        );
+        assert!(parse_apfs(&serde_json::json!({"Error": "unavailable"}))
+            .containers
+            .is_empty());
+    }
 
     #[test]
     fn parses_two_active_arrays() {

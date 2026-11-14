@@ -80,11 +80,28 @@ fn relationships_with(
             ));
         }
     }
+    for raid in &volumes.apple_raid {
+        for member in &raid.members {
+            edges.insert(("raid_member_of", member.clone(), raid.bsd.clone()));
+            if let Some(parent) = partition_parent(member) {
+                edges.insert(("partition_of", member.clone(), parent));
+            }
+        }
+    }
+    for image in &volumes.disk_images {
+        for device in &image.devices {
+            edges.insert((
+                "disk_image_backed_by_file",
+                device.clone(),
+                image.path.clone(),
+            ));
+        }
+    }
     for container in &volumes.containers {
         for volume in &container.volumes {
             edges.insert(("apfs_volume_of", volume.bsd.clone(), container.bsd.clone()));
         }
-        if let Some(store) = &container.physical_store {
+        for store in &container.physical_stores {
             edges.insert((
                 "apfs_container_backed_by",
                 container.bsd.clone(),
@@ -121,7 +138,10 @@ fn relationships_with(
 }
 
 pub fn device_name(value: &str) -> &str {
-    value.strip_prefix("/dev/").unwrap_or(value)
+    let name = value.strip_prefix("/dev/").unwrap_or(value);
+    name.strip_prefix('r')
+        .filter(|name| name.starts_with("disk"))
+        .unwrap_or(name)
 }
 
 fn partition_parent(name: &str) -> Option<String> {

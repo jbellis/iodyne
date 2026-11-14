@@ -4,16 +4,23 @@
 //! `ebpf` feature, non-Linux systems, and Linux systems which reject BPF loads
 //! all report an ordinary status and continue using `/proc/diskstats`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
+use std::collections::VecDeque;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 mod batch;
 
 pub const LATENCY_BUCKETS: usize = 32;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 const FUSE_ORIGIN_UNKNOWN: u32 = u32::MAX;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 const FUSE_ORIGIN_PROTOCOL: u32 = 1;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 const FUSE_ORIGIN_WRITEBACK: u32 = 2;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 const FUSE_ORIGIN_PID_ZERO: u32 = 3;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 const CGROUP_CONTAINER_CACHE_CAPACITY: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -43,8 +50,16 @@ pub enum VfsActivitySource {
     EbpfCompletedBytes,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "ebpf")),
+    expect(
+        dead_code,
+        reason = "Linux-only events retain a common cross-platform trace schema"
+    )
+)]
 pub enum VfsAttributionKind {
+    #[default]
     Direct,
     FuseProtocol,
     FuseWriteback,
@@ -53,24 +68,24 @@ pub enum VfsAttributionKind {
     Unknown(u32),
 }
 
-impl Default for VfsAttributionKind {
-    fn default() -> Self {
-        Self::Direct
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum VfsPathSource {
+    #[cfg_attr(
+        all(not(all(target_os = "linux", feature = "ebpf")), not(test)),
+        expect(
+            dead_code,
+            reason = "The trace schema includes eBPF paths on platforms without tracing"
+        )
+    )]
     Ebpf,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "/proc path resolution is Linux-only")
+    )]
     ProcFd,
     BasenameFallback,
+    #[default]
     Unresolved,
-}
-
-impl Default for VfsPathSource {
-    fn default() -> Self {
-        Self::Unresolved
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +97,7 @@ pub enum EbpfStatus {
     Unavailable(String),
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 fn independent_vfs_status(result: Result<(), String>) -> EbpfStatus {
     result.map_or_else(EbpfStatus::Unavailable, |_| EbpfStatus::Active)
 }
@@ -118,6 +134,7 @@ struct HistogramKey {
     bucket: u32,
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(C)]
 struct VfsFileKey {
@@ -128,6 +145,7 @@ struct VfsFileKey {
     _padding: u32,
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(C)]
 struct VfsAggKey {
@@ -140,6 +158,7 @@ struct VfsAggKey {
     _padding: u32,
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct VfsAggValue {
@@ -160,6 +179,7 @@ struct VfsAggValue {
     basename: [u8; 64],
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 impl Default for VfsAggValue {
     fn default() -> Self {
         Self {
@@ -182,6 +202,7 @@ impl Default for VfsAggValue {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct VfsFilePath {
@@ -245,7 +266,9 @@ pub struct EbpfLatencyCollector {
     vfs_fuse_status: EbpfStatus,
     vfs_fuse_writeback_status: EbpfStatus,
     vfs_overlay_status: EbpfStatus,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     cgroup_container_cache: HashMap<u64, bool>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     cgroup_container_order: VecDeque<u64>,
     previous: HashMap<HistogramKey, u64>,
     previous_vfs_drops: u64,
@@ -274,7 +297,9 @@ impl EbpfLatencyCollector {
             vfs_fuse_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_fuse_writeback_status: EbpfStatus::Unavailable("test fixture".into()),
             vfs_overlay_status: EbpfStatus::Unavailable("test fixture".into()),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_cache: HashMap::new(),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
@@ -428,7 +453,9 @@ impl EbpfLatencyCollector {
                     vfs_fuse_status,
                     vfs_fuse_writeback_status,
                     vfs_overlay_status,
+                    #[cfg(all(target_os = "linux", feature = "ebpf"))]
                     cgroup_container_cache: HashMap::new(),
+                    #[cfg(all(target_os = "linux", feature = "ebpf"))]
                     cgroup_container_order: VecDeque::new(),
                     previous: HashMap::new(),
                     previous_vfs_drops: 0,
@@ -455,7 +482,9 @@ impl EbpfLatencyCollector {
                 vfs_overlay_status: EbpfStatus::Unavailable(format!(
                     "block probe initialization failed before OverlayFS attach: {error}"
                 )),
+                #[cfg(all(target_os = "linux", feature = "ebpf"))]
                 cgroup_container_cache: HashMap::new(),
+                #[cfg(all(target_os = "linux", feature = "ebpf"))]
                 cgroup_container_order: VecDeque::new(),
                 previous: HashMap::new(),
                 previous_vfs_drops: 0,
@@ -476,7 +505,9 @@ impl EbpfLatencyCollector {
             vfs_fuse_status: EbpfStatus::DisabledAtBuild,
             vfs_fuse_writeback_status: EbpfStatus::DisabledAtBuild,
             vfs_overlay_status: EbpfStatus::DisabledAtBuild,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_cache: HashMap::new(),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
@@ -494,7 +525,9 @@ impl EbpfLatencyCollector {
             vfs_fuse_status: EbpfStatus::UnsupportedPlatform,
             vfs_fuse_writeback_status: EbpfStatus::UnsupportedPlatform,
             vfs_overlay_status: EbpfStatus::UnsupportedPlatform,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_cache: HashMap::new(),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
             cgroup_container_order: VecDeque::new(),
             previous: HashMap::new(),
             previous_vfs_drops: 0,
@@ -937,6 +970,7 @@ fn enforce_linux_trace_abi() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 fn parse_linux_version(release: &str) -> Option<(u32, u32)> {
     let mut components = release.trim().split(['.', '-']);
     Some((
@@ -962,6 +996,7 @@ fn histogram_delta(
         .collect()
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 fn bpf_string(bytes: &[u8]) -> String {
     let end = bytes
         .iter()
@@ -1017,6 +1052,7 @@ fn cached_cgroup_is_container(
     container_owned
 }
 
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
 fn insert_bounded_cache(
     cache: &mut HashMap<u64, bool>,
     order: &mut VecDeque<u64>,
@@ -1073,6 +1109,7 @@ fn cgroup_id_is_container_at(cgroup_id: u64, root: &std::path::Path) -> bool {
     false
 }
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn attribution_kind(origin_kind: u32) -> VfsAttributionKind {
     match origin_kind {
         0 => VfsAttributionKind::Direct,
