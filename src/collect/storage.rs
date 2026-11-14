@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::io::{DeviceHistory, IoTick, TracedLatencySample};
+use super::topology::device_name;
 use super::{FsTick, VolumeTick};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,7 @@ pub enum VolumeKind {
     Btrfs,
     ZfsPool,
     ApfsContainer,
+    MountGroup,
     Swap,
 }
 
@@ -115,6 +117,7 @@ struct StorageInputs {
     blocks: HashMap<String, BlockInfo>,
     aliases: HashMap<String, String>,
     diskstats: HashSet<String>,
+    image_hosts: HashMap<String, String>,
     btrfs: HashMap<String, (String, Vec<String>)>,
     swaps: Vec<SwapEntry>,
     fs_device_ids: HashMap<String, Option<(u32, u32)>>,
@@ -151,14 +154,58 @@ impl StorageInputs {
         }
 
         #[cfg(target_os = "macos")]
-        {
-            let _ = volumes;
-        }
+        inputs.read_macos_blocks(volumes, filesystems);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = volumes;
         }
         inputs
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn read_macos_blocks(&mut self, volumes: &VolumeTick, filesystems: &[FsTick]) {
+        for container in &volumes.containers {
+            self.blocks.insert(
+                mac_media_name(&container.bsd),
+                BlockInfo {
+                    slaves: container
+                        .physical_stores
+                        .iter()
+                        .map(|name| mac_media_name(name))
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+        }
+        for image in &volumes.disk_images {
+            let path = std::path::Path::new(&image.path);
+            let host = filesystems
+                .iter()
+                .filter(|fs| path.starts_with(&fs.mount))
+                .max_by_key(|fs| fs.mount.len());
+            if let Some(host) = host {
+                let source = mac_media_name(&host.device);
+                if source.starts_with("disk") {
+                    for device in &image.devices {
+                        self.image_hosts
+                            .insert(mac_media_name(device), source.clone());
+                    }
+                }
+            }
+        }
+        for raid in &volumes.apple_raid {
+            self.blocks.insert(
+                mac_media_name(&raid.bsd),
+                BlockInfo {
+                    slaves: raid
+                        .members
+                        .iter()
+                        .map(|name| mac_media_name(name))
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -239,6 +286,11 @@ fn resolve_with_inputs(
             for (index, fs) in filesystems.iter().enumerate() {
                 let source = device_name(&fs.device);
                 let is_container_volume = volume_names.contains(source)
+                    || source.rsplit_once('s').is_some_and(|(base, snapshot)| {
+                        !snapshot.is_empty()
+                            && snapshot.bytes().all(|c| c.is_ascii_digit())
+                            && volume_names.contains(base)
+                    })
                     || container
                         .volumes
                         .iter()
@@ -252,12 +304,9 @@ fn resolve_with_inputs(
                     );
                 }
             }
-            let physical = container
-                .physical_store
-                .as_deref()
-                .map(device_name)
-                .map(mac_media_name);
-            let member_disks = physical.iter().cloned().collect::<Vec<_>>();
+            let counter_sources = mac_counter_sources(&container.physical_stores, inputs);
+            let physical = member_disks_for(&container.physical_stores, inputs);
+            let member_disks = physical.clone();
             let mut row = VolumeRow {
                 id: format!("apfs:{}", container.bsd),
                 label: mounts
@@ -269,9 +318,9 @@ fn resolve_with_inputs(
                 mounts,
                 size_bytes: container.size_bytes,
                 free_bytes: container.size_bytes.saturating_sub(container.used_bytes),
-                backing: format!("apfs {}", physical.as_deref().unwrap_or("unknown")),
+                backing: format!("apfs {}", sorted_braced(&physical)),
                 member_disks,
-                counter_sources: physical.into_iter().collect(),
+                counter_sources,
                 latency_sources: Vec::new(),
                 latency_note: None,
                 fs_device_ids: fs_ids,
@@ -549,7 +598,7 @@ fn resolve_with_inputs(
         };
         let member_disks = member_disks_for(&member_names, inputs);
         let counter_sources = if platform == Platform::MacOs {
-            vec![mac_media_name(&source)]
+            mac_counter_sources(std::slice::from_ref(&source), inputs)
         } else {
             expand_counter_sources(std::slice::from_ref(&source), inputs)
         };
@@ -678,9 +727,119 @@ fn resolve_with_inputs(
         }
     }
 
+    if platform == Platform::MacOs {
+        for row in &mut rows {
+            if let Some(note) = &volumes.collection_note {
+                row.warnings.push(note.clone());
+            }
+            if row.counter_sources.is_empty() {
+                row.warnings
+                    .push("backing I/O unavailable; try running from Terminal".into());
+            }
+            if row
+                .counter_sources
+                .iter()
+                .any(|source| inputs.image_hosts.contains_key(source))
+            {
+                row.warnings
+                    .push("Disk image I/O is measured at the virtual disk".into());
+            } else {
+                row.warnings
+                    .push("I/O counters cover whole backing disks".into());
+            }
+            for raid in &volumes.apple_raid {
+                let members = member_disks_for(std::slice::from_ref(&raid.bsd), inputs);
+                if members.iter().any(|disk| row.member_disks.contains(disk))
+                    && raid.status != "Online"
+                {
+                    row.warnings
+                        .push(format!("AppleRAID {}: {}", raid.bsd, raid.status));
+                }
+            }
+        }
+    }
     assign_latency_sources(&mut rows);
     rows.sort_by(|left, right| left.id.cmp(&right.id));
     StorageResolution { rows, notes }
+}
+
+fn runtime_prefix(mount: &str) -> Option<&'static str> {
+    ["/Library/Developer", "/private/var/run", "/private/tmp/run"]
+        .into_iter()
+        .find(|prefix| std::path::Path::new(mount).starts_with(prefix))
+}
+
+pub(super) fn group_runtime_rows(rows: Vec<VolumeRow>) -> Vec<VolumeRow> {
+    let mut result = Vec::new();
+    let mut groups = BTreeMap::<(Vec<String>, &'static str), Vec<VolumeRow>>::new();
+    for row in rows {
+        let prefix = row.mounts.first().and_then(|mount| runtime_prefix(mount));
+        if let Some(prefix) = prefix.filter(|prefix| {
+            !row.member_disks.is_empty()
+                && row
+                    .mounts
+                    .iter()
+                    .all(|mount| runtime_prefix(mount) == Some(*prefix))
+        }) {
+            groups
+                .entry((row.member_disks.clone(), prefix))
+                .or_default()
+                .push(row);
+        } else {
+            result.push(row);
+        }
+    }
+    if groups.is_empty() {
+        return result;
+    }
+    for ((disks, prefix), rows) in groups {
+        let mounts = rows
+            .iter()
+            .flat_map(|row| row.mounts.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let strings = |field: fn(&VolumeRow) -> &Vec<String>| {
+            rows.iter()
+                .flat_map(|row| field(row).iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        result.push(VolumeRow {
+            id: format!("mount-group:{}:{prefix}", disks.join("+")),
+            label: format!("{prefix}/* ({})", mounts.len()),
+            kind: VolumeKind::MountGroup,
+            fs_type: rows
+                .iter()
+                .flat_map(|row| row.fs_type.split(", "))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", "),
+            size_bytes: rows
+                .iter()
+                .fold(0_u64, |total, row| total.saturating_add(row.size_bytes)),
+            free_bytes: rows
+                .iter()
+                .fold(0_u64, |total, row| total.saturating_add(row.free_bytes)),
+            backing: format!("{} mounts on {}", mounts.len(), format_device_set(&disks)),
+            mounts,
+            member_disks: disks,
+            counter_sources: strings(|row| &row.counter_sources),
+            latency_sources: Vec::new(),
+            latency_note: None,
+            fs_device_ids: rows
+                .iter()
+                .flat_map(|row| row.fs_device_ids.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            warnings: strings(|row| &row.warnings),
+        });
+    }
+    assign_latency_sources(&mut result);
+    result
 }
 
 fn assign_latency_sources(rows: &mut [VolumeRow]) {
@@ -759,7 +918,7 @@ fn is_pseudo_filesystem(fs: &FsTick) -> bool {
 fn is_block_source(name: &str, platform: Platform, inputs: &StorageInputs) -> bool {
     match platform {
         Platform::Linux => inputs.blocks.contains_key(name),
-        Platform::MacOs => name.starts_with("disk"),
+        Platform::MacOs => mac_media_name(name).starts_with("disk"),
         Platform::Other => false,
     }
 }
@@ -775,23 +934,37 @@ fn linux_block_name(source: &str, aliases: &HashMap<String, String>) -> String {
     source.to_string()
 }
 
-fn device_name(value: &str) -> &str {
-    value.strip_prefix("/dev/").unwrap_or(value)
+fn mac_media_name(name: &str) -> String {
+    super::devices::short_name(name)
 }
 
-fn mac_media_name(name: &str) -> String {
-    let Some(rest) = name.strip_prefix("disk") else {
-        return name.to_string();
-    };
-    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    if digits == 0 {
-        return name.to_string();
-    }
-    format!("disk{}", &rest[..digits])
+fn mac_counter_sources(names: &[String], inputs: &StorageInputs) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|name| block_leaves(&mac_media_name(name), inputs))
+        .map(|name| mac_media_name(&name))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn member_disks_for(names: &[String], inputs: &StorageInputs) -> Vec<String> {
     let mut disks = BTreeSet::new();
+    if inputs.platform == Some(Platform::MacOs) {
+        let mut pending = mac_counter_sources(names, inputs);
+        let mut seen = HashSet::new();
+        while let Some(disk) = pending.pop() {
+            if !seen.insert(disk.clone()) {
+                continue;
+            }
+            if let Some(host) = inputs.image_hosts.get(&disk) {
+                pending.extend(mac_counter_sources(std::slice::from_ref(host), inputs));
+            } else {
+                disks.insert(disk);
+            }
+        }
+        return disks.into_iter().collect();
+    }
     for name in names {
         for leaf in block_leaves(name, inputs) {
             let disk = inputs
@@ -973,11 +1146,6 @@ fn read_diskstats_names() -> HashSet<String> {
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_diskstats_names() -> HashSet<String> {
-    HashSet::new()
-}
-
 #[cfg(target_os = "linux")]
 fn read_swaps() -> Vec<SwapEntry> {
     std::fs::read_to_string("/proc/swaps")
@@ -985,11 +1153,7 @@ fn read_swaps() -> Vec<SwapEntry> {
         .unwrap_or_default()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_swaps() -> Vec<SwapEntry> {
-    Vec::new()
-}
-
+#[cfg(any(target_os = "linux", test))]
 fn parse_swaps(text: &str) -> Vec<SwapEntry> {
     text.lines()
         .skip(1)
@@ -1066,6 +1230,147 @@ mod tests {
             platform: Some(platform),
             ..StorageInputs::default()
         }
+    }
+
+    #[test]
+    fn disk_images_group_with_host_disks_and_keep_virtual_io_counters() {
+        let filesystems = [
+            fs("/", "/dev/disk3s1", "apfs", 1000, 400),
+            fs("/raid", "/dev/disk19s1", "apfs", 2000, 800),
+            fs("/sim", "/dev/disk25s1", "apfs", 100, 10),
+            fs("/nested", "/dev/rdisk27s1", "apfs", 50, 5),
+            fs("/raid-image", "/dev/disk29s1", "apfs", 150, 15),
+        ];
+        let container = |bsd: &str, store: &str, volume: &str, size, used| ApfsContainer {
+            bsd: bsd.into(),
+            physical_stores: vec![store.into()],
+            size_bytes: size,
+            used_bytes: used,
+            volumes: vec![ApfsVolume {
+                bsd: volume.into(),
+                ..Default::default()
+            }],
+        };
+        let image = |bsd: &str, path: &str| super::super::volumes::DiskImage {
+            devices: vec![bsd.into()],
+            path: path.into(),
+        };
+        let volumes = VolumeTick {
+            containers: vec![
+                container("disk3", "/dev/rdisk0s2", "disk3s1", 1000, 600),
+                container("disk19", "disk14", "disk19s1", 2000, 1200),
+                container("disk25", "disk24s1", "disk25s1", 100, 90),
+                container("disk27", "disk26s1", "disk27s1", 50, 45),
+                container("disk29", "disk28s1", "disk29s1", 150, 135),
+            ],
+            disk_images: vec![
+                image("disk24", "/Library/Runtime.dmg"),
+                image("disk26", "/sim/nested.dmg"),
+                image("disk28", "/raid/runtime.dmg"),
+            ],
+            apple_raid: vec![super::super::volumes::AppleRaid {
+                bsd: "disk14".into(),
+                members: vec!["disk7s2".into(), "/dev/rdisk9s2".into()],
+                status: "Online".into(),
+            }],
+            ..Default::default()
+        };
+        let mut inputs = base_inputs(Platform::MacOs);
+        inputs.read_macos_blocks(&volumes, &filesystems);
+        let rows = resolve_with_inputs(&filesystems, &volumes, &inputs).rows;
+        for (id, disks, counters) in [
+            ("apfs:disk25", vec!["disk0"], vec!["disk24"]),
+            ("apfs:disk27", vec!["disk0"], vec!["disk26"]),
+            ("apfs:disk29", vec!["disk7", "disk9"], vec!["disk28"]),
+        ] {
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.member_disks, disks);
+            assert_eq!(row.counter_sources, counters);
+        }
+        assert_eq!(
+            super::super::devices::usage_by_disk(&rows).get("disk0"),
+            Some(&600)
+        );
+        inputs.image_hosts.insert("disk24".into(), "disk26".into());
+        inputs.image_hosts.insert("disk26".into(), "disk24".into());
+        assert!(member_disks_for(&["disk24".into()], &inputs).is_empty());
+    }
+
+    #[test]
+    fn macos_apfs_on_apple_raid_uses_member_counters() {
+        let filesystems = [fs("/Volumes/RAID", "/dev/disk19s1", "apfs", 1000, 400)];
+        let volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk19".into(),
+                size_bytes: 1000,
+                used_bytes: 600,
+                physical_stores: vec!["disk14".into()],
+                volumes: vec![ApfsVolume {
+                    bsd: "disk19s1".into(),
+                    ..Default::default()
+                }],
+            }],
+            apple_raid: vec![super::super::volumes::AppleRaid {
+                bsd: "disk14".into(),
+                members: vec!["disk7s2".into(), "disk9s2".into()],
+                status: "Degraded".into(),
+            }],
+            ..Default::default()
+        };
+        let mut inputs = base_inputs(Platform::MacOs);
+        inputs.read_macos_blocks(&volumes, &filesystems);
+        let rows = resolve_with_inputs(&filesystems, &volumes, &inputs).rows;
+        assert_eq!(rows[0].counter_sources, ["disk7", "disk9"]);
+        assert!(rows[0].warnings.iter().any(|s| s.contains("Degraded")));
+        let edges = super::super::topology::relationships(&filesystems, &volumes);
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "raid_member_of" && e.from == "disk7s2" && e.to == "disk14"));
+    }
+
+    #[test]
+    fn macos_resolves_apfs_snapshot_fusion_and_independent_hfs_partitions() {
+        let filesystems = [
+            fs("/", "/dev/disk3s1s1", "apfs", 1000, 400),
+            fs("/System/Volumes/Data", "/dev/disk3s5", "apfs", 1000, 400),
+            fs("/Volumes/Archive", "/dev/disk2s1", "hfs", 2000, 500),
+            fs("/Volumes/Backup", "/dev/disk2s2", "hfs", 3000, 1000),
+        ];
+        let volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk3".into(),
+                size_bytes: 1000,
+                used_bytes: 600,
+                physical_stores: vec!["disk0s2".into(), "disk1s2".into()],
+                volumes: vec![
+                    ApfsVolume {
+                        bsd: "disk3s1".into(),
+                        ..Default::default()
+                    },
+                    ApfsVolume {
+                        bsd: "disk3s5".into(),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let rows = resolve_with_inputs(&filesystems, &volumes, &base_inputs(Platform::MacOs)).rows;
+        assert_eq!(rows.len(), 3);
+        let apfs = rows
+            .iter()
+            .find(|row| row.kind == VolumeKind::ApfsContainer)
+            .unwrap();
+        assert_eq!(apfs.mounts, ["/", "/System/Volumes/Data"]);
+        assert_eq!((apfs.size_bytes, apfs.free_bytes), (1000, 400));
+        assert_eq!(apfs.counter_sources, ["disk0", "disk1"]);
+        for hfs in rows.iter().filter(|row| row.fs_type == "hfs") {
+            assert_eq!(hfs.counter_sources, ["disk2"]);
+            assert!(hfs.latency_note.as_ref().unwrap().contains("shared"));
+        }
+        let used = super::super::devices::usage_by_disk(&rows);
+        assert_eq!(used.get("disk2"), Some(&3500));
+        assert!(!used.contains_key("disk0"));
     }
 
     #[test]
@@ -1199,7 +1504,7 @@ mod tests {
                 bsd: "disk3".into(),
                 size_bytes: 1000,
                 used_bytes: 600,
-                physical_store: Some("disk0s2".into()),
+                physical_stores: vec!["disk0s2".into()],
                 volumes: vec![ApfsVolume {
                     bsd: "disk3s1".into(),
                     mount_point: Some("/".into()),

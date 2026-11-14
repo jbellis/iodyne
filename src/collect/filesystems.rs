@@ -1,10 +1,6 @@
-//! Filesystem (mount) enumeration via `sysinfo::Disks`.
+//! Filesystem capacity from sysinfo, or native mount statistics on macOS.
 //!
-//! One entry per mount point. sysinfo provides total / available bytes,
-//! file-system kind, mount path, device name on Linux. On macOS sysinfo's
-//! disk name is the volume label, so we resolve mount point to BSD device via
-//! `/sbin/mount`. Inode usage and 7d growth aren't in sysinfo — inode % is
-//! `None` for now; growth is computed by the App from a snapshot ring.
+//! macOS includes non-browsable APFS and HFS+ mounts that sysinfo filters out.
 
 use sysinfo::Disks;
 
@@ -29,32 +25,36 @@ pub struct FsTick {
 pub fn collect() -> Vec<FsTick> {
     let disks = Disks::new_with_refreshed_list();
     #[cfg(target_os = "macos")]
-    let mount_table = mounts::macos_mount_table();
-
+    let mut out: Vec<FsTick> = mounts::macos_mount_table()
+        .into_iter()
+        .filter(|(_, device)| super::topology::device_name(device).starts_with("disk"))
+        .filter_map(|(mount, device)| {
+            let removable = disks
+                .list()
+                .iter()
+                .find(|disk| disk.mount_point() == std::path::Path::new(&mount))
+                .is_some_and(|disk| disk.is_removable());
+            macos_mount(mount, device, removable)
+        })
+        .collect();
+    #[cfg(not(target_os = "macos"))]
     let mut out: Vec<FsTick> = disks
         .list()
         .iter()
-        .map(|d| {
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let reported_device = d.name().to_string_lossy().to_string();
-            #[cfg(target_os = "macos")]
-            let device = mount_table.get(&mount).cloned().unwrap_or(reported_device);
-            #[cfg(not(target_os = "macos"))]
-            let device = reported_device;
-            let fs_type = d.file_system().to_string_lossy().to_string();
-            let total = d.total_space();
-            let avail = d.available_space();
-            let used = total.saturating_sub(avail);
+        .map(|disk| {
+            let mount = disk.mount_point().to_string_lossy().to_string();
+            let total = disk.total_space();
+            let avail = disk.available_space();
             FsTick {
                 is_system: is_system_mount(&mount),
                 mount,
-                device,
-                fs_type,
+                device: disk.name().to_string_lossy().to_string(),
+                fs_type: disk.file_system().to_string_lossy().to_string(),
                 size_bytes: total,
-                used_bytes: used,
+                used_bytes: total.saturating_sub(avail),
                 avail_bytes: avail,
                 inode_pct: None,
-                is_removable: d.is_removable(),
+                is_removable: disk.is_removable(),
             }
         })
         .collect();
@@ -63,8 +63,43 @@ pub fn collect() -> Vec<FsTick> {
         b.is_system
             .cmp(&a.is_system)
             .then(b.size_bytes.cmp(&a.size_bytes))
+            .then(a.mount.cmp(&b.mount))
     });
     out
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount(mount: String, device: String, is_removable: bool) -> Option<FsTick> {
+    let path = std::ffi::CString::new(mount.as_bytes()).ok()?;
+    // SAFETY: path is NUL-terminated and lives through the call. stat points to
+    // writable, correctly aligned storage. statfs initializes it on success;
+    // the failure branch returns before any uninitialized fields are read.
+    let stat = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if libc::statfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    let fs_type = stat
+        .f_fstypename
+        .iter()
+        .take_while(|ch| **ch != 0)
+        .map(|ch| *ch as u8 as char)
+        .collect();
+    let size_bytes = stat.f_blocks.saturating_mul(u64::from(stat.f_bsize));
+    let avail_bytes = stat.f_bavail.saturating_mul(u64::from(stat.f_bsize));
+    Some(FsTick {
+        is_system: is_system_mount(&mount),
+        mount,
+        device,
+        fs_type,
+        size_bytes,
+        used_bytes: size_bytes.saturating_sub(avail_bytes),
+        avail_bytes,
+        inode_pct: None,
+        is_removable,
+    })
 }
 
 fn is_system_mount(path: &str) -> bool {

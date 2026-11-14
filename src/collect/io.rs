@@ -19,7 +19,9 @@
 //! display bucket. Real per-op p99 needs eBPF biolatency (Linux)
 //! or IOReport subscription (macOS), both deferred.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub use crate::collect::ebpf::VfsActivitySource;
@@ -583,7 +585,28 @@ impl IoCollector {
     /// Called from the main loop and rate-limited to the selected cadence.
     /// Replace the Volumes rows whose IO series are maintained.
     #[allow(dead_code)] // The Volumes view installs rows from its filesystem snapshot.
-    pub fn set_volume_rows(&mut self, rows: Vec<super::storage::VolumeRow>) {
+    pub fn set_volume_rows(&mut self, mut rows: Vec<super::storage::VolumeRow>) {
+        for row in &mut rows {
+            row.member_disks.sort();
+            row.member_disks.dedup();
+        }
+        let mut rows = super::storage::group_runtime_rows(rows);
+        rows.sort_by(|left, right| {
+            (
+                left.member_disks.is_empty(),
+                &left.member_disks,
+                left.label != "/",
+                &left.label,
+                &left.id,
+            )
+                .cmp(&(
+                    right.member_disks.is_empty(),
+                    &right.member_disks,
+                    right.label != "/",
+                    &right.label,
+                    &right.id,
+                ))
+        });
         let previous: HashMap<_, _> = self
             .volume_rows
             .iter()
@@ -875,7 +898,12 @@ impl IoCollector {
             latest.push(tick);
             members.insert(row.id.clone(), member_ticks);
 
-            if row.latency_sources.is_empty() {
+            if row.latency_sources.is_empty()
+                || !row
+                    .latency_sources
+                    .iter()
+                    .any(|source| self.traced_history.contains_key(source))
+            {
                 self.volume_io.traced_history.remove(&row.id);
             } else {
                 let mut sample = TracedLatencySample::default();
@@ -2415,6 +2443,70 @@ mod tests {
             history.write_us.iter().copied().collect::<Vec<_>>(),
             vec![2_000.0]
         );
+    }
+
+    #[test]
+    fn runtime_mount_groups_deduplicate_counters_and_derive_rates_from_combined_deltas() {
+        let mut collector = IoCollector::new_for_test();
+        let rows = [("a", "disk24"), ("b", "disk26"), ("alias", "disk24")]
+            .into_iter()
+            .map(|(name, source)| {
+                let mut row = volume_row(name, &[source], &["disk0"]);
+                row.mounts = vec![format!("/Library/Developer/CoreSimulator/{name}")];
+                row.member_disks = vec!["disk0".into()];
+                row
+            })
+            .collect();
+        collector.set_volume_rows(rows);
+        assert_eq!(collector.volume_rows.len(), 1);
+        let group = &collector.volume_rows[0];
+        assert_eq!(group.counter_sources, ["disk24", "disk26"]);
+        assert_eq!(group.mounts.len(), 3);
+        assert_eq!((group.size_bytes, group.free_bytes), (3000, 1500));
+        let previous = HashMap::from([
+            ("disk24".into(), totals(0, 0, 0, 0, 0, 0, None)),
+            ("disk26".into(), totals(0, 0, 0, 0, 0, 0, None)),
+        ]);
+        collector.prev_totals = HashMap::from([
+            ("disk24".into(), totals(1000, 0, 2, 0, 20_000, 0, None)),
+            ("disk26".into(), totals(9000, 0, 3, 0, 300_000, 0, None)),
+        ]);
+        collector.sample_volume_io(&previous, 2.0);
+        let tick = &collector.volume_io.latest[0];
+        assert_near(tick.bps, 5000.0);
+        assert_near(tick.iops, 2.5);
+        assert_near(tick.avg_request_bytes.unwrap(), 2000.0);
+        assert_near(tick.await_sample.read_us.unwrap(), 64.0);
+        let previous = collector.prev_totals.clone();
+        collector.prev_totals = HashMap::from([
+            ("disk24".into(), totals(5000, 0, 6, 0, 100_000, 0, None)),
+            ("disk26".into(), totals(17000, 0, 11, 0, 1_100_000, 0, None)),
+        ]);
+        collector.sample_volume_io(&previous, 4.0);
+        let tick = &collector.volume_io.latest[0];
+        assert_near(tick.bps, 3000.0);
+        assert_near(tick.iops, 3.0);
+        assert_near(tick.await_sample.read_us.unwrap(), 880.0 / 12.0);
+    }
+
+    #[test]
+    fn aggregate_volume_latency_does_not_create_empty_request_histograms() {
+        let mut collector = IoCollector::new_for_test();
+        collector.set_volume_rows(vec![volume_row("apfs:disk3", &["disk0"], &["disk0"])]);
+        let previous = HashMap::from([("disk0".into(), totals(0, 0, 0, 0, 0, 0, None))]);
+        collector
+            .prev_totals
+            .insert("disk0".into(), totals(4096, 0, 1, 0, 50_000, 0, None));
+        collector.sample_volume_io(&previous, 1.0);
+        assert_near(collector.volume_io.latest[0].bps, 4096.0);
+        assert_near(
+            collector.volume_io.latest[0].await_sample.read_us.unwrap(),
+            50.0,
+        );
+        assert!(!collector
+            .volume_io
+            .traced_history
+            .contains_key("apfs:disk3"));
     }
 
     #[test]

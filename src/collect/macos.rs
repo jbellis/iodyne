@@ -56,7 +56,7 @@ pub fn collect() -> Vec<MacDevice> {
 }
 
 fn query(kind: ControllerKind, data_type: &str, protocol: &str) -> Vec<MacDevice> {
-    let Ok(out) = Command::new("system_profiler")
+    let Ok(out) = Command::new("/usr/sbin/system_profiler")
         .args([data_type, "-json"])
         .output()
     else {
@@ -179,76 +179,25 @@ fn parse_device(v: &serde_json::Value, kind: ControllerKind, protocol: &str) -> 
     })
 }
 
-/// Builds a `disk3 → disk0` style map from synthesized APFS containers
-/// to their physical disks. Walks `diskutil list -plist` output.
-///
-/// `system_profiler` lists physical disks (disk0); sysinfo mounts live on
-/// volumes inside synthesized containers (disk3s5). This map closes the gap.
-pub fn container_to_physical_map() -> std::collections::HashMap<String, String> {
-    let map = diskutil_container_to_physical_map();
-    if map.is_empty() {
-        crate::collect::iokit::apfs_container_to_physical_map()
-    } else {
-        map
-    }
-}
+/// Read command plist output through the system plist converter.
+pub(crate) fn plist_json(program: &str, args: &[&str]) -> Option<serde_json::Value> {
+    use std::process::Stdio;
 
-fn diskutil_container_to_physical_map() -> std::collections::HashMap<String, String> {
-    let Ok(out) = Command::new("diskutil").args(["list", "-plist"]).output() else {
-        return Default::default();
-    };
-    if !out.status.success() {
-        return Default::default();
+    let mut source = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let converted = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(source.stdout.take()?)
+        .stderr(Stdio::null())
+        .output();
+    let status = source.wait().ok()?;
+    let converted = converted.ok()?;
+    if !status.success() || !converted.status.success() {
+        return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    // The plist is XML; rather than pull in a plist parser, we parse the
-    // plain-text `diskutil list` form instead — it has explicit
-    // "Physical Store diskNsN" lines we can grep.
-    let Ok(plain) = Command::new("diskutil").arg("list").output() else {
-        let _ = s;
-        return Default::default();
-    };
-    let text = String::from_utf8_lossy(&plain.stdout);
-
-    let mut map = std::collections::HashMap::new();
-    let mut current_synth: Option<String> = None;
-    for line in text.lines() {
-        let line = line.trim_start();
-        // Headers look like: "/dev/disk3 (synthesized):"
-        if let Some(rest) = line.strip_prefix("/dev/") {
-            current_synth = None;
-            if let Some(end) = rest.find(' ') {
-                let name = &rest[..end];
-                if rest.contains("(synthesized)") {
-                    current_synth = Some(name.to_string());
-                }
-            }
-            continue;
-        }
-        if let (Some(synth), Some(idx)) = (current_synth.as_ref(), line.find("Physical Store ")) {
-            let after = &line[idx + "Physical Store ".len()..];
-            let phys_partition: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
-            // disk0s2 → disk0
-            let phys: String = phys_partition
-                .chars()
-                .scan(false, |seen_digit, c| {
-                    if c.is_ascii_digit() {
-                        *seen_digit = true;
-                        Some(c)
-                    } else if *seen_digit {
-                        None
-                    } else {
-                        Some(c)
-                    }
-                })
-                .collect();
-            if !phys.is_empty() {
-                map.insert(synth.clone(), phys);
-            }
-        }
-    }
-    map
+    serde_json::from_slice(&converted.stdout).ok()
 }
