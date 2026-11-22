@@ -6,6 +6,7 @@ rust-version = "1.87"
 description = "Single-screen, read-only disk IO, latency, topology, and health TUI."
 license = "MIT"
 repository = "https://github.com/jbellis/iodyne"
+homepage = "https://github.com/jbellis/iodyne"
 readme = "README.md"
 keywords = ["disk", "storage", "tui", "diagnostics", "observability"]
 categories = ["command-line-utilities"]

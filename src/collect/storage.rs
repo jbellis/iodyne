@@ -38,6 +38,7 @@ pub struct VolumeRow {
     #[allow(dead_code)] // Consumed by the Volumes detail pane in the UI worktree.
     pub fs_device_ids: Vec<(u32, u32)>,
     pub warnings: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 /// Per-volume IO series, maintained by `IoCollector` after each sample.
@@ -329,6 +330,7 @@ fn resolve_with_inputs(
                 latency_note: None,
                 fs_device_ids: fs_ids,
                 warnings: Vec::new(),
+                notes: Vec::new(),
             };
             row.mounts = unique_mounts(row.mounts);
             rows.push(row);
@@ -398,6 +400,7 @@ fn resolve_with_inputs(
                 } else {
                     vec![format!("pool health {}", pool.health)]
                 },
+                notes: Vec::new(),
             });
         }
 
@@ -451,6 +454,7 @@ fn resolve_with_inputs(
                 latency_note: Some("pool metadata unavailable".into()),
                 fs_device_ids,
                 warnings: vec!["pool metadata unavailable".into()],
+                notes: Vec::new(),
             });
         }
     }
@@ -519,6 +523,7 @@ fn resolve_with_inputs(
                 latency_note: None,
                 fs_device_ids,
                 warnings: Vec::new(),
+                notes: Vec::new(),
             });
         }
     }
@@ -688,6 +693,7 @@ fn resolve_with_inputs(
                 }
                 warnings
             },
+            notes: Vec::new(),
         });
     }
 
@@ -727,6 +733,7 @@ fn resolve_with_inputs(
                 latency_note: None,
                 fs_device_ids: Vec::new(),
                 warnings: Vec::new(),
+                notes: Vec::new(),
             });
         }
     }
@@ -739,16 +746,15 @@ fn resolve_with_inputs(
             if row.counter_sources.is_empty() {
                 row.warnings
                     .push("backing I/O unavailable; try running from Terminal".into());
-            }
-            if row
+            } else if row
                 .counter_sources
                 .iter()
                 .any(|source| inputs.image_hosts.contains_key(source))
             {
-                row.warnings
+                row.notes
                     .push("Disk image I/O is measured at the virtual disk".into());
             } else {
-                row.warnings
+                row.notes
                     .push("I/O counters cover whole backing disks".into());
             }
             for raid in &volumes.apple_raid {
@@ -840,6 +846,7 @@ pub(super) fn group_runtime_rows(rows: Vec<VolumeRow>) -> Vec<VolumeRow> {
                 .into_iter()
                 .collect(),
             warnings: strings(|row| &row.warnings),
+            notes: strings(|row| &row.notes),
         });
     }
     assign_latency_sources(&mut result);
@@ -1253,6 +1260,7 @@ mod tests {
             latency_note: None,
             fs_device_ids: vec![],
             warnings: vec![],
+            notes: vec![],
         };
         let rows = group_runtime_rows(vec![
             row("a", "/Library/Developer/one", "disk0"),
@@ -1445,6 +1453,33 @@ mod tests {
         let used = super::super::devices::usage_by_disk(&rows);
         assert_eq!(used.get("disk2"), Some(&3500));
         assert!(!used.contains_key("disk0"));
+        assert!(apfs.warnings.is_empty());
+        assert_eq!(apfs.notes, ["I/O counters cover whole backing disks"]);
+    }
+
+    #[test]
+    fn macos_empty_counter_sources_warns_without_contradicting_note() {
+        let filesystems = [fs("/", "/dev/disk3s1s1", "apfs", 1000, 400)];
+        let volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk3".into(),
+                size_bytes: 1000,
+                used_bytes: 600,
+                physical_stores: Vec::new(),
+                volumes: vec![ApfsVolume {
+                    bsd: "disk3s1".into(),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+        let rows = resolve_with_inputs(&filesystems, &volumes, &base_inputs(Platform::MacOs)).rows;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("backing I/O unavailable")));
+        assert!(rows[0].notes.is_empty());
     }
 
     #[test]

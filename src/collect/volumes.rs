@@ -365,14 +365,39 @@ fn macos_collect() -> VolumeTick {
         tick.disk_images = parse_disk_images(&root);
         let mounts = super::mounts::macos_mount_table();
         for image in &mut tick.disk_images {
-            image.host_device = mounts
-                .iter()
-                .filter(|(mount, _)| std::path::Path::new(&image.path).starts_with(mount))
-                .max_by_key(|(mount, _)| mount.len())
-                .map(|(_, device)| device.clone());
+            image.host_device = statfs_mount_source(&image.path).or_else(|| {
+                mounts
+                    .iter()
+                    .filter(|(mount, _)| std::path::Path::new(&image.path).starts_with(mount))
+                    .max_by_key(|(mount, _)| mount.len())
+                    .map(|(_, device)| device.clone())
+            });
         }
     }
     tick
+}
+
+#[cfg(target_os = "macos")]
+fn statfs_mount_source(path: &str) -> Option<String> {
+    let path = std::ffi::CString::new(path.as_bytes()).ok()?;
+    // SAFETY: path is NUL-terminated and lives through the call. stat points to
+    // writable, correctly aligned storage. statfs initializes it on success;
+    // the failure branch returns before any uninitialized fields are read.
+    let stat = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if libc::statfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    let bytes: Vec<u8> = stat
+        .f_mntfromname
+        .iter()
+        .take_while(|ch| **ch != 0)
+        .map(|ch| *ch as u8)
+        .collect();
+    let source = String::from_utf8_lossy(&bytes).into_owned();
+    (!source.is_empty()).then_some(source)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -422,11 +447,7 @@ fn fallback_apfs(
         container.size_bytes = container.size_bytes.max(fs.size_bytes);
         container.used_bytes = container.used_bytes.max(fs.used_bytes);
         container.volumes.push(ApfsVolume {
-            bsd: fs
-                .device
-                .strip_prefix("/dev/")
-                .unwrap_or(&fs.device)
-                .to_string(),
+            bsd: super::topology::device_name(&fs.device).to_string(),
             mount_point: Some(fs.mount.clone()),
             ..Default::default()
         });

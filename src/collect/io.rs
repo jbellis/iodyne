@@ -1841,6 +1841,7 @@ mod tests {
             latency_note: None,
             fs_device_ids: Vec::new(),
             warnings: Vec::new(),
+            notes: Vec::new(),
         }
     }
 

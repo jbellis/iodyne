@@ -323,9 +323,13 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
         let mut last_metadata_refresh = Instant::now();
         loop {
             if last_usage_refresh.elapsed() >= USAGE_REFRESH_INTERVAL {
-                collect::devices::refresh_usage_with_volumes(&mut devices, &volumes);
                 filesystems = collect::filesystems::collect();
                 volume_rows = collect::storage::resolve(&filesystems, &volumes);
+                collect::devices::refresh_usage_with_volume_rows(
+                    &mut devices,
+                    &volumes,
+                    &volume_rows,
+                );
                 last_usage_refresh = Instant::now();
             }
             if last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
@@ -738,6 +742,7 @@ mod tests {
             latency_note: Some("sda shared with swap".into()),
             fs_device_ids: vec![(8, 1)],
             warnings: vec!["DEGRADED".into()],
+            notes: Vec::new(),
         }
     }
 

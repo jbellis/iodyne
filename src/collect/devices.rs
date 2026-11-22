@@ -206,6 +206,7 @@ pub fn refresh_usage(devices: &mut [DeviceTick]) {
 }
 
 /// Fast usage refresh using the already collected volume state.
+#[allow(dead_code)] // Kept for callers without resolved volume rows.
 pub fn refresh_usage_with_volumes(devices: &mut [DeviceTick], volumes: &super::VolumeTick) {
     let _ = volumes;
     // Linux: shared attribution with collect() — a mount's usage lands
@@ -223,13 +224,7 @@ pub fn refresh_usage_with_volumes(devices: &mut [DeviceTick], volumes: &super::V
     #[cfg(target_os = "macos")]
     {
         let used = macos_used_by_device(volumes);
-        for device in devices {
-            device.used_bytes = used
-                .get(&device.name)
-                .copied()
-                .unwrap_or(0)
-                .min(device.size_bytes);
-        }
+        apply_macos_usage(devices, &used);
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -242,6 +237,36 @@ pub fn refresh_usage_with_volumes(devices: &mut [DeviceTick], volumes: &super::V
                 .max()
                 .unwrap_or(0);
         }
+    }
+}
+
+/// Fast usage refresh reusing already resolved volume rows when available.
+pub fn refresh_usage_with_volume_rows(
+    devices: &mut [DeviceTick],
+    volumes: &super::VolumeTick,
+    volume_rows: &[super::storage::VolumeRow],
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = volumes;
+        let used = usage_by_disk(volume_rows);
+        apply_macos_usage(devices, &used);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = volume_rows;
+        refresh_usage_with_volumes(devices, volumes);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_usage(devices: &mut [DeviceTick], used: &HashMap<String, u64>) {
+    for device in devices {
+        device.used_bytes = used
+            .get(&device.name)
+            .copied()
+            .unwrap_or(0)
+            .min(device.size_bytes);
     }
 }
 
