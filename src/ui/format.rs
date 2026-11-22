@@ -4,17 +4,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnitMode {
+    #[default]
     Binary,
     Decimal,
-}
-
-impl Default for UnitMode {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 impl UnitMode {

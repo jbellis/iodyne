@@ -35,7 +35,7 @@ pub struct IokitDeviceStats {
 }
 
 pub fn collect() -> HashMap<String, IokitDeviceStats> {
-    let Ok(out) = Command::new("ioreg")
+    let Ok(out) = Command::new("/usr/sbin/ioreg")
         .args(["-c", "IOBlockStorageDriver", "-r", "-l", "-w", "0"])
         .output()
     else {
@@ -48,8 +48,9 @@ pub fn collect() -> HashMap<String, IokitDeviceStats> {
     parse_ioreg(&text)
 }
 
-pub fn apfs_container_to_physical_map() -> HashMap<String, String> {
-    let Ok(out) = Command::new("ioreg")
+/// Resolve synthesized media to physical driver ancestors without DiskManagement.
+pub(crate) fn backing_disks() -> HashMap<String, Vec<String>> {
+    let Ok(out) = Command::new("/usr/sbin/ioreg")
         .args(["-c", "IOBlockStorageDriver", "-r", "-l", "-w", "0"])
         .output()
     else {
@@ -58,8 +59,50 @@ pub fn apfs_container_to_physical_map() -> HashMap<String, String> {
     if !out.status.success() {
         return HashMap::new();
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_apfs_container_to_physical_map(&text)
+    parse_backing_disks(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_backing_disks(text: &str) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::<String, Vec<String>>::new();
+    let mut physical = None;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line_is_node(line, "IOBlockStorageDriver") {
+            physical = None;
+            let _ = read_property_block(&mut lines);
+        } else if line_is_node(line, "IOMedia") || line_is_node(line, "AppleAPFSMedia") {
+            let Some(props) = read_property_block(&mut lines) else {
+                continue;
+            };
+            if !props
+                .iter()
+                .any(|(key, value)| key == "Whole" && value == "Yes")
+            {
+                continue;
+            }
+            let Some(name) = props
+                .iter()
+                .find(|(key, _)| key == "BSD Name")
+                .map(|(_, value)| strip_quotes(value).to_string())
+            else {
+                continue;
+            };
+            // Only the first whole IOMedia belongs to this physical driver.
+            // Later whole media can be AppleRAID sets or APFS containers.
+            if physical.is_none() {
+                physical = Some(name);
+            } else if let Some(disk) = physical.as_ref() {
+                let members = map.entry(name).or_default();
+                if !members.contains(disk) {
+                    members.push(disk.clone());
+                }
+            }
+        }
+    }
+    for members in map.values_mut() {
+        members.sort();
+    }
+    map
 }
 
 /// Pure parser, exposed for tests on any platform.
@@ -113,58 +156,6 @@ pub(crate) fn parse_ioreg(text: &str) -> HashMap<String, IokitDeviceStats> {
         }
     }
     out
-}
-
-pub(crate) fn parse_apfs_container_to_physical_map(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut current_physical: Option<String> = None;
-
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line_is_node(line, "IOBlockStorageDriver") {
-            current_physical = None;
-            let _ = read_property_block(&mut lines);
-            continue;
-        }
-
-        if line_is_node(line, "IOMedia") {
-            let Some(props) = read_property_block(&mut lines) else {
-                continue;
-            };
-            if property_is_yes(&props, "Whole") {
-                current_physical = property_value(&props, "BSD Name").map(str::to_string);
-            }
-            continue;
-        }
-
-        if line_is_node(line, "AppleAPFSMedia") {
-            let Some(props) = read_property_block(&mut lines) else {
-                continue;
-            };
-            let Some(physical) = current_physical.as_deref() else {
-                continue;
-            };
-            if property_is_yes(&props, "Whole") {
-                if let Some(container) = property_value(&props, "BSD Name") {
-                    if container != physical {
-                        out.insert(container.to_string(), physical.to_string());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn property_value<'a>(props: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    props
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| strip_quotes(v))
-}
-
-fn property_is_yes(props: &[(String, String)], key: &str) -> bool {
-    property_value(props, key) == Some("Yes")
 }
 
 #[derive(Default, Clone, Copy)]
@@ -288,6 +279,36 @@ mod tests {
 "#;
 
     #[test]
+    fn backing_map_preserves_physical_ancestor_through_raid_media() {
+        let subtree = |physical: &str| {
+            format!(
+                r#"+-o driver <class IOBlockStorageDriver, id 0x1>
+{{
+}}
++-o physical <class IOMedia, id 0x2>
+{{
+"Whole" = Yes
+"BSD Name" = "{physical}"
+}}
++-o raid <class IOMedia, id 0x3>
+{{
+"Whole" = Yes
+"BSD Name" = "disk14"
+}}
++-o apfs <class AppleAPFSMedia, id 0x4>
+{{
+"Whole" = Yes
+"BSD Name" = "disk19"
+}}
+"#
+            )
+        };
+        let map = parse_backing_disks(&(subtree("disk7") + &subtree("disk9")));
+        assert_eq!(map["disk14"], ["disk7", "disk9"]);
+        assert_eq!(map["disk19"], ["disk7", "disk9"]);
+    }
+
+    #[test]
     fn parses_one_driver_with_media() {
         let m = parse_ioreg(SAMPLE);
         let stats = m.get("disk0").expect("disk0 should be present");
@@ -314,37 +335,5 @@ mod tests {
 "#;
         let m = parse_ioreg(text);
         assert!(m.is_empty());
-    }
-
-    #[test]
-    fn maps_apfs_whole_media_to_physical_ancestor() {
-        let text = r#"+-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x1, ...>
-  | {
-  |   "Statistics" = {"Bytes (Read)"=10}
-  | }
-  +-o APPLE SSD Media  <class IOMedia, id 0x2, ...>
-    | {
-    |   "Whole" = Yes
-    |   "BSD Name" = "disk0"
-    | }
-    +-o IOGUIDPartitionScheme  <class IOGUIDPartitionScheme, id 0x3, ...>
-      | {
-      | }
-      +-o Container@2  <class IOMedia, id 0x4, ...>
-        | {
-        |   "Whole" = No
-        |   "BSD Name" = "disk0s2"
-        | }
-        +-o AppleAPFSContainerScheme  <class AppleAPFSContainerScheme, id 0x5, ...>
-          | {
-          | }
-          | +-o AppleAPFSMedia  <class AppleAPFSMedia, id 0x6, ...>
-          |   | {
-          |   |   "Whole" = Yes
-          |   |   "BSD Name" = "disk3"
-          |   | }
-"#;
-        let m = parse_apfs_container_to_physical_map(text);
-        assert_eq!(m.get("disk3").map(String::as_str), Some("disk0"));
     }
 }

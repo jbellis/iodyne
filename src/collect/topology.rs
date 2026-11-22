@@ -80,11 +80,30 @@ fn relationships_with(
             ));
         }
     }
+    for raid in &volumes.apple_raid {
+        let raid_bsd = device_name(&raid.bsd).to_string();
+        for member in &raid.members {
+            let member = device_name(member).to_string();
+            edges.insert(("raid_member_of", member.clone(), raid_bsd.clone()));
+            if let Some(parent) = partition_parent(&member) {
+                edges.insert(("partition_of", member, parent));
+            }
+        }
+    }
+    for image in &volumes.disk_images {
+        for device in &image.devices {
+            edges.insert((
+                "disk_image_backed_by_file",
+                device.clone(),
+                image.path.clone(),
+            ));
+        }
+    }
     for container in &volumes.containers {
         for volume in &container.volumes {
             edges.insert(("apfs_volume_of", volume.bsd.clone(), container.bsd.clone()));
         }
-        if let Some(store) = &container.physical_store {
+        for store in &container.physical_stores {
             edges.insert((
                 "apfs_container_backed_by",
                 container.bsd.clone(),
@@ -121,7 +140,10 @@ fn relationships_with(
 }
 
 pub fn device_name(value: &str) -> &str {
-    value.strip_prefix("/dev/").unwrap_or(value)
+    let name = value.strip_prefix("/dev/").unwrap_or(value);
+    name.strip_prefix('r')
+        .filter(|name| name.starts_with("disk"))
+        .unwrap_or(name)
 }
 
 fn partition_parent(name: &str) -> Option<String> {
@@ -293,5 +315,35 @@ mod tests {
         assert!(pairs.contains(&("zfs_vdev_member_of", "dm-0", "tank/mirror-0")));
         assert!(pairs.contains(&("block_device_backed_by", "dm-0", "sda")));
         assert!(pairs.contains(&("block_device_backed_by", "dm-0", "sdb")));
+    }
+
+    #[test]
+    fn normalizes_apple_raid_member_and_set_device_names() {
+        let volumes = VolumeTick {
+            apple_raid: vec![crate::collect::volumes::AppleRaid {
+                bsd: "/dev/rdisk14".into(),
+                members: vec!["/dev/rdisk7s2".into(), "disk9s2".into()],
+                status: "Online".into(),
+            }],
+            ..Default::default()
+        };
+        let no_btrfs = |_: &str| None;
+        let parent = |name: &str| {
+            name.strip_prefix("disk").and_then(|rest| {
+                let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                (digits > 0 && rest[digits..].starts_with('s'))
+                    .then(|| format!("disk{}", &rest[..digits]))
+            })
+        };
+        let no_slaves = |_: &str| Vec::new();
+        let edges = relationships_with(&[], &volumes, &no_btrfs, &parent, &no_slaves);
+        let pairs: BTreeSet<_> = edges
+            .iter()
+            .map(|edge| (edge.kind, edge.from.as_str(), edge.to.as_str()))
+            .collect();
+        assert!(pairs.contains(&("raid_member_of", "disk7s2", "disk14")));
+        assert!(pairs.contains(&("raid_member_of", "disk9s2", "disk14")));
+        assert!(pairs.contains(&("partition_of", "disk7s2", "disk7")));
+        assert!(pairs.contains(&("partition_of", "disk9s2", "disk9")));
     }
 }

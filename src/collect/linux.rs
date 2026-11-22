@@ -62,7 +62,7 @@ pub fn collect() -> Vec<LinuxDevice> {
         out.push(device);
     }
     // Largest first, matching the macOS ordering.
-    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    out.sort_by_key(|device| std::cmp::Reverse(device.size_bytes));
     out
 }
 

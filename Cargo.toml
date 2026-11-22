@@ -30,6 +30,9 @@ aya = { version = "0.14", optional = true }
 aya-obj = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 # Linux attempts the embedded probe at startup and falls back cleanly when the
 # process lacks tracing privileges. Other platforms compile the fallback only.

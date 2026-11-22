@@ -323,9 +323,13 @@ fn spawn_background_collector(initial: CollectorSnapshot) -> Arc<Mutex<Collector
         let mut last_metadata_refresh = Instant::now();
         loop {
             if last_usage_refresh.elapsed() >= USAGE_REFRESH_INTERVAL {
-                collect::devices::refresh_usage_with_volumes(&mut devices, &volumes);
                 filesystems = collect::filesystems::collect();
                 volume_rows = collect::storage::resolve(&filesystems, &volumes);
+                collect::devices::refresh_usage_with_volume_rows(
+                    &mut devices,
+                    &volumes,
+                    &volume_rows,
+                );
                 last_usage_refresh = Instant::now();
             }
             if last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
@@ -738,6 +742,7 @@ mod tests {
             latency_note: Some("sda shared with swap".into()),
             fs_device_ids: vec![(8, 1)],
             warnings: vec!["DEGRADED".into()],
+            notes: Vec::new(),
         }
     }
 
@@ -781,6 +786,38 @@ mod tests {
         }
         assert!(text.lines().any(|line| line.starts_with('┌')));
         assert!(text.lines().any(|line| line.starts_with('│')));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual check of live macOS counters and rendered screens"]
+    fn live_macos_screen_capture() {
+        use std::io::Write;
+        let mut app = App::new(Duration::from_millis(200), None);
+        app.settings.top_view = TopView::Volumes;
+        app.detail_tab = DetailTab::Disk;
+        let path = std::env::temp_dir().join(format!("iodyne-live-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let bytes = vec![0x5a; 1024 * 1024];
+        for _ in 0..12 {
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+            thread::sleep(Duration::from_millis(200));
+            app.tick();
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        for (width, height) in [(80, 24), (120, 40), (160, 70)] {
+            let text = render_screen(&app, width, height);
+            let path = format!("/tmp/iodyne-screen-{width}.txt");
+            std::fs::write(&path, &text).unwrap();
+            println!("screen: {path}");
+        }
+        assert!(app.io.volume_io.latest.iter().any(|tick| tick.bps > 0.0));
+        assert!(app.io.volume_io.history.values().any(|history| history
+            .await_samples
+            .iter()
+            .any(|sample| sample.read_us.is_some() || sample.write_us.is_some())));
     }
 
     #[test]
@@ -990,6 +1027,116 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('d'));
         handle_key(&mut app, KeyCode::Char('u'));
         assert!(app.io_show_unmounted);
+    }
+
+    #[test]
+    fn runtime_summary_expands_its_label_without_overwriting_a_hundred_percent_free() {
+        let mut app = fixture_app(true);
+        app.settings.top_view = TopView::Volumes;
+        let mut volume = fixture_volume("runtime", vec!["sda"]);
+        volume.mounts = (0..11)
+            .map(|index| format!("/Library/Developer/Runtime/{index}"))
+            .collect();
+        volume.free_bytes = volume.size_bytes;
+        app.io.set_volume_rows(vec![volume]);
+        let screen = render_screen(&app, 160, 50);
+        let row = screen
+            .lines()
+            .find(|line| line.contains("/* (11)"))
+            .unwrap();
+        let legend = screen
+            .lines()
+            .find(|line| line.contains("Free B/s"))
+            .unwrap();
+        assert!(row.contains("/Lib"), "{screen}");
+        assert!(!row.contains('~'), "{screen}");
+        assert_eq!(row.find("100%"), legend.find("Free"), "{screen}");
+    }
+
+    #[test]
+    fn compact_volume_overview_shows_a_volume_below_its_disk_header() {
+        let mut app = fixture_app(true);
+        app.settings.top_view = TopView::Volumes;
+        app.io
+            .set_volume_rows(vec![fixture_volume("fs:1", vec!["sda"])]);
+        let screen = render_screen(&app, 80, 24);
+        let overview = screen.split(" DISK ").next().unwrap();
+        assert!(overview.contains("─ sda · Fixture SSD"), "{screen}");
+        assert!(overview.contains("/mnt/data"), "{screen}");
+    }
+
+    #[test]
+    fn volumes_group_by_physical_disks_without_duplicating_shared_volumes() {
+        let mut app = fixture_app(true);
+        let mut root = fixture_volume("root", vec!["sda"]);
+        root.label = "/".into();
+        let mut home = fixture_volume("home", vec!["sda"]);
+        home.label = "/home".into();
+        let mut archive = fixture_volume("archive", vec!["sdb"]);
+        archive.label = "/archive".into();
+        let mut pool = fixture_volume("pool", vec!["sdb", "sda", "sda"]);
+        pool.label = "/pool".into();
+        let mut unknown = fixture_volume("unknown", vec![]);
+        unknown.label = "/unknown".into();
+        app.io
+            .set_volume_rows(vec![archive, unknown, home, pool, root]);
+        app.settings.top_view = TopView::Volumes;
+        assert_eq!(
+            app.io
+                .volume_rows()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "home", "pool", "archive", "unknown"]
+        );
+        let screen = render_screen(&app, 160, 50);
+        for header in [
+            "─ sda · Fixture SSD",
+            "─ sda + sdb",
+            "─ sdb",
+            "─ Unresolved backing device",
+        ] {
+            assert_eq!(screen.matches(header).count(), 1, "{screen}");
+        }
+        assert_eq!(screen.matches("  /pool").count(), 1, "{screen}");
+        assert!(screen.find("─ sda · Fixture SSD") < screen.find("  /home"));
+        assert!(screen.find("  /home") < screen.find("─ sda + sdb"));
+        assert!(screen.find("─ sdb") < screen.find("  /archive"));
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.io.volume_rows()[app.selected_volumes - 1].id, "root");
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.io.volume_rows()[app.selected_volumes - 1].id, "home");
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.io.volume_rows()[app.selected_volumes - 1].id, "pool");
+        let compact = render_screen(&app, 80, 24);
+        assert!(compact.contains("/pool |"));
+        let overview = compact.split(" DISK ").next().unwrap();
+        assert!(overview.contains("─ sda + sdb"), "{compact}");
+        assert!(!overview.contains("─ sda · Fixture SSD"), "{compact}");
+    }
+
+    #[test]
+    fn scrolling_a_long_volume_group_keeps_its_disk_header_and_selection_visible() {
+        let mut app = fixture_app(true);
+        app.settings.top_view = TopView::Volumes;
+        app.io.set_volume_rows(
+            (0..12)
+                .map(|index| {
+                    let mut volume = fixture_volume(&format!("fs:{index:02}"), vec!["sda"]);
+                    volume.label = format!("/data/{index:02}");
+                    volume
+                })
+                .collect(),
+        );
+        app.selected_volumes = 12;
+        let screen = render_screen(&app, 80, 24);
+        assert!(screen.contains("─ sda · Fixture SSD"), "{screen}");
+        assert!(screen.contains("/data/11"), "{screen}");
+        handle_key(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_volumes, 11);
+        let screen = render_screen(&app, 80, 24);
+        assert!(screen.contains("─ sda · Fixture SSD"), "{screen}");
+        assert!(screen.contains("/data/10"), "{screen}");
     }
 
     #[test]

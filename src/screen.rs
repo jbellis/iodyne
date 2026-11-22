@@ -25,6 +25,7 @@ use crate::collect::ebpf::{EbpfStatus, LatencySource, LATENCY_BUCKETS};
 use crate::collect::io::{DeviceHistory, VfsActivitySource, VfsFileActivity};
 use crate::collect::smart::{AtaAttr, SmartTick};
 use crate::collect::storage::{VolumeKind, VolumeRow};
+use crate::collect::topology::device_name as disk_name;
 use crate::collect::volumes::{
     ApfsContainer, MdRaidArray, MdRaidMember, VolumeTick, ZfsPool, ZfsVdev, ZfsVdevSection,
 };
@@ -340,6 +341,129 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeLine {
+    All,
+    Group(usize),
+    Volume(usize),
+}
+
+fn volume_lines(volumes: &[VolumeRow]) -> Vec<VolumeLine> {
+    let mut lines = vec![VolumeLine::All];
+    for (index, volume) in volumes.iter().enumerate() {
+        if index == 0 || volumes[index - 1].member_disks != volume.member_disks {
+            lines.push(VolumeLine::Group(index));
+        }
+        lines.push(VolumeLine::Volume(index));
+    }
+    lines
+}
+
+fn volume_line_window(lines: &[VolumeLine], height: u16, selected: usize) -> (usize, Vec<usize>) {
+    let selected_line = if selected == 0 {
+        0
+    } else {
+        lines
+            .iter()
+            .position(|line| *line == VolumeLine::Volume(selected - 1))
+            .unwrap_or(0)
+    };
+    let (start, count, _) = visible_band_window(height, lines.len(), selected_line);
+    let mut visible: Vec<_> = (start..start + count).collect();
+    // Keep the physical disk visible when scrolling within a long group.
+    if count > 1 && matches!(lines[start], VolumeLine::Volume(_)) {
+        if let Some(group) = lines[..start]
+            .iter()
+            .rposition(|line| matches!(line, VolumeLine::Group(_)))
+        {
+            if matches!(lines[start + 1], VolumeLine::Group(_)) {
+                visible.remove(0);
+                if start + count < lines.len() {
+                    visible.push(start + count);
+                }
+                return (start + 1, visible);
+            } else {
+                visible[0] = group;
+            }
+        }
+    }
+    (start, visible)
+}
+
+fn display_path(path: &str, width: usize) -> String {
+    if path.chars().count() <= width {
+        return path.to_string();
+    }
+    let prefixes = [
+        "/Library/Developer",
+        "/System/Volumes",
+        "/private/var/run",
+        "/private/tmp/run",
+        "/Volumes",
+        "/Library",
+        "/System",
+        "/private/var",
+        "/private/tmp",
+        "/private",
+        "/Users",
+    ];
+    let Some(prefix) = prefixes.into_iter().find(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    }) else {
+        return fit_overview_device(path, width);
+    };
+    let components: Vec<_> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+    let mut lengths = vec![1; components.len()];
+    let render = |lengths: &[usize]| {
+        let mut label = String::new();
+        for (part, length) in components.iter().zip(lengths) {
+            label.push('/');
+            label.push_str(&part[..*length]);
+            if *length < part.len() {
+                label.push('.');
+            }
+        }
+        label.push_str(&path[prefix.len()..]);
+        label
+    };
+    let mut label = render(&lengths);
+    loop {
+        let mut expanded = false;
+        for index in 0..lengths.len() {
+            if lengths[index] == components[index].len() {
+                continue;
+            }
+            lengths[index] += 1;
+            let candidate = render(&lengths);
+            if candidate.chars().count() <= width {
+                label = candidate;
+                expanded = true;
+            } else {
+                lengths[index] -= 1;
+            }
+        }
+        if !expanded {
+            return fit_overview_device(&label, width);
+        }
+    }
+}
+
+fn volume_group_label(volume: &VolumeRow, devices: &[DeviceTick]) -> String {
+    if volume.member_disks.is_empty() {
+        return "Unresolved backing device".into();
+    }
+    let names = volume.member_disks.join(" + ");
+    if let [name] = volume.member_disks.as_slice() {
+        if let Some(device) = devices.iter().find(|device| device.name == *name) {
+            if !device.model.is_empty() && device.model != "Unknown" {
+                return format!("{names} · {}", device.model);
+            }
+        }
+    }
+    names
+}
+
 fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
     let volumes = app.io.volume_rows();
     let ticks: Vec<IoTick> = volumes
@@ -359,8 +483,15 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let all_ticks: Vec<&IoTick> = app.io.latest.iter().collect();
     let aggregate = aggregate_io(&all_ticks, app);
-    let row_count = volumes.len() + 1;
+    let lines = volume_lines(volumes);
+    let row_count = lines.len();
     let (overview_height, detail_height) = master_detail_heights(area.height, row_count);
+    // Two borders, column labels, aggregate, disk header, and one volume.
+    let target_min = area.height.min((row_count as u16).saturating_add(3).min(6));
+    let extra = target_min
+        .saturating_sub(overview_height)
+        .min(detail_height);
+    let (overview_height, detail_height) = (overview_height + extra, detail_height - extra);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -368,10 +499,10 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(detail_height),
         ])
         .split(area);
-    let selected = app.selected_volumes.min(row_count - 1);
+    let selected = app.selected_volumes.min(volumes.len());
     let longest_label = volumes
         .iter()
-        .map(|volume| volume.label.chars().count())
+        .map(|volume| volume.label.chars().count() + 2)
         .max()
         .unwrap_or(10);
     let (throughput_scale, iops_scale) =
@@ -383,10 +514,23 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
         height: overview_inner.height.saturating_sub(1),
         ..overview_inner
     };
-    let (start, count, _) = visible_band_window(row_area.height, row_count, selected);
+    let (start, visible) = volume_line_window(&lines, row_area.height, selected);
+    let visible_volumes: Vec<_> = visible
+        .iter()
+        .filter_map(|index| match lines[*index] {
+            VolumeLine::Volume(volume) => Some(volume + 1),
+            _ => None,
+        })
+        .collect();
+    let first = visible_volumes.first().copied().unwrap_or(0);
+    let last = visible_volumes.last().copied().unwrap_or(0);
     let overview_block = pane_block(overview_title(
         app,
-        volume_range_title(start, count, volumes.len()),
+        volume_range_title(
+            first,
+            if first > 0 { last - first + 1 } else { 0 },
+            volumes.len(),
+        ),
     ))
     .title(center_status_title(app))
     .title(cpu_title(app));
@@ -402,15 +546,15 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
             overview_geometry,
         );
     }
-    for (slot, index) in (start..start + count).enumerate() {
+    for (slot, line_index) in visible.iter().enumerate() {
         let row_area = Rect {
             x: row_area.x,
             y: row_area.y + slot as u16,
             width: row_area.width,
             height: 1,
         };
-        if index == 0 {
-            draw_overview_aggregate_row(
+        match lines[*line_index] {
+            VolumeLine::All => draw_overview_aggregate_row(
                 f,
                 row_area,
                 &aggregate,
@@ -421,33 +565,52 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
                     iops: iops_scale,
                 },
                 overview_geometry,
-            );
-        } else {
-            let volume = &volumes[index - 1];
-            let tick = &ticks[index - 1];
-            let history = app.io.volume_io.history.get(&volume.id);
-            let traced = app.io.volume_io.traced_history.get(&volume.id);
-            draw_overview_row(
-                f,
-                row_area,
-                OverviewRow {
-                    tick,
-                    label: Some(&volume.label),
-                    free: volume_free_pct(volume),
-                    history,
-                    traced,
-                    use_traced: traced.is_some(),
-                },
-                index == selected,
-                OverviewScales {
-                    throughput: throughput_scale,
-                    iops: iops_scale,
-                },
-                overview_geometry,
-            );
+            ),
+            VolumeLine::Group(index) => {
+                let label = format!("─ {}", volume_group_label(&volumes[index], &app.devices));
+                f.render_widget(
+                    Paragraph::new(truncate_line(&label, row_area.width as usize)).style(
+                        Style::default()
+                            .fg(p::BR_WHITE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    row_area,
+                );
+            }
+            VolumeLine::Volume(index) => {
+                let volume = &volumes[index];
+                let tick = &ticks[index];
+                let history = app.io.volume_io.history.get(&volume.id);
+                let traced = app.io.volume_io.traced_history.get(&volume.id);
+                let label = format!(
+                    "  {}",
+                    display_path(
+                        &volume.label,
+                        overview_geometry.prefix.device.saturating_sub(2) as usize
+                    )
+                );
+                draw_overview_row(
+                    f,
+                    row_area,
+                    OverviewRow {
+                        tick,
+                        label: Some(&label),
+                        free: volume_free_pct(volume),
+                        history,
+                        traced,
+                        use_traced: traced.is_some(),
+                    },
+                    index + 1 == selected,
+                    OverviewScales {
+                        throughput: throughput_scale,
+                        iops: iops_scale,
+                    },
+                    overview_geometry,
+                );
+            }
         }
     }
-    if count < row_count {
+    if visible.len() < row_count {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
@@ -459,7 +622,7 @@ fn draw_volumes_view(f: &mut Frame, area: Rect, app: &App) {
         };
         let mut scrollbar_state = ScrollbarState::new(row_count)
             .position(start)
-            .viewport_content_length(count);
+            .viewport_content_length(visible.len());
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
     if selected == 0 {
@@ -810,7 +973,7 @@ fn md_exception_summary(arrays: &[MdRaidArray]) -> Option<String> {
             Some((score, format!(" {}", facts.join(" · "))))
         })
         .collect();
-    exceptions.sort_by(|a, b| b.0.cmp(&a.0));
+    exceptions.sort_by_key(|exception| std::cmp::Reverse(exception.0));
     let (_, mut summary) = exceptions.first()?.clone();
     if exceptions.len() > 1 {
         summary.push_str(&format!(" · +{} arrays", exceptions.len() - 1));
@@ -1394,7 +1557,7 @@ fn draw_volume_detail(
 fn volume_detail_header(volume: &VolumeRow) -> String {
     format!(
         " {} | {} / {} | {} | {} free ",
-        volume.label,
+        display_path(&volume.label, 48),
         volume_kind_label(volume.kind),
         volume.fs_type,
         fmt_size(volume.size_bytes),
@@ -1414,7 +1577,7 @@ fn volume_detail_context(volume: &VolumeRow) -> Vec<DetailContext> {
             .mounts
             .iter()
             .take(MAX_MOUNTS)
-            .map(String::as_str)
+            .map(|mount| display_path(mount, 32))
             .collect::<Vec<_>>()
             .join(", ");
         if extra > 0 {
@@ -1427,6 +1590,12 @@ fn volume_detail_context(volume: &VolumeRow) -> Vec<DetailContext> {
             text: format!("WARNING: {}", volume.warnings.join(" · ")),
             warning: true,
         });
+    }
+    if !volume.notes.is_empty() {
+        context.push(DetailContext::muted(format!(
+            "Note: {}",
+            volume.notes.join(" · ")
+        )));
     }
     if let Some(note) = &volume.latency_note {
         context.push(DetailContext::muted(format!(
@@ -1442,6 +1611,7 @@ fn volume_kind_label(kind: VolumeKind) -> &'static str {
         VolumeKind::Btrfs => "Btrfs",
         VolumeKind::ZfsPool => "ZFS pool",
         VolumeKind::ApfsContainer => "APFS container",
+        VolumeKind::MountGroup => "Mount group",
         VolumeKind::Swap => "Swap",
     }
 }
@@ -2637,6 +2807,7 @@ fn hot_files_for_fs_device_ids<'a>(
     hot_files_for_fs_devices(entries, &fs_device_id_set(fs_device_ids))
 }
 
+#[cfg(target_os = "linux")]
 fn filesystems_for_io_device<'a>(
     device: &str,
     filesystems: &'a [FsTick],
@@ -3146,11 +3317,24 @@ fn topology_chain_with_btrfs_members(
 
     if let Some(container) = apfs_container_for_source(source, &volumes.containers) {
         let mut nodes = vec![fs.mount.clone(), source.to_string(), container.bsd.clone()];
-        if let Some(store) = container.physical_store.as_deref() {
-            nodes.push(store.to_string());
+        let stores: Vec<&str> = container
+            .physical_stores
+            .iter()
+            .map(|store| disk_name(store))
+            .collect();
+        if let [store] = stores.as_slice() {
+            nodes.push((*store).to_string());
             let whole = whole_disk_name(store);
-            if whole != store {
+            if whole != *store {
                 nodes.push(whole.to_string());
+            }
+        } else if !stores.is_empty() {
+            nodes.push(format!("{{{}}}", stores.join(",")));
+            let mut wholes: Vec<&str> = stores.iter().map(|store| whole_disk_name(store)).collect();
+            wholes.sort();
+            wholes.dedup();
+            if wholes != stores {
+                nodes.push(format!("{{{}}}", wholes.join(",")));
             }
         }
         nodes.dedup();
@@ -3197,6 +3381,7 @@ fn format_btrfs_members(members: &[String], selected: &str) -> String {
         .join(",")
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn expand_btrfs_members(
     members: &[String],
     stacked_members: &dyn Fn(&str) -> Option<Vec<String>>,
@@ -3250,11 +3435,35 @@ fn apfs_container_for_source<'a>(
         .find(|container| disk_name(&container.bsd) == whole_disk_name(source))
 }
 
-fn apfs_container_contains_device(container: &ApfsContainer, device: &str) -> bool {
-    container
-        .physical_store
-        .as_deref()
-        .is_some_and(|store| whole_disk_name(disk_name(store)) == disk_name(device))
+fn apfs_container_contains_device(
+    container: &ApfsContainer,
+    device: &str,
+    volumes: &VolumeTick,
+) -> bool {
+    let target = disk_name(device);
+    container.physical_stores.iter().any(|store| {
+        let store_whole = whole_disk_name(disk_name(store));
+        store_whole == target
+            || volumes.apple_raid.iter().any(|raid| {
+                disk_name(&raid.bsd) == store_whole
+                    && raid
+                        .members
+                        .iter()
+                        .any(|member| whole_disk_name(disk_name(member)) == target)
+            })
+    })
+}
+
+fn apple_raid_contains_device(source: &str, device: &str, volumes: &VolumeTick) -> bool {
+    let source_whole = whole_disk_name(disk_name(source));
+    let target = disk_name(device);
+    volumes.apple_raid.iter().any(|raid| {
+        disk_name(&raid.bsd) == source_whole
+            && raid
+                .members
+                .iter()
+                .any(|member| whole_disk_name(disk_name(member)) == target)
+    })
 }
 
 fn attributable_filesystems<'a>(
@@ -3284,7 +3493,10 @@ fn attributable_filesystems_with_mount_label<'a>(
                     },
                 )
                 || apfs_container_for_source(disk_name(&fs.device), &volumes.containers)
-                    .is_some_and(|container| apfs_container_contains_device(container, device))
+                    .is_some_and(|container| {
+                        apfs_container_contains_device(container, device, volumes)
+                    })
+                || apple_raid_contains_device(&fs.device, device, volumes)
                 || mount_label(fs, device).is_some()
         })
         .collect()
@@ -3508,6 +3720,7 @@ fn mount_label_for_device_with_volumes_and_zfs_members(
     mount_label_for_device(fs, io_device)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn mount_label_for_btrfs_members(
     fs: &FsTick,
     io_device: &str,
@@ -3612,10 +3825,6 @@ fn sysfs_stacked_members(device: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn disk_name(device: &str) -> &str {
-    device.strip_prefix("/dev/").unwrap_or(device)
-}
-
 fn block_name_with_mapper_target(device: &str, target: Option<&Path>) -> String {
     let name = disk_name(device);
     if !name.starts_with("mapper/") {
@@ -3658,14 +3867,13 @@ fn whole_disk_name(device: &str) -> &str {
     }
 
     if let Some((base, part)) = device.rsplit_once('p') {
-        if base.starts_with("nvme")
+        if (base.starts_with("nvme")
             || base.starts_with("mmcblk")
             || base.starts_with("md")
-            || base.starts_with("dm-")
+            || base.starts_with("dm-"))
+            && part.chars().all(|c| c.is_ascii_digit())
         {
-            if part.chars().all(|c| c.is_ascii_digit()) {
-                return base;
-            }
+            return base;
         }
     }
 
@@ -3770,8 +3978,33 @@ mod tests {
     }
 
     #[test]
+    fn display_paths_expand_to_available_width_without_crossing_the_free_column() {
+        for (path, minimal) in [
+            ("/Volumes/home_ext1", "/V./home_ext1"),
+            ("/Library/Developer/* (11)", "/L./D./* (11)"),
+            ("/private/var/run/* (7)", "/p./v./r./* (7)"),
+            ("/System/Volumes/Hardware", "/S./V./Hardware"),
+        ] {
+            assert_eq!(display_path(path, minimal.chars().count()), minimal);
+            let mut previous = 0;
+            for width in 0..=40 {
+                let label = display_path(path, width);
+                assert!(label.chars().count() <= width);
+                assert!(label.chars().count() >= previous);
+                previous = label.chars().count();
+            }
+            assert_eq!(display_path(path, 40), path);
+        }
+        assert_eq!(
+            display_path("/VolumesElsewhere/file", 40),
+            "/VolumesElsewhere/file"
+        );
+        assert_eq!(display_path("/", 1), "/");
+    }
+
+    #[test]
     fn maps_linux_partition_mounts_to_whole_disk() {
-        let filesystems = vec![fs("/dev/sda1", "/"), fs("/dev/sda2", "/home")];
+        let filesystems = [fs("/dev/sda1", "/"), fs("/dev/sda2", "/home")];
 
         assert_eq!(
             mounts_for_device("sda", &filesystems),
@@ -3791,7 +4024,7 @@ mod tests {
 
     #[test]
     fn labels_stacked_mounts_via_container_device() {
-        let filesystems = vec![fs("/dev/md0", "/mnt/optane")];
+        let filesystems = [fs("/dev/md0", "/mnt/optane")];
         let members = vec!["sdd".to_string(), "sde".to_string()];
 
         assert_eq!(
@@ -3802,7 +4035,7 @@ mod tests {
 
     #[test]
     fn stacked_mount_is_included_for_selected_member() {
-        let filesystems = vec![fs("/dev/md0", "/mnt/optane")];
+        let filesystems = [fs("/dev/md0", "/mnt/optane")];
         let members = vec!["sdd".to_string(), "sde".to_string()];
 
         let selected: Vec<_> = filesystems
@@ -4005,6 +4238,7 @@ mod tests {
             latency_note: None,
             fs_device_ids: vec![(8, 2)],
             warnings: Vec::new(),
+            notes: Vec::new(),
         };
         let entries = vec![hot_file(8, 1, 100.0, 0.0), hot_file(8, 2, 0.0, 500.0)];
 
@@ -4252,7 +4486,7 @@ mod tests {
         let volumes = VolumeTick {
             containers: vec![ApfsContainer {
                 bsd: "disk3".into(),
-                physical_store: Some("disk0s2".into()),
+                physical_stores: vec!["disk0s2".into()],
                 ..ApfsContainer::default()
             }],
             ..VolumeTick::default()
@@ -4266,6 +4500,65 @@ mod tests {
             attributable_filesystems("disk0", &filesystems, &volumes).len(),
             1
         );
+    }
+
+    #[test]
+    fn multi_store_apfs_and_apple_raid_topology_normalize_and_attribute() {
+        let fusion_fs = vec![fs("/dev/disk3s1", "/")];
+        let fusion_volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk3".into(),
+                physical_stores: vec!["/dev/rdisk0s2".into(), "disk1s2".into()],
+                ..ApfsContainer::default()
+            }],
+            ..VolumeTick::default()
+        };
+        assert_eq!(
+            detail_header("disk0", &fusion_fs, &fusion_volumes),
+            " disk0 | / → disk3s1 → disk3 → {disk0s2,disk1s2} → {disk0,disk1} "
+        );
+
+        let raid_filesystems = vec![
+            fs("/dev/disk19s1", "/Volumes/ApfsRaid"),
+            fs("/dev/disk14s1", "/Volumes/HfsRaid"),
+        ];
+        let raid_volumes = VolumeTick {
+            containers: vec![ApfsContainer {
+                bsd: "disk19".into(),
+                physical_stores: vec!["disk14s2".into()],
+                ..ApfsContainer::default()
+            }],
+            apple_raid: vec![crate::collect::volumes::AppleRaid {
+                bsd: "/dev/disk14".into(),
+                members: vec!["/dev/rdisk7s2".into(), "disk9s2".into()],
+                status: "Online".into(),
+            }],
+            ..VolumeTick::default()
+        };
+        let mounts: Vec<_> = attributable_filesystems("disk7", &raid_filesystems, &raid_volumes)
+            .into_iter()
+            .map(|entry| entry.mount.as_str())
+            .collect();
+        assert_eq!(mounts, ["/Volumes/ApfsRaid", "/Volumes/HfsRaid"]);
+    }
+
+    #[test]
+    fn volume_line_window_advances_cleanly_past_group_boundary() {
+        let lines = vec![
+            VolumeLine::All,
+            VolumeLine::Group(0),
+            VolumeLine::Volume(0),
+            VolumeLine::Volume(1),
+            VolumeLine::Volume(2),
+            VolumeLine::Group(3),
+            VolumeLine::Volume(3),
+            VolumeLine::Volume(4),
+        ];
+        // Selecting Volume(3) with a 3-row viewport starts at Volume(2) right
+        // before Group(3); shifting forward fills all 3 rows from Group(3).
+        let (start, visible) = volume_line_window(&lines, 3, 4);
+        assert_eq!(start, 5);
+        assert_eq!(visible, vec![5, 6, 7]);
     }
 
     #[test]
@@ -4406,7 +4699,7 @@ mod tests {
     #[test]
     fn md_state_line_only_reports_exceptional_arrays() {
         let normal = md_array();
-        assert_eq!(md_exception_summary(&[normal.clone()]), None);
+        assert_eq!(md_exception_summary(std::slice::from_ref(&normal)), None);
 
         let mut degraded = normal;
         degraded.members_present = 1;
